@@ -2,10 +2,12 @@ use anyhow::Result;
 use bson::{doc, Document};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use mongodb::options::{AuthMechanism, ClientOptions, Credential, TlsOptions};
 use mongodb::sync::{Client, Collection};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const DEFAULT_BATCH_SIZE: usize = 10000;
@@ -43,6 +45,43 @@ struct LookupTables {
     biosample_in_collection: MultiMap,
 }
 
+/// Create MongoDB client with optional TLS/X.509 authentication.
+fn create_mongodb_client() -> Result<Client> {
+    let uri = env::var("DATABASE_URL").unwrap_or_else(|_| "mongodb://localhost:27017".to_string());
+    let tls_enabled = env::var("MONGODB_TLS_ENABLED")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if tls_enabled {
+        let cert_path = env::var("MONGODB_CERT_PATH")
+            .unwrap_or_else(|_| "/etc/cfdb/certs/client-bundle.pem".to_string());
+        let ca_path = env::var("MONGODB_CA_PATH")
+            .unwrap_or_else(|_| "/etc/cfdb/certs/ca.pem".to_string());
+
+        println!("Connecting to MongoDB at {} with X.509 authentication", uri);
+
+        let mut options = ClientOptions::parse(&uri).run()?;
+
+        let tls_options = TlsOptions::builder()
+            .ca_file_path(Some(PathBuf::from(ca_path)))
+            .cert_key_file_path(Some(PathBuf::from(cert_path)))
+            .build();
+
+        options.tls = Some(mongodb::options::Tls::Enabled(tls_options));
+        options.credential = Some(
+            Credential::builder()
+                .mechanism(AuthMechanism::MongoDbX509)
+                .source(Some("$external".to_string()))
+                .build(),
+        );
+
+        Ok(Client::with_options(options)?)
+    } else {
+        println!("Connecting to MongoDB at {} (no authentication)", uri);
+        Ok(Client::with_uri_str(&uri)?)
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -57,8 +96,7 @@ fn main() -> Result<()> {
         println!("Using {} threads (CPU count)", rayon::current_num_threads());
     }
 
-    let uri = env::var("DATABASE_URL").unwrap_or_else(|_| "mongodb://localhost:27017".to_string());
-    let client = Client::with_uri_str(&uri)?;
+    let client = create_mongodb_client()?;
     let db = client.database("cfdb");
 
     if let Some(ref sub) = args.submission {

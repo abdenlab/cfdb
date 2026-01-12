@@ -13,10 +13,26 @@ from cfdb.api.routers.sync import router as sync_router
 logging.basicConfig(level=logging.INFO)
 
 
+def create_mongodb_client() -> AsyncIOMotorClient:
+    """Create MongoDB client with optional TLS/X.509 authentication."""
+    if api.MONGODB_TLS_ENABLED:
+        print(f"Connecting to MongoDB at {api.DATABASE_URL} with X.509 authentication")
+        return AsyncIOMotorClient(
+            api.DATABASE_URL,
+            authMechanism="MONGODB-X509",
+            tls=True,
+            tlsCertificateKeyFile=api.MONGODB_CERT_PATH,
+            tlsCAFile=api.MONGODB_CA_PATH,
+            authSource="$external",
+        )
+    print(f"Connecting to MongoDB at {api.DATABASE_URL} (no authentication)")
+    return AsyncIOMotorClient(api.DATABASE_URL)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    print(f"Connecting to MongoDB at {api.DATABASE_URL}")
-    api.db = (client := AsyncIOMotorClient(api.DATABASE_URL))[api.DATABASE_NAME]
+    client = create_mongodb_client()
+    api.db = client[api.DATABASE_NAME]
     yield
     client.close()
 

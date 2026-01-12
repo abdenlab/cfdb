@@ -24,6 +24,9 @@ Requires Python 3.10 or later.
 | `SYNC_DATA_DIR` | Directory for downloaded sync data files | - |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
 | `DATABASE_URL` | MongoDB connection string | `mongodb://localhost:27017` |
+| `MONGODB_TLS_ENABLED` | Enable X.509 certificate authentication (production) | `false` |
+| `MONGODB_CERT_PATH` | Path to client certificate bundle | `/etc/cfdb/certs/client-bundle.pem` |
+| `MONGODB_CA_PATH` | Path to CA certificate | `/etc/cfdb/certs/ca.pem` |
 
 ### Quick Start
 
@@ -42,6 +45,32 @@ This starts:
 - MongoDB on port 27017 (with indexes)
 - GraphQL/REST API on port 8000
 
+### Production Deployment (TLS/X.509)
+
+For production, MongoDB uses TLS encryption with X.509 certificate authentication:
+
+```bash
+# 1. Generate certificates (customize hostname/IP as needed)
+./certs/generate-certs.sh mongodb.example.com 10.0.1.50
+
+# Or use environment variables
+MONGODB_HOSTNAME=mongodb.example.com MONGODB_IP=10.0.1.50 ./certs/generate-certs.sh
+
+# 2. Start MongoDB with TLS
+make mongodb-prod
+
+# 3. Start API with client certificate
+make api-prod
+```
+
+The certificate script generates:
+- `certs/ca/ca.pem` - CA certificate (deploy to all containers)
+- `certs/server/mongodb-server-bundle.pem` - MongoDB server certificate
+- `certs/clients/cfdb-api-bundle.pem` - API client certificate
+- `certs/clients/cfdb-materializer-bundle.pem` - Materializer client certificate
+
+Run `./certs/generate-certs.sh --help` for full usage information.
+
 ### Makefile Targets
 
 | Target | Description |
@@ -50,6 +79,9 @@ This starts:
 | `make api` | Build and start the API container |
 | `make materialize-files` | Manually materialize all file metadata (usually done via sync) |
 | `make materialize-dcc DCC=hubmap` | Materialize a single DCC |
+| `make certs` | Generate TLS certificates for production |
+| `make mongodb-prod` | Start MongoDB with TLS/X.509 authentication |
+| `make api-prod` | Start API with X.509 client certificate |
 
 ### Sync Workflow
 
