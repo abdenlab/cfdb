@@ -11,6 +11,7 @@ bson = { version = "2", features = ["chrono-0_4"] }
 rayon = "1"
 indicatif = "0.17"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 lto = true

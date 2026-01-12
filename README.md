@@ -5,7 +5,7 @@ A Python package for querying and serving C2M2 (Crosscut Metadata Model) file me
 ## Installation
 
 ```bash
-pip install git+https://github.com/conradbzura/cfdb.git
+pip install git+https://github.com/abdenlab/cfdb.git
 ```
 
 Requires Python 3.10 or later.

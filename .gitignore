@@ -76,3 +76,6 @@ uv.lock
 # Rust
 materialize/target/
 Cargo.lock
+
+# Database
+database/
