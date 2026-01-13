@@ -1,6 +1,6 @@
-# CFDB
+# Common Fund Database
 
-A Python package for querying and serving C2M2 (Crosscut Metadata Model) file metadata from Common Fund Data Coordinating Centers (DCCs).
+CFDB is a Python package for querying and serving C2M2 (Crosscut Metadata Model) file metadata from Common Fund Data Coordinating Centers (DCCs).
 
 ## Installation
 
@@ -20,7 +20,7 @@ Requires Python 3.10 or later.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SYNC_API_KEY` | API key for the sync endpoint (required for sync operations) | - |
+| `SYNC_API_KEY` | API key for the sync endpoint (required - API won't start without it) | - |
 | `SYNC_DATA_DIR` | Directory for downloaded sync data files | - |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
 | `DATABASE_URL` | MongoDB connection string | `mongodb://localhost:27017` |
@@ -458,9 +458,9 @@ Features:
 
 ### File Streaming Endpoint
 
-**URL:** `GET /data/{dcc}/{local_id}`
+**URL:** `GET /data/{dcc}/{local_id}` | `HEAD /data/{dcc}/{local_id}`
 
-Stream file contents from DCCs via HTTPS.
+Stream file contents from DCCs via HTTPS. Supports both GET (download) and HEAD (metadata only) requests.
 
 **Path Parameters:**
 - `dcc` - DCC abbreviation (e.g., `4dn`, `hubmap`) - case insensitive
@@ -472,7 +472,7 @@ Stream file contents from DCCs via HTTPS.
 **Response Codes:**
 | Code | Description |
 |------|-------------|
-| 200 | Full file content |
+| 200 | Full file content (GET) or file metadata (HEAD) |
 | 206 | Partial content (Range request) |
 | 400 | Invalid DCC or Range header |
 | 403 | File requires authentication (consortium/protected access) |
@@ -484,6 +484,9 @@ Stream file contents from DCCs via HTTPS.
 **Example:**
 
 ```bash
+# Check file availability (HEAD request)
+curl -I http://localhost:8000/data/4dn/abc123
+
 # Download a 4DN file
 curl -O http://localhost:8000/data/4dn/abc123
 
@@ -527,6 +530,43 @@ curl -X POST -H "X-API-Key: your-key" http://localhost:8000/sync
 
 # Sync specific DCCs
 curl -X POST -H "X-API-Key: your-key" "http://localhost:8000/sync?dccs=4dn&dccs=hubmap"
+```
+
+### Sync Status Endpoint
+
+**URL:** `GET /sync/{task_id}`
+
+Check the status of a sync task.
+
+**Path Parameters:**
+- `task_id` - The task ID returned when starting a sync
+
+**Response:**
+```json
+{
+  "task_id": "abc-123",
+  "status": "running",
+  "dcc_names": ["4dn", "hubmap"],
+  "started_at": "2024-01-15T10:30:00",
+  "completed_at": null
+}
+```
+
+**Response Codes:**
+| Code | Description |
+|------|-------------|
+| 200 | Task status returned |
+| 404 | Task not found |
+
+**Example:**
+
+```bash
+# Start a sync and get task ID
+curl -X POST -H "X-API-Key: your-key" "http://localhost:8000/sync?dccs=4dn"
+# Returns: {"task_id": "abc-123", ...}
+
+# Check sync status
+curl http://localhost:8000/sync/abc-123
 ```
 
 ## CLI Usage
