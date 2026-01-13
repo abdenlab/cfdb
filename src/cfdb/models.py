@@ -15,88 +15,88 @@ class FileMetadataModel(BaseModel):
     Attributes:
         dcc:
             The Data Coordinating Center that produced this file.
-        
+
         collections:
             Collections containing this file.
-        
+
         id_namespace:
             A CFDE-cleared identifier representing the top-level data space
             containing this file. Part 1 of 2-component composite primary key.
-        
+
         local_id:
             An identifier representing this file, unique within this id_namespace.
             Part 2 of 2-component composite primary key.
-        
+
         project_id_namespace:
             The id_namespace of the primary project within which this file was
             created. Part 1 of 2-component composite foreign key.
-        
+
         project_local_id:
             The local_id of the primary project within which this file was created.
             Part 2 of 2-component composite foreign key.
-        
+
         persistent_id:
             A persistent, resolvable (not necessarily retrievable) URI or compact
             ID permanently attached to this file.
-        
+
         creation_time:
             An ISO 8601/RFC 3339 compliant timestamp documenting this file's
             creation time (YYYY-MM-DDTHH:MM:SS±NN:NN).
-        
+
         size_in_bytes:
             The size of this file in bytes.
-        
+
         sha256:
             SHA-256 checksum for this file (preferred).
-        
+
         md5:
             MD5 checksum for this file (allowed if sha256 unavailable).
-        
+
         filename:
             A filename with no prepended PATH information.
-        
+
         file_format:
             An EDAM CV term identifying the digital format of this file
             (e.g., TSV or FASTQ). If compressed, this is the uncompressed format.
-        
+
         compression_format:
             An EDAM CV term ID identifying the compression format (e.g., gzip or
             bzip2). None if file is not compressed.
-        
+
         data_type:
             An EDAM CV term ID identifying the type of information stored in this
             file (e.g., RNA sequence reads).
-        
+
         assay_type:
             An OBI CV term ID describing the type of experiment that generated the
             results summarized by this file.
-        
+
         analysis_type:
             An OBI CV term ID describing the type of analytic operation that
             generated this file.
-        
+
         mime_type:
             A MIME type describing this file.
-        
+
         bundle_collection_id_namespace:
             If this file is a bundle, the id_namespace of a collection listing the
             bundle's sub-file contents.
-        
+
         bundle_collection_local_id:
             If this file is a bundle, the local_id of a collection listing the
             bundle's sub-file contents.
-        
+
         dbgap_study_id:
             The name of a dbGaP study ID governing access control, compatible for
             comparison to RAS user-level access control metadata.
-        
+
         access_url:
             A DRS URI or publicly accessible DRS-compatible URL.
-        
+
         status:
             HuBMAP dataset status (e.g., "Published", "QA") cached from HuBMAP
             Search API.
-        
+
         data_access_level:
             HuBMAP data access level ("public", "consortium", "protected") cached
             from HuBMAP Search API.
@@ -141,29 +141,29 @@ class DCC(BaseModel):
     Attributes:
         id:
             The identifier for this DCC, issued by the CFDE-CC.
-        
+
         dcc_name:
             A short, human-readable, machine-read-friendly label for this DCC.
-        
+
         dcc_abbreviation:
             A very short display label for this DCC.
-        
+
         dcc_description:
             A human-readable description of this DCC.
-        
+
         contact_email:
             Email address of this DCC's primary technical contact.
-        
+
         contact_name:
             Name of this DCC's primary technical contact.
-        
+
         dcc_url:
             URL of the front page of the website for this DCC.
-        
+
         project_id_namespace:
             ID of the identifier namespace for the project record representing
             the C2M2 submission produced by this DCC.
-        
+
         project_local_id:
             Foreign key identifying the project record representing the C2M2
             submission produced by this DCC.
@@ -209,11 +209,11 @@ class FileFormat(BaseModel):
     Attributes:
         id:
             An EDAM CV format term identifier.
-        
+
         name:
             A short, human-readable, machine-read-friendly label for this EDAM
             format term.
-        
+
         description:
             A human-readable description of this EDAM format term.
     """
@@ -251,29 +251,29 @@ class Collection(BaseModel):
     Attributes:
         biosamples:
             Biosamples contained in this collection.
-        
+
         id_namespace:
             A CFDE-cleared identifier representing the top-level data space
             containing this collection. Part 1 of 2-component composite primary key.
-        
+
         local_id:
             An identifier representing this collection, unique within this
             id_namespace. Part 2 of 2-component composite primary key.
-        
+
         persistent_id:
             A persistent, resolvable (not necessarily retrievable) URI or compact
             ID permanently attached to this collection.
-        
+
         creation_time:
             An ISO 8601/RFC 3339 compliant timestamp documenting this collection's
             creation time (YYYY-MM-DDTHH:MM:SS±NN:NN).
-        
+
         abbreviation:
             A very short display label for this collection.
-        
+
         name:
             A short, human-readable, machine-read-friendly label for this collection.
-        
+
         description:
             A human-readable description of this collection.
     """
@@ -296,35 +296,35 @@ class Biosample(BaseModel):
         id_namespace:
             A CFDE-cleared identifier representing the top-level data space
             containing this biosample. Part 1 of 2-component composite primary key.
-        
+
         local_id:
             An identifier representing this biosample, unique within this
             id_namespace. Part 2 of 2-component composite primary key.
-        
+
         project_id_namespace:
             The id_namespace of the primary project within which this biosample
             was created. Part 1 of 2-component composite foreign key.
-        
+
         project_local_id:
             The local_id of the primary project within which this biosample was
             created. Part 2 of 2-component composite foreign key.
-        
+
         persistent_id:
             A persistent, resolvable (not necessarily retrievable) URI or compact
             ID permanently attached to this biosample.
-        
+
         creation_time:
             An ISO 8601/RFC 3339 compliant timestamp documenting this biosample's
             creation time (YYYY-MM-DDTHH:MM:SS±NN:NN).
-        
+
         sample_prep_method:
             An OBI CV term ID (from the 'planned process' branch, excluding 'assay'
             subtree) describing the preparation method that produced this biosample.
-        
+
         anatomy:
             An UBERON CV term used to locate the origin of this biosample within
             the physiology of its source or host organism.
-        
+
         biofluid:
             An UBERON CV term or InterLex term used to locate the origin of this
             biosample within the fluid compartment of its source or host organism.
@@ -351,11 +351,11 @@ class Anatomy(BaseModel):
     Attributes:
         id:
             An UBERON CV term identifier.
-        
+
         name:
             A short, human-readable, machine-read-friendly label for this
             UBERON term.
-        
+
         description:
             A human-readable description of this UBERON term.
     """

@@ -9,7 +9,9 @@ PAGE_SIZE: Final = 25
 
 # TLS/X.509 authentication configuration (production)
 MONGODB_TLS_ENABLED: Final = os.getenv("MONGODB_TLS_ENABLED", "false").lower() == "true"
-MONGODB_CERT_PATH: Final = os.getenv("MONGODB_CERT_PATH", "/etc/cfdb/certs/client-bundle.pem")
+MONGODB_CERT_PATH: Final = os.getenv(
+    "MONGODB_CERT_PATH", "/etc/cfdb/certs/client-bundle.pem"
+)
 MONGODB_CA_PATH: Final = os.getenv("MONGODB_CA_PATH", "/etc/cfdb/certs/ca.pem")
 
 # Sync API authentication

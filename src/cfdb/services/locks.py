@@ -75,7 +75,9 @@ async def try_acquire_sync_lock(task_id: str, dcc_names: list[str]) -> bool:
     if existing and existing.get("task_id") == task_id:
         return True
 
-    logger.info(f"Sync lock held by task {existing.get('task_id') if existing else 'unknown'}")
+    logger.info(
+        f"Sync lock held by task {existing.get('task_id') if existing else 'unknown'}"
+    )
     return False
 
 
@@ -126,7 +128,9 @@ async def get_current_sync_task() -> Optional[dict]:
     if api.db is None:
         return None
 
-    lock = await api.db[LOCKS_COLLECTION].find_one({"_id": SYNC_LOCK_ID, "active": True})
+    lock = await api.db[LOCKS_COLLECTION].find_one(
+        {"_id": SYNC_LOCK_ID, "active": True}
+    )
     return lock
 
 
