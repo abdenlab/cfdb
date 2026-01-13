@@ -3,8 +3,8 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 
 from cfdb import api
 from cfdb.models import FileMetadataModel
@@ -19,8 +19,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/data", tags=["data"])
 
 
+@router.head("/{dcc}/{local_id}")
 @router.get("/{dcc}/{local_id}")
-async def stream_file(dcc: str, local_id: str, range: Optional[str] = Header(None)):
+async def stream_file(
+    dcc: str, local_id: str, request: Request, range: Optional[str] = Header(None)
+):
     """
     Stream file from DCC via HTTPS using file metadata from database.
 
@@ -308,15 +311,23 @@ async def stream_file(dcc: str, local_id: str, range: Optional[str] = Header(Non
                             status_code=400, detail=f"Invalid Range header: {str(e)}"
                         )
 
-                # Stream file (with or without range)
-                chunk_gen = drs.stream_from_url(download_url, range_header_to_send)
-
                 # Set Content-Type from DRS metadata
                 media_type = drs_object.mime_type or "application/octet-stream"
 
                 # For full file requests, include Content-Length from DRS metadata if available
                 if not range and drs_object.size:
                     response_headers["Content-Length"] = str(drs_object.size)
+
+                # HEAD request - return headers only, no body
+                if request.method == "HEAD":
+                    return Response(
+                        status_code=status_code,
+                        media_type=media_type,
+                        headers=response_headers,
+                    )
+
+                # Stream file (with or without range)
+                chunk_gen = drs.stream_from_url(download_url, range_header_to_send)
 
                 return StreamingResponse(
                     chunk_gen,

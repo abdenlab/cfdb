@@ -58,7 +58,8 @@ async def try_acquire_sync_lock(task_id: str, dcc_names: list[str]) -> bool:
                 "dcc_names": dcc_names,
                 "started_at": now,
                 "updated_at": now,
-            }
+            },
+            "$unset": {"completed_at": ""},
         },
         upsert=True,
         return_document=True,
@@ -126,6 +127,17 @@ async def get_current_sync_task() -> Optional[dict]:
         return None
 
     lock = await api.db[LOCKS_COLLECTION].find_one({"_id": SYNC_LOCK_ID, "active": True})
+    return lock
+
+
+async def get_sync_task(task_id: str) -> Optional[dict]:
+    """Get information about a sync task by ID."""
+    if api.db is None:
+        return None
+
+    lock = await api.db[LOCKS_COLLECTION].find_one(
+        {"_id": SYNC_LOCK_ID, "task_id": task_id}
+    )
     return lock
 
 

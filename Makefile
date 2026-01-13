@@ -19,6 +19,8 @@ certs:
 # Development mode (no authentication)
 mongodb:
 	make network
+	@docker stop mongodb 2>/dev/null || true
+	@docker rm mongodb 2>/dev/null || true
 	@echo "Building MongoDB image..."
 	docker build -t cfdb-mongodb -f Dockerfile.mongodb .
 	@echo "Starting MongoDB container in DEVELOPMENT mode (no TLS)..."
@@ -28,6 +30,8 @@ mongodb:
 # Production mode (TLS/X.509 authentication)
 mongodb-prod:
 	make network
+	@docker stop mongodb 2>/dev/null || true
+	@docker rm mongodb 2>/dev/null || true
 	@echo "Building MongoDB image..."
 	docker build -t cfdb-mongodb -f Dockerfile.mongodb .
 	@echo "Starting MongoDB container in PRODUCTION mode (TLS/X.509)..."
@@ -83,6 +87,8 @@ materialize-dcc-prod: build-materialize
 # Development mode (no authentication)
 api:
 	make network
+	@docker stop api 2>/dev/null || true
+	@docker rm api 2>/dev/null || true
 	@echo "Building the API Docker image..."
 	docker build -t api -f Dockerfile.api .
 	@echo "Starting the API container in DEVELOPMENT mode (no TLS)..."
@@ -92,6 +98,8 @@ api:
 # Production mode (TLS/X.509 authentication)
 api-prod:
 	make network
+	@docker stop api 2>/dev/null || true
+	@docker rm api 2>/dev/null || true
 	@echo "Building the API Docker image..."
 	docker build -t api -f Dockerfile.api .
 	@echo "Starting the API container in PRODUCTION mode (TLS/X.509)..."

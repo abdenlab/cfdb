@@ -12,4 +12,7 @@ MONGODB_TLS_ENABLED: Final = os.getenv("MONGODB_TLS_ENABLED", "false").lower() =
 MONGODB_CERT_PATH: Final = os.getenv("MONGODB_CERT_PATH", "/etc/cfdb/certs/client-bundle.pem")
 MONGODB_CA_PATH: Final = os.getenv("MONGODB_CA_PATH", "/etc/cfdb/certs/ca.pem")
 
+# Sync API authentication
+SYNC_API_KEY: Final = os.getenv("SYNC_API_KEY", "")
+
 db: AsyncIOMotorDatabase | None = None

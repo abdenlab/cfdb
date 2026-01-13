@@ -31,6 +31,10 @@ def create_mongodb_client() -> AsyncIOMotorClient:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Validate required configuration
+    if not api.SYNC_API_KEY:
+        raise RuntimeError("SYNC_API_KEY environment variable is required")
+
     client = create_mongodb_client()
     api.db = client[api.DATABASE_NAME]
     yield
