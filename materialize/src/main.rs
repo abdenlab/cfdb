@@ -41,8 +41,14 @@ struct LookupTables {
     anatomies: LookupMap,
     collections: HashMap<(String, String), Document>,
     biosamples: HashMap<(String, String), Document>,
+    subjects: HashMap<(String, String), Document>,
     file_in_collection: MultiMap,
     biosample_in_collection: MultiMap,
+    biosample_from_subject: MultiMap,
+    subject_race: MultiMap,
+    collection_by_persistent_id: HashMap<String, (String, String)>,
+    collection_anatomy: MultiMap,
+    subject_in_collection: MultiMap,
 }
 
 /// Create MongoDB client with optional TLS/X.509 authentication.
@@ -242,6 +248,10 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
     let biosamples = load_entity_table(&db.collection("biosample"), submission_filter);
     println!("  biosample: {} entries", biosamples.len());
 
+    // Load subjects keyed by (id_namespace, local_id)
+    let subjects = load_entity_table(&db.collection("subject"), submission_filter);
+    println!("  subject: {} entries", subjects.len());
+
     // Load junction tables as multi-maps
     let file_in_collection = load_file_in_collection(&db.collection("file_in_collection"), submission_filter);
     println!("  file_in_collection: {} entries", file_in_collection.len());
@@ -249,6 +259,32 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
     let biosample_in_collection =
         load_biosample_in_collection(&db.collection("biosample_in_collection"), submission_filter);
     println!("  biosample_in_collection: {} entries", biosample_in_collection.len());
+
+    let biosample_from_subject =
+        load_biosample_from_subject(&db.collection("biosample_from_subject"), submission_filter);
+    println!("  biosample_from_subject: {} entries", biosample_from_subject.len());
+
+    let subject_race = load_subject_race(&db.collection("subject_race"), submission_filter);
+    println!("  subject_race: {} entries", subject_race.len());
+
+    // Build collection persistent_id lookup (for DOI-based file→collection matching)
+    let collection_by_persistent_id =
+        load_collection_by_persistent_id(&db.collection("collection"), submission_filter);
+    println!(
+        "  collection_by_persistent_id: {} entries",
+        collection_by_persistent_id.len()
+    );
+
+    let collection_anatomy =
+        load_collection_anatomy(&db.collection("collection_anatomy"), submission_filter);
+    println!("  collection_anatomy: {} entries", collection_anatomy.len());
+
+    let subject_in_collection =
+        load_subject_in_collection(&db.collection("subject_in_collection"), submission_filter);
+    println!(
+        "  subject_in_collection: {} entries",
+        subject_in_collection.len()
+    );
 
     LookupTables {
         dccs,
@@ -258,8 +294,14 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
         anatomies,
         collections,
         biosamples,
+        subjects,
         file_in_collection,
         biosample_in_collection,
+        biosample_from_subject,
+        subject_race,
+        collection_by_persistent_id,
+        collection_anatomy,
+        subject_in_collection,
     }
 }
 
@@ -318,7 +360,11 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
     let file_key = (id_namespace.clone(), local_id.clone());
     let mut enriched_collections: Vec<Document> = Vec::new();
 
+    // Get collection keys - either from junction table or persistent_id match
+    let mut coll_keys: Vec<(String, String)> = Vec::new();
+
     if let Some(file_colls) = lookups.file_in_collection.get(&file_key) {
+        // Use junction table entries
         for fc in file_colls {
             let coll_ns = fc
                 .get_str("collection_id_namespace")
@@ -328,50 +374,168 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
                 .get_str("collection_local_id")
                 .unwrap_or_default()
                 .to_string();
-            let coll_key = (coll_ns.clone(), coll_id.clone());
+            if !coll_ns.is_empty() && !coll_id.is_empty() {
+                coll_keys.push((coll_ns, coll_id));
+            }
+        }
+    }
 
-            if let Some(coll) = lookups.collections.get(&coll_key) {
-                let mut coll_copy = coll.clone();
-                coll_copy.remove("_id");
+    // Fallback: look up collection by persistent_id (DOI) match
+    if coll_keys.is_empty() {
+        if let Ok(persistent_id) = file.get_str("persistent_id") {
+            if !persistent_id.is_empty() {
+                if let Some((coll_ns, coll_id)) = lookups.collection_by_persistent_id.get(persistent_id) {
+                    coll_keys.push((coll_ns.clone(), coll_id.clone()));
+                }
+            }
+        }
+    }
 
-                // Build biosamples array for this collection
-                let mut enriched_biosamples: Vec<Document> = Vec::new();
+    // Process each collection
+    for (coll_ns, coll_id) in coll_keys {
+        let coll_key = (coll_ns.clone(), coll_id.clone());
 
-                if let Some(bios_in_coll) = lookups.biosample_in_collection.get(&coll_key) {
-                    for bc in bios_in_coll {
-                        let bio_ns = bc
-                            .get_str("biosample_id_namespace")
-                            .unwrap_or_default()
-                            .to_string();
-                        let bio_id = bc
-                            .get_str("biosample_local_id")
-                            .unwrap_or_default()
-                            .to_string();
-                        let bio_key = (bio_ns, bio_id);
+        if let Some(coll) = lookups.collections.get(&coll_key) {
+            let mut coll_copy = coll.clone();
+            coll_copy.remove("_id");
 
-                        if let Some(biosample) = lookups.biosamples.get(&bio_key) {
-                            let mut bio_copy = biosample.clone();
-                            bio_copy.remove("_id");
-
-                            // Lookup anatomy for biosample
-                            if let Some(anatomy_id) = biosample.get_str("anatomy").ok() {
-                                if let Some(anatomy) =
-                                    lookups.anatomies.get(&(submission.clone(), anatomy_id.to_string()))
-                                {
-                                    let mut anatomy_copy = anatomy.clone();
-                                    anatomy_copy.remove("_id");
-                                    bio_copy.insert("anatomy", anatomy_copy);
-                                }
-                            }
-
-                            enriched_biosamples.push(bio_copy);
+            // Add anatomy terms from collection_anatomy
+            let mut coll_anatomies: Vec<Document> = Vec::new();
+            if let Some(ca_entries) = lookups.collection_anatomy.get(&coll_key) {
+                for ca in ca_entries {
+                    if let Ok(anatomy_id) = ca.get_str("anatomy") {
+                        if let Some(anatomy) =
+                            lookups.anatomies.get(&(submission.clone(), anatomy_id.to_string()))
+                        {
+                            let mut anatomy_copy = anatomy.clone();
+                            anatomy_copy.remove("_id");
+                            coll_anatomies.push(anatomy_copy);
                         }
                     }
                 }
-
-                coll_copy.insert("biosamples", enriched_biosamples);
-                enriched_collections.push(coll_copy);
             }
+            coll_copy.insert("anatomy", coll_anatomies);
+
+            // Add subjects from subject_in_collection
+            let mut coll_subjects: Vec<Document> = Vec::new();
+            if let Some(sic_entries) = lookups.subject_in_collection.get(&coll_key) {
+                for sic in sic_entries {
+                    let subj_ns = sic
+                        .get_str("subject_id_namespace")
+                        .unwrap_or_default()
+                        .to_string();
+                    let subj_id = sic
+                        .get_str("subject_local_id")
+                        .unwrap_or_default()
+                        .to_string();
+                    let subj_key = (subj_ns, subj_id);
+
+                    if let Some(subject) = lookups.subjects.get(&subj_key) {
+                        let mut subj_copy = subject.clone();
+                        subj_copy.remove("_id");
+
+                        // Add race from subject_race
+                        let mut races: Vec<String> = Vec::new();
+                        if let Some(race_entries) = lookups.subject_race.get(&subj_key) {
+                            for race_entry in race_entries {
+                                if let Ok(race) = race_entry.get_str("race") {
+                                    if !race.is_empty() {
+                                        races.push(race.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        subj_copy.insert("race", races);
+
+                        coll_subjects.push(subj_copy);
+                    }
+                }
+            }
+            coll_copy.insert("subjects", coll_subjects);
+
+            // Build biosamples array for this collection
+            let mut enriched_biosamples: Vec<Document> = Vec::new();
+
+            if let Some(bios_in_coll) = lookups.biosample_in_collection.get(&coll_key) {
+                for bc in bios_in_coll {
+                    let bio_ns = bc
+                        .get_str("biosample_id_namespace")
+                        .unwrap_or_default()
+                        .to_string();
+                    let bio_id = bc
+                        .get_str("biosample_local_id")
+                        .unwrap_or_default()
+                        .to_string();
+                    let bio_key = (bio_ns, bio_id);
+
+                    if let Some(biosample) = lookups.biosamples.get(&bio_key) {
+                        let mut bio_copy = biosample.clone();
+                        bio_copy.remove("_id");
+
+                        // Lookup anatomy for biosample
+                        if let Some(anatomy_id) = biosample.get_str("anatomy").ok() {
+                            if let Some(anatomy) =
+                                lookups.anatomies.get(&(submission.clone(), anatomy_id.to_string()))
+                            {
+                                let mut anatomy_copy = anatomy.clone();
+                                anatomy_copy.remove("_id");
+                                bio_copy.insert("anatomy", anatomy_copy);
+                            }
+                        }
+
+                        // Lookup subjects for this biosample
+                        let mut enriched_subjects: Vec<Document> = Vec::new();
+                        if let Some(bfs_junctions) = lookups.biosample_from_subject.get(&bio_key) {
+                            for bfs in bfs_junctions {
+                                let subj_ns = bfs
+                                    .get_str("subject_id_namespace")
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let subj_id = bfs
+                                    .get_str("subject_local_id")
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let subj_key = (subj_ns, subj_id);
+
+                                if let Some(subject) = lookups.subjects.get(&subj_key) {
+                                    let mut subj_copy = subject.clone();
+                                    subj_copy.remove("_id");
+
+                                    // Add age_at_sampling from junction table
+                                    if let Ok(age) = bfs.get_f64("age_at_sampling") {
+                                        subj_copy.insert("age_at_sampling", age);
+                                    } else if let Ok(age_str) = bfs.get_str("age_at_sampling") {
+                                        if let Ok(age) = age_str.parse::<f64>() {
+                                            subj_copy.insert("age_at_sampling", age);
+                                        }
+                                    }
+
+                                    // Add race(s) from subject_race junction table
+                                    let mut races: Vec<String> = Vec::new();
+                                    if let Some(race_entries) = lookups.subject_race.get(&subj_key) {
+                                        for race_entry in race_entries {
+                                            if let Ok(race) = race_entry.get_str("race") {
+                                                if !race.is_empty() {
+                                                    races.push(race.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    subj_copy.insert("race", races);
+
+                                    enriched_subjects.push(subj_copy);
+                                }
+                            }
+                        }
+                        bio_copy.insert("subjects", enriched_subjects);
+
+                        enriched_biosamples.push(bio_copy);
+                    }
+                }
+            }
+
+            coll_copy.insert("biosamples", enriched_biosamples);
+            enriched_collections.push(coll_copy);
         }
     }
 
@@ -451,6 +615,85 @@ fn load_biosample_in_collection(coll: &Collection<Document>, submission: &Option
     map
 }
 
+fn load_biosample_from_subject(coll: &Collection<Document>, submission: &Option<String>) -> MultiMap {
+    let mut map: MultiMap = HashMap::new();
+    for doc in load_collection_filtered(coll, submission) {
+        if let (Ok(ns), Ok(id)) = (
+            doc.get_str("biosample_id_namespace"),
+            doc.get_str("biosample_local_id"),
+        ) {
+            map.entry((ns.to_string(), id.to_string()))
+                .or_default()
+                .push(doc);
+        }
+    }
+    map
+}
+
+fn load_subject_race(coll: &Collection<Document>, submission: &Option<String>) -> MultiMap {
+    let mut map: MultiMap = HashMap::new();
+    for doc in load_collection_filtered(coll, submission) {
+        if let (Ok(ns), Ok(id)) = (
+            doc.get_str("subject_id_namespace"),
+            doc.get_str("subject_local_id"),
+        ) {
+            map.entry((ns.to_string(), id.to_string()))
+                .or_default()
+                .push(doc);
+        }
+    }
+    map
+}
+
+fn load_collection_by_persistent_id(
+    coll: &Collection<Document>,
+    submission: &Option<String>,
+) -> HashMap<String, (String, String)> {
+    let mut map: HashMap<String, (String, String)> = HashMap::new();
+    for doc in load_collection_filtered(coll, submission) {
+        if let (Ok(persistent_id), Ok(ns), Ok(id)) = (
+            doc.get_str("persistent_id"),
+            doc.get_str("id_namespace"),
+            doc.get_str("local_id"),
+        ) {
+            if !persistent_id.is_empty() {
+                map.insert(persistent_id.to_string(), (ns.to_string(), id.to_string()));
+            }
+        }
+    }
+    map
+}
+
+fn load_collection_anatomy(coll: &Collection<Document>, submission: &Option<String>) -> MultiMap {
+    let mut map: MultiMap = HashMap::new();
+    for doc in load_collection_filtered(coll, submission) {
+        if let (Ok(ns), Ok(id)) = (
+            doc.get_str("collection_id_namespace"),
+            doc.get_str("collection_local_id"),
+        ) {
+            map.entry((ns.to_string(), id.to_string()))
+                .or_default()
+                .push(doc);
+        }
+    }
+    map
+}
+
+fn load_subject_in_collection(coll: &Collection<Document>, submission: &Option<String>) -> MultiMap {
+    let mut map: MultiMap = HashMap::new();
+    for doc in load_collection_filtered(coll, submission) {
+        if let (Ok(ns), Ok(id)) = (
+            doc.get_str("collection_id_namespace"),
+            doc.get_str("collection_local_id"),
+        ) {
+            map.entry((ns.to_string(), id.to_string()))
+                .or_default()
+                .push(doc);
+        }
+    }
+    map
+}
+
 fn create_indexes(coll: &Collection<Document>) -> Result<()> {
     use mongodb::IndexModel;
 
@@ -476,20 +719,40 @@ fn create_indexes(coll: &Collection<Document>) -> Result<()> {
         doc! { "collections.id_namespace": 1 },
         doc! { "collections.local_id": 1 },
         doc! { "collections.name": 1 },
+        // Collection anatomy indexes
+        doc! { "collections.anatomy.id": 1 },
+        doc! { "collections.anatomy.name": 1 },
+        // Collection subjects indexes
+        doc! { "collections.subjects.id_namespace": 1 },
+        doc! { "collections.subjects.local_id": 1 },
+        doc! { "collections.subjects.granularity": 1 },
+        doc! { "collections.subjects.sex": 1 },
+        doc! { "collections.subjects.ethnicity": 1 },
+        doc! { "collections.subjects.race": 1 },
+        // Biosample indexes
         doc! { "collections.biosamples.id_namespace": 1 },
         doc! { "collections.biosamples.local_id": 1 },
         doc! { "collections.biosamples.anatomy.id": 1 },
         doc! { "collections.biosamples.anatomy.name": 1 },
+        doc! { "collections.biosamples.subjects.id_namespace": 1 },
+        doc! { "collections.biosamples.subjects.local_id": 1 },
+        doc! { "collections.biosamples.subjects.granularity": 1 },
+        doc! { "collections.biosamples.subjects.sex": 1 },
+        doc! { "collections.biosamples.subjects.ethnicity": 1 },
+        doc! { "collections.biosamples.subjects.age_at_enrollment": 1 },
+        doc! { "collections.biosamples.subjects.age_at_sampling": 1 },
+        doc! { "collections.biosamples.subjects.race": 1 },
         doc! { "data_access_level": 1 },
         doc! { "submission": 1 },
     ];
 
+    let index_count = indexes.len();
     let models: Vec<IndexModel> = indexes
         .into_iter()
         .map(|keys| IndexModel::builder().keys(keys).build())
         .collect();
 
     coll.create_indexes(models).run()?;
-    println!("  Created {} indexes", 27);
+    println!("  Created {} indexes", index_count);
     Ok(())
 }

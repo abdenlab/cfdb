@@ -86,3 +86,63 @@ async def fetch_access_metadata(uuid: str) -> Optional[HuBMAPSearchResult]:
         except Exception as e:
             logger.warning(f"Unexpected error fetching HuBMAP metadata: {e}")
             return None
+
+
+async def fetch_access_metadata_batch(persistent_ids: list[str]) -> dict[str, str]:
+    """
+    Batch fetch access levels for datasets by persistent_id (DOI URL).
+
+    Uses HuBMAP Search API to query by doi_url field.
+
+    Args:
+        persistent_ids: List of DOI URLs (e.g., "https://doi.org/10.35079/HBM673.JJRZ.435")
+
+    Returns:
+        Dict mapping persistent_id -> data_access_level
+    """
+    if not persistent_ids:
+        return {}
+
+    results: dict[str, str] = {}
+
+    # Query HuBMAP Search API for datasets matching these DOI URLs
+    search_url = "https://search.api.hubmapconsortium.org/v3/portal/search"
+
+    async with aiohttp.ClientSession() as session:
+        # Build query for all DOIs using doi_url.keyword field
+        query = {
+            "query": {
+                "bool": {
+                    "should": [
+                        {"term": {"doi_url.keyword": doi}} for doi in persistent_ids
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+            "size": len(persistent_ids),
+            "_source": ["doi_url", "data_access_level"],
+        }
+
+        try:
+            async with session.post(
+                search_url,
+                json=query,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    for hit in data.get("hits", {}).get("hits", []):
+                        src = hit.get("_source", {})
+                        doi_url = src.get("doi_url")
+                        level = src.get("data_access_level")
+                        if doi_url and level:
+                            results[doi_url] = level
+        except asyncio.TimeoutError:
+            logger.warning("Timeout batch fetching HuBMAP access levels")
+        except aiohttp.ClientError as e:
+            logger.warning(f"Network error batch fetching HuBMAP access levels: {e}")
+        except Exception as e:
+            logger.warning(f"Error batch fetching HuBMAP access levels: {e}")
+
+    return results

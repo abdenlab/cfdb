@@ -32,11 +32,19 @@ def is_pydantic_model(annotation):
     return False
 
 
+# Cache for built Strawberry types to avoid duplicates
+_type_cache: dict[type, type] = {}
+
+
 def build_strawberry_type(type):
+    if type in _type_cache:
+        return _type_cache[type]
+
     @strawberry.experimental.pydantic.type(model=type)
     @annotate(type, type.__name__)
     class T: ...
 
+    _type_cache[type] = T
     return T
 
 

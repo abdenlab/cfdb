@@ -593,3 +593,35 @@ cfdb sync --api-key your-key
 - `--api-url` - cfdb API base URL (default: `http://localhost:8000`, env: `CFDB_API_URL`)
 - `--api-key` - API key for sync endpoint (env: `SYNC_API_KEY`)
 - `--debug` / `-d` - Enable debugpy debugging
+
+## HuBMAP Data Portal Filter Mapping
+
+The following table maps HuBMAP data portal search dimensions to CFDB/C2M2 fields:
+
+| Category | HuBMAP Dimension | CFDB Field | Status | Notes |
+|----------|------------------|------------|--------|-------|
+| **Dataset** | Dataset/Assay Type | `assay_type.name` | ✅ | OBI CV terms (CODEX, RNA-seq, etc.) |
+| **Dataset** | Data Type | `data_type.name` | ✅ | EDAM CV terms |
+| **Dataset** | File Format | `file_format.name` | ✅ | EDAM CV terms |
+| **Dataset** | Data Access Level | `data_access_level` | ✅ | public/consortium/protected |
+| **Dataset** | Status | `status` | ✅ | Published/QA (HuBMAP-specific) |
+| **Dataset** | DCC/Affiliation | `dcc.dcc_abbreviation` | ✅ | Data provider |
+| **Organ** | Organ | `collections.anatomy.name` | ✅ | UBERON CV terms |
+| **Sample** | Sample Prep Method | `collections.biosamples.sample_prep_method` | ✅ | OBI CV terms |
+| **Sample** | Biofluid | `collections.biosamples.biofluid` | ✅ | UBERON/InterLex terms |
+| **Donor** | Sex | `collections.subjects.sex` | ✅ | NCIT CV terms |
+| **Donor** | Age | `collections.subjects.age_at_enrollment` | ✅ | Decimal years |
+| **Donor** | Age at Sampling | `collections.biosamples.subjects.age_at_sampling` | ✅ | Decimal years |
+| **Donor** | Race | `collections.subjects.race` | ✅ | CFDE CV terms (multi-valued) |
+| **Donor** | Ethnicity | `collections.subjects.ethnicity` | ✅ | NCIT CV terms |
+| **Donor** | Granularity | `collections.subjects.granularity` | ✅ | single organism/cell line/etc. |
+| **Donor** | BMI | — | ❌ | Not in C2M2 |
+| **Donor** | Height/Weight | — | ❌ | Not in C2M2 |
+| **Donor** | Medical History | — | ❌ | Diabetes, hypertension, etc. |
+| **Donor** | Lifestyle | — | ❌ | Smoking, alcohol, drug use |
+| **Donor** | Cause of Death | — | ❌ | Not in C2M2 |
+| **Donor** | Blood Type | — | ❌ | Not in C2M2 |
+| **Processing** | Pipeline | `analysis_type` | ⚠️ | Partial - OBI CV terms |
+| **Processing** | Processing Type | — | ❌ | HuBMAP-specific |
+
+**Legend:** ✅ Supported | ⚠️ Partial | ❌ Not Available

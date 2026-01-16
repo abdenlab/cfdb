@@ -26,7 +26,7 @@ Configuration precedence:
   3. Defaults (lowest)
 
 Examples:
-  $(basename "$0")                                    # Use defaults (local dev)
+  $(basename "$0")                                   # Use defaults (local dev)
   $(basename "$0") mongodb.example.com 10.0.1.50     # Production with args
   MONGODB_HOSTNAME=db.example.com $(basename "$0")   # Production with env var
 

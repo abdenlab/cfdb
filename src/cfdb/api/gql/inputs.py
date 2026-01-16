@@ -18,6 +18,22 @@ class AssayTypeInput:
 
 
 @strawberry.input
+class SubjectInput:
+    id_namespace: list[str] | None = None
+    local_id: list[str] | None = None
+    project_id_namespace: list[str] | None = None
+    project_local_id: list[str] | None = None
+    persistent_id: list[str] | None = None
+    creation_time: list[str] | None = None
+    granularity: list[str] | None = None
+    sex: list[str] | None = None
+    ethnicity: list[str] | None = None
+    age_at_enrollment: list[float] | None = None
+    age_at_sampling: list[float] | None = None
+    race: list[str] | None = None
+
+
+@strawberry.input
 class BiosampleInput:
     id_namespace: list[str] | None = None
     local_id: list[str] | None = None
@@ -28,6 +44,7 @@ class BiosampleInput:
     sample_prep_method: list[str] | None = None
     anatomy: list[AnatomyInput] | None = None
     biofluid: list[str] | None = None
+    subjects: list[SubjectInput] | None = None
 
 
 @strawberry.input
@@ -40,6 +57,8 @@ class CollectionInput:
     abbreviation: list[str] | None = None
     name: list[str] | None = None
     description: list[str] | None = None
+    anatomy: list[AnatomyInput] | None = None
+    subjects: list[SubjectInput] | None = None
 
 
 @strawberry.input
@@ -93,6 +112,7 @@ class FileMetadataInput:
     bundle_collection_local_id: list[str] | None = None
     dbgap_study_id: list[str] | None = None
     access_url: list[str] | None = None
+    data_access_level: list[str] | None = None
 
 
 def to_dict(obj):

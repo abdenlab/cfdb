@@ -101,6 +101,44 @@ db.biosample_in_collection.createIndex({ collection_local_id: 1 });
 db.biosample_in_collection.createIndex({ collection_id_namespace: 1, collection_local_id: 1 });
 db.biosample_in_collection.createIndex({ submission: 1 });
 
+print("Creating indexes on 'subject' collection...");
+db.subject.createIndex({ id_namespace: 1 });
+db.subject.createIndex({ local_id: 1 });
+db.subject.createIndex({ id_namespace: 1, local_id: 1 });  // composite key
+db.subject.createIndex({ project_id_namespace: 1 });
+db.subject.createIndex({ project_local_id: 1 });
+db.subject.createIndex({ persistent_id: 1 });
+db.subject.createIndex({ granularity: 1 });
+db.subject.createIndex({ sex: 1 });
+db.subject.createIndex({ ethnicity: 1 });
+db.subject.createIndex({ submission: 1 });
+
+print("Creating indexes on 'biosample_from_subject' collection...");
+db.biosample_from_subject.createIndex({ biosample_id_namespace: 1 });
+db.biosample_from_subject.createIndex({ biosample_local_id: 1 });
+db.biosample_from_subject.createIndex({ biosample_id_namespace: 1, biosample_local_id: 1 });
+db.biosample_from_subject.createIndex({ subject_id_namespace: 1 });
+db.biosample_from_subject.createIndex({ subject_local_id: 1 });
+db.biosample_from_subject.createIndex({ subject_id_namespace: 1, subject_local_id: 1 });
+db.biosample_from_subject.createIndex({ submission: 1 });
+
+print("Creating indexes on 'subject_race' collection...");
+db.subject_race.createIndex({ subject_id_namespace: 1 });
+db.subject_race.createIndex({ subject_local_id: 1 });
+db.subject_race.createIndex({ subject_id_namespace: 1, subject_local_id: 1 });
+db.subject_race.createIndex({ race: 1 });
+db.subject_race.createIndex({ submission: 1 });
+
+print("Creating indexes on 'collection_anatomy' collection...");
+db.collection_anatomy.createIndex({ collection_id_namespace: 1, collection_local_id: 1 });
+db.collection_anatomy.createIndex({ anatomy: 1 });
+db.collection_anatomy.createIndex({ submission: 1 });
+
+print("Creating indexes on 'subject_in_collection' collection...");
+db.subject_in_collection.createIndex({ collection_id_namespace: 1, collection_local_id: 1 });
+db.subject_in_collection.createIndex({ subject_id_namespace: 1, subject_local_id: 1 });
+db.subject_in_collection.createIndex({ submission: 1 });
+
 print("Creating indexes on 'locks' collection...");
 db.locks.createIndex({ active: 1 });
 

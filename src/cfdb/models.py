@@ -276,6 +276,14 @@ class Collection(BaseModel):
 
         description:
             A human-readable description of this collection.
+
+        anatomy:
+            Anatomy terms associated with this collection. Populated from the
+            collection_anatomy junction table.
+
+        subjects:
+            Subjects (donors) directly associated with this collection. Populated
+            from the subject_in_collection junction table.
     """
 
     biosamples: List[Biosample]
@@ -286,6 +294,8 @@ class Collection(BaseModel):
     abbreviation: Optional[str] = None
     name: str = str()
     description: Optional[str] = None
+    anatomy: List[Anatomy] = []
+    subjects: List[Subject] = []
 
 
 class Biosample(BaseModel):
@@ -328,6 +338,10 @@ class Biosample(BaseModel):
         biofluid:
             An UBERON CV term or InterLex term used to locate the origin of this
             biosample within the fluid compartment of its source or host organism.
+
+        subjects:
+            The subjects (donors) from which this biosample was derived. Linked
+            via the biosample_from_subject junction table.
     """
 
     id_namespace: str = str()
@@ -339,6 +353,7 @@ class Biosample(BaseModel):
     sample_prep_method: Optional[str] = None
     anatomy: Optional[Anatomy] = None
     biofluid: Optional[str] = None
+    subjects: List[Subject] = []
 
 
 class Anatomy(BaseModel):
@@ -363,3 +378,74 @@ class Anatomy(BaseModel):
     id: str = str()
     name: str = str()
     description: Optional[str] = None
+
+
+class Subject(BaseModel):
+    """
+    A human or organism from which biosamples are derived.
+
+    Represents an experimental subject (e.g., donor) in the C2M2 data model.
+
+    Attributes:
+        id_namespace:
+            A CFDE-cleared identifier representing the top-level data space
+            containing this subject. Part 1 of 2-component composite primary key.
+
+        local_id:
+            An identifier representing this subject, unique within this
+            id_namespace. Part 2 of 2-component composite primary key.
+
+        project_id_namespace:
+            The id_namespace of the primary project within which this subject
+            was enrolled. Part 1 of 2-component composite foreign key.
+
+        project_local_id:
+            The local_id of the primary project within which this subject was
+            enrolled. Part 2 of 2-component composite foreign key.
+
+        persistent_id:
+            A persistent, resolvable (not necessarily retrievable) URI or compact
+            ID permanently attached to this subject.
+
+        creation_time:
+            An ISO 8601/RFC 3339 compliant timestamp documenting this subject's
+            record creation time (YYYY-MM-DDTHH:MM:SS±NN:NN).
+
+        granularity:
+            A CFDE CV term categorizing the subject by granularity (e.g.,
+            single organism, cell line, microbiome).
+
+        sex:
+            An NCIT CV term ID describing the biological sex of this subject.
+
+        ethnicity:
+            An NCIT CV term ID describing the self-reported ethnicity of this
+            subject.
+
+        age_at_enrollment:
+            The age in years (decimal) of this subject when first enrolled in
+            the primary project.
+
+        age_at_sampling:
+            The age in years (decimal) of this subject when the associated
+            biosample was taken. Populated from the biosample_from_subject
+            junction table.
+
+        race:
+            Self-identified race(s) of this subject. A list of CFDE CV term IDs
+            since subjects can identify with multiple races. Populated from the
+            subject_race junction table.
+    """
+
+    id_namespace: str = str()
+    local_id: str = str()
+    project_id_namespace: str = str()
+    project_local_id: str = str()
+    persistent_id: Optional[str] = None
+    creation_time: Optional[str] = None
+    granularity: Optional[str] = None
+    sex: Optional[str] = None
+    ethnicity: Optional[str] = None
+    age_at_enrollment: Optional[float] = None
+    age_at_sampling: Optional[float] = None
+    race: List[str] = []
