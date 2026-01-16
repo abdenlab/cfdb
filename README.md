@@ -625,3 +625,26 @@ The following table maps HuBMAP data portal search dimensions to CFDB/C2M2 field
 | **Processing** | Processing Type | — | ❌ | HuBMAP-specific |
 
 **Legend:** ✅ Supported | ⚠️ Partial | ❌ Not Available
+
+## 4DN Data Portal Filter Mapping
+
+The following table maps 4DN data portal search dimensions to CFDB/C2M2 fields:
+
+| Category | 4DN Dimension | CFDB Field | Status | Notes |
+|----------|---------------|------------|--------|-------|
+| **Experiment** | Experiment Type | `assay_type.name` | ✅ | OBI CV terms (Hi-C, etc.) |
+| **Experiment** | Data Category | `data_type.name` | ✅ | Sequencing vs Microscopy |
+| **File** | File Format | `file_format.name` | ✅ | EDAM CV terms |
+| **File** | File Size | `size_in_bytes` | ✅ | Integer bytes |
+| **Sample** | Tissue/Anatomy | `collections.anatomy.name` | ✅ | UBERON CV terms |
+| **Sample** | Sample Prep | `collections.biosamples.sample_prep_method` | ✅ | OBI CV terms |
+| **Sample** | Biosource/Cell Line | `collections.biosamples.local_id` | ⚠️ | Cell line in biosample ID |
+| **Sample** | Organism | `collections.subjects.taxonomy.name` | ✅ | NCBI taxonomy |
+| **Sample** | Cell Line Tier | — | ❌ | 4DN-specific |
+| **Dataset** | Dataset/Collection | `collections.name` | ✅ | Collection grouping |
+| **Dataset** | Publication/DOI | `collections.persistent_id` | ⚠️ | If DOI linked |
+| **Dataset** | Condition | — | ❌ | 4DN-specific |
+| **Provider** | DCC | `dcc.dcc_abbreviation` | ✅ | Always "4DN" |
+| **Provider** | Lab/Project | `project.name` | ✅ | Via project FK |
+
+**Legend:** ✅ Supported | ⚠️ Partial | ❌ Not Available

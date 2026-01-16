@@ -142,4 +142,25 @@ db.subject_in_collection.createIndex({ submission: 1 });
 print("Creating indexes on 'locks' collection...");
 db.locks.createIndex({ active: 1 });
 
+print("Creating indexes on 'ncbi_taxonomy' collection...");
+db.ncbi_taxonomy.createIndex({ id: 1 });
+db.ncbi_taxonomy.createIndex({ name: 1 });
+db.ncbi_taxonomy.createIndex({ clade: 1 });
+db.ncbi_taxonomy.createIndex({ submission: 1, id: 1 }, { unique: true });
+
+print("Creating indexes on 'subject_role_taxonomy' collection...");
+db.subject_role_taxonomy.createIndex({ subject_id_namespace: 1 });
+db.subject_role_taxonomy.createIndex({ subject_local_id: 1 });
+db.subject_role_taxonomy.createIndex({ subject_id_namespace: 1, subject_local_id: 1 });
+db.subject_role_taxonomy.createIndex({ taxonomy_id: 1 });
+db.subject_role_taxonomy.createIndex({ submission: 1 });
+
+print("Creating indexes on 'project' collection...");
+db.project.createIndex({ id_namespace: 1 });
+db.project.createIndex({ local_id: 1 });
+db.project.createIndex({ id_namespace: 1, local_id: 1 });
+db.project.createIndex({ name: 1 });
+db.project.createIndex({ abbreviation: 1 });
+db.project.createIndex({ submission: 1 });
+
 print("All indexes created successfully");

@@ -11,6 +11,22 @@ class AnatomyInput:
 
 
 @strawberry.input
+class NCBITaxonomyInput:
+    id: list[str] | None = None
+    name: list[str] | None = None
+    clade: list[str] | None = None
+
+
+@strawberry.input
+class ProjectInput:
+    id_namespace: list[str] | None = None
+    local_id: list[str] | None = None
+    name: list[str] | None = None
+    abbreviation: list[str] | None = None
+    description: list[str] | None = None
+
+
+@strawberry.input
 class AssayTypeInput:
     id: list[str] | None = None
     name: list[str] | None = None
@@ -31,6 +47,7 @@ class SubjectInput:
     age_at_enrollment: list[float] | None = None
     age_at_sampling: list[float] | None = None
     race: list[str] | None = None
+    taxonomy: list[NCBITaxonomyInput] | None = None
 
 
 @strawberry.input
@@ -92,6 +109,7 @@ class FileFormatInput:
 class FileMetadataInput:
     dcc: list[DCCInput] | None = None
     collections: list[CollectionInput] | None = None
+    project: list[ProjectInput] | None = None
     id_namespace: list[str] | None = None
     local_id: list[str] | None = None
     project_id_namespace: list[str] | None = None

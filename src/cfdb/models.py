@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class FileMetadataModel(BaseModel):
@@ -100,6 +100,9 @@ class FileMetadataModel(BaseModel):
         data_access_level:
             HuBMAP data access level ("public", "consortium", "protected") cached
             from HuBMAP Search API.
+
+        project:
+            The primary project within which this file was created.
     """
 
     class Config:
@@ -107,6 +110,7 @@ class FileMetadataModel(BaseModel):
 
     dcc: DCC
     collections: List[Collection]
+    project: Optional[Project] = None
     id_namespace: str = str()
     local_id: str = str()
     project_id_namespace: str = str()
@@ -380,6 +384,70 @@ class Anatomy(BaseModel):
     description: Optional[str] = None
 
 
+class NCBITaxonomy(BaseModel):
+    """
+    An NCBI Taxonomy term for organism classification.
+
+    Used to identify the species or organism associated with a C2M2 subject.
+
+    Attributes:
+        id:
+            An NCBI Taxonomy Database ID (e.g., NCBI:txid9606 for human).
+
+        name:
+            A short, human-readable label for this taxon (e.g., 'Homo sapiens').
+
+        clade:
+            The phylogenetic level assigned to this taxon (e.g., species, genus).
+
+        description:
+            A human-readable description of this taxon.
+    """
+
+    id: str = str()
+    name: str = str()
+    clade: Optional[str] = None
+    description: Optional[str] = None
+
+
+class Project(BaseModel):
+    """
+    A node in the C2M2 project hierarchy.
+
+    Represents a project that subdivides resources described by a DCC's C2M2
+    metadata.
+
+    Attributes:
+        id_namespace:
+            A CFDE-cleared identifier representing the top-level data space
+            containing this project. Part 1 of 2-component composite primary key.
+
+        local_id:
+            An identifier representing this project, unique within this
+            id_namespace. Part 2 of 2-component composite primary key.
+
+        name:
+            A short, human-readable, machine-read-friendly label for this project.
+
+        abbreviation:
+            A very short display label for this project.
+
+        description:
+            A human-readable description of this project.
+
+        persistent_id:
+            A persistent, resolvable (not necessarily retrievable) URI or compact
+            ID permanently attached to this project.
+    """
+
+    id_namespace: str = str()
+    local_id: str = str()
+    name: str = str()
+    abbreviation: Optional[str] = None
+    description: Optional[str] = None
+    persistent_id: Optional[str] = None
+
+
 class Subject(BaseModel):
     """
     A human or organism from which biosamples are derived.
@@ -435,6 +503,10 @@ class Subject(BaseModel):
             Self-identified race(s) of this subject. A list of CFDE CV term IDs
             since subjects can identify with multiple races. Populated from the
             subject_race junction table.
+
+        taxonomy:
+            NCBI taxonomy information for this subject's organism. Populated from
+            the subject_role_taxonomy junction table.
     """
 
     id_namespace: str = str()
@@ -449,3 +521,11 @@ class Subject(BaseModel):
     age_at_enrollment: Optional[float] = None
     age_at_sampling: Optional[float] = None
     race: List[str] = []
+    taxonomy: Optional[NCBITaxonomy] = None
+
+    @field_validator("age_at_enrollment", "age_at_sampling", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v

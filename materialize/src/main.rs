@@ -39,6 +39,8 @@ struct LookupTables {
     data_types: LookupMap,
     assay_types: LookupMap,
     anatomies: LookupMap,
+    ncbi_taxonomies: LookupMap,
+    projects: HashMap<(String, String), Document>,
     collections: HashMap<(String, String), Document>,
     biosamples: HashMap<(String, String), Document>,
     subjects: HashMap<(String, String), Document>,
@@ -46,6 +48,7 @@ struct LookupTables {
     biosample_in_collection: MultiMap,
     biosample_from_subject: MultiMap,
     subject_race: MultiMap,
+    subject_role_taxonomy: MultiMap,
     collection_by_persistent_id: HashMap<String, (String, String)>,
     collection_anatomy: MultiMap,
     subject_in_collection: MultiMap,
@@ -240,6 +243,13 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
     let anatomies = load_lookup_table(&db.collection("anatomy"), submission_filter);
     println!("  anatomy: {} entries", anatomies.len());
 
+    let ncbi_taxonomies = load_lookup_table(&db.collection("ncbi_taxonomy"), submission_filter);
+    println!("  ncbi_taxonomy: {} entries", ncbi_taxonomies.len());
+
+    // Load projects keyed by (id_namespace, local_id)
+    let projects = load_entity_table(&db.collection("project"), submission_filter);
+    println!("  project: {} entries", projects.len());
+
     // Load collections keyed by (id_namespace, local_id)
     let collections = load_entity_table(&db.collection("collection"), submission_filter);
     println!("  collection: {} entries", collections.len());
@@ -267,6 +277,13 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
     let subject_race = load_subject_race(&db.collection("subject_race"), submission_filter);
     println!("  subject_race: {} entries", subject_race.len());
 
+    let subject_role_taxonomy =
+        load_subject_role_taxonomy(&db.collection("subject_role_taxonomy"), submission_filter);
+    println!(
+        "  subject_role_taxonomy: {} entries",
+        subject_role_taxonomy.len()
+    );
+
     // Build collection persistent_id lookup (for DOI-based file→collection matching)
     let collection_by_persistent_id =
         load_collection_by_persistent_id(&db.collection("collection"), submission_filter);
@@ -292,6 +309,8 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
         data_types,
         assay_types,
         anatomies,
+        ncbi_taxonomies,
+        projects,
         collections,
         biosamples,
         subjects,
@@ -299,6 +318,7 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
         biosample_in_collection,
         biosample_from_subject,
         subject_race,
+        subject_role_taxonomy,
         collection_by_persistent_id,
         collection_anatomy,
         subject_in_collection,
@@ -315,6 +335,20 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
         let mut dcc_copy = dcc.clone();
         dcc_copy.remove("_id");
         file.insert("dcc", dcc_copy);
+    }
+
+    // Lookup project via FK
+    if let (Ok(proj_ns), Ok(proj_id)) = (
+        file.get_str("project_id_namespace"),
+        file.get_str("project_local_id"),
+    ) {
+        if !proj_ns.is_empty() && !proj_id.is_empty() {
+            if let Some(project) = lookups.projects.get(&(proj_ns.to_string(), proj_id.to_string())) {
+                let mut proj_copy = project.clone();
+                proj_copy.remove("_id");
+                file.insert("project", proj_copy);
+            }
+        }
     }
 
     // Lookup file_format (skip empty strings)
@@ -447,6 +481,21 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
                         }
                         subj_copy.insert("race", races);
 
+                        // Add taxonomy from subject_role_taxonomy
+                        if let Some(srt_entries) = lookups.subject_role_taxonomy.get(&subj_key) {
+                            if let Some(srt) = srt_entries.first() {
+                                if let Ok(tax_id) = srt.get_str("taxonomy_id") {
+                                    if let Some(taxonomy) =
+                                        lookups.ncbi_taxonomies.get(&(submission.clone(), tax_id.to_string()))
+                                    {
+                                        let mut tax_copy = taxonomy.clone();
+                                        tax_copy.remove("_id");
+                                        subj_copy.insert("taxonomy", tax_copy);
+                                    }
+                                }
+                            }
+                        }
+
                         coll_subjects.push(subj_copy);
                     }
                 }
@@ -522,6 +571,21 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
                                         }
                                     }
                                     subj_copy.insert("race", races);
+
+                                    // Add taxonomy from subject_role_taxonomy
+                                    if let Some(srt_entries) = lookups.subject_role_taxonomy.get(&subj_key) {
+                                        if let Some(srt) = srt_entries.first() {
+                                            if let Ok(tax_id) = srt.get_str("taxonomy_id") {
+                                                if let Some(taxonomy) =
+                                                    lookups.ncbi_taxonomies.get(&(submission.clone(), tax_id.to_string()))
+                                                {
+                                                    let mut tax_copy = taxonomy.clone();
+                                                    tax_copy.remove("_id");
+                                                    subj_copy.insert("taxonomy", tax_copy);
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     enriched_subjects.push(subj_copy);
                                 }
@@ -645,6 +709,21 @@ fn load_subject_race(coll: &Collection<Document>, submission: &Option<String>) -
     map
 }
 
+fn load_subject_role_taxonomy(coll: &Collection<Document>, submission: &Option<String>) -> MultiMap {
+    let mut map: MultiMap = HashMap::new();
+    for doc in load_collection_filtered(coll, submission) {
+        if let (Ok(ns), Ok(id)) = (
+            doc.get_str("subject_id_namespace"),
+            doc.get_str("subject_local_id"),
+        ) {
+            map.entry((ns.to_string(), id.to_string()))
+                .or_default()
+                .push(doc);
+        }
+    }
+    map
+}
+
 fn load_collection_by_persistent_id(
     coll: &Collection<Document>,
     submission: &Option<String>,
@@ -742,6 +821,16 @@ fn create_indexes(coll: &Collection<Document>) -> Result<()> {
         doc! { "collections.biosamples.subjects.age_at_enrollment": 1 },
         doc! { "collections.biosamples.subjects.age_at_sampling": 1 },
         doc! { "collections.biosamples.subjects.race": 1 },
+        doc! { "collections.biosamples.subjects.taxonomy.id": 1 },
+        doc! { "collections.biosamples.subjects.taxonomy.name": 1 },
+        // Collection subject taxonomy indexes
+        doc! { "collections.subjects.taxonomy.id": 1 },
+        doc! { "collections.subjects.taxonomy.name": 1 },
+        // Project indexes
+        doc! { "project.id_namespace": 1 },
+        doc! { "project.local_id": 1 },
+        doc! { "project.name": 1 },
+        doc! { "project.abbreviation": 1 },
         doc! { "data_access_level": 1 },
         doc! { "submission": 1 },
     ];
