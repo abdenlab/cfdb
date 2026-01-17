@@ -185,6 +185,7 @@ The central entity representing a stable digital asset.
 | `local_id` | string | Identifier unique within the namespace (PK part 2) |
 | `dcc` | DCC | The Data Coordinating Center that produced this file |
 | `collections` | Collection[] | Collections containing this file |
+| `project` | Project? | The primary project within which this file was created |
 | `project_id_namespace` | string | Project namespace (FK part 1) |
 | `project_local_id` | string | Project local ID (FK part 2) |
 | `persistent_id` | string? | Permanent URI or compact ID |
@@ -203,6 +204,8 @@ The central entity representing a stable digital asset.
 | `bundle_collection_local_id` | string? | Bundle collection local ID |
 | `dbgap_study_id` | string? | dbGaP study ID for access control |
 | `access_url` | string? | DRS URI or publicly accessible URL |
+| `status` | string? | Dataset status (e.g., "Published", "QA") - HuBMAP specific |
+| `data_access_level` | string? | Access level: public, consortium, or protected - HuBMAP specific |
 
 ##### DCC
 
@@ -229,6 +232,8 @@ A grouping of files, biosamples, and/or subjects.
 | `id_namespace` | string | Collection namespace (PK part 1) |
 | `local_id` | string | Collection local ID (PK part 2) |
 | `biosamples` | Biosample[] | Biosamples in this collection |
+| `subjects` | Subject[] | Subjects (donors) directly in this collection |
+| `anatomy` | Anatomy[] | Anatomy terms associated with this collection |
 | `persistent_id` | string? | Permanent URI |
 | `creation_time` | string? | ISO 8601 timestamp |
 | `abbreviation` | string? | Short display label |
@@ -250,6 +255,7 @@ A tissue sample or other physical specimen.
 | `sample_prep_method` | string? | OBI CV term for preparation method |
 | `anatomy` | Anatomy? | UBERON CV term for anatomical origin |
 | `biofluid` | string? | UBERON/InterLex term for fluid origin |
+| `subjects` | Subject[] | Subjects (donors) from which this biosample was derived |
 
 ##### Anatomy
 
@@ -290,6 +296,50 @@ An OBI (Ontology for Biomedical Investigations) CV term describing experiment ty
 | `id` | string | OBI CV term identifier |
 | `name` | string | Human-readable label |
 | `description` | string? | Human-readable description |
+
+##### Subject
+
+A human or organism from which biosamples are derived.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id_namespace` | string | Subject namespace (PK part 1) |
+| `local_id` | string | Subject local ID (PK part 2) |
+| `project_id_namespace` | string | Project namespace (FK part 1) |
+| `project_local_id` | string | Project local ID (FK part 2) |
+| `persistent_id` | string? | Permanent URI |
+| `creation_time` | string? | ISO 8601 timestamp |
+| `granularity` | string? | CFDE CV term (single organism, cell line, microbiome, etc.) |
+| `sex` | string? | NCIT CV term for biological sex |
+| `ethnicity` | string? | NCIT CV term for self-reported ethnicity |
+| `age_at_enrollment` | float? | Age in years when enrolled in primary project |
+| `age_at_sampling` | float? | Age in years when biosample was taken |
+| `race` | string[] | CFDE CV terms for self-identified race(s) |
+| `taxonomy` | NCBITaxonomy? | NCBI taxonomy for the subject's organism |
+
+##### NCBITaxonomy
+
+An NCBI Taxonomy term for organism classification.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | NCBI Taxonomy Database ID (e.g., NCBI:txid9606) |
+| `name` | string | Taxonomy name (e.g., "Homo sapiens") |
+| `clade` | string? | Phylogenetic level (e.g., species, genus) |
+| `description` | string? | Human-readable description |
+
+##### Project
+
+A node in the C2M2 project hierarchy.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id_namespace` | string | Project namespace (PK part 1) |
+| `local_id` | string | Project local ID (PK part 2) |
+| `name` | string | Human-readable label |
+| `abbreviation` | string? | Short display label |
+| `description` | string? | Human-readable description |
+| `persistent_id` | string? | Permanent URI or compact ID |
 
 #### Query Mechanics
 
@@ -433,15 +483,27 @@ The data model uses MongoDB aggregation pipelines to join related entities:
 ```
 file
 ├── dcc (DCC) ─────────────────── via submission field
+├── project (Project) ─────────── via project FK
 ├── file_format (FileFormat) ──── via file_format ID
 ├── data_type (DataType) ──────── via data_type ID
 ├── assay_type (AssayType) ────── via assay_type ID
-└── collections[] (Collection)
-    └── biosamples[] (Biosample)
-        └── anatomy (Anatomy) ─── via anatomy ID
+└── collections[] (Collection) ── via file_in_collection
+    ├── anatomy[] (Anatomy) ───── via collection_anatomy
+    ├── subjects[] (Subject) ──── via subject_in_collection
+    │   └── taxonomy (NCBITaxonomy) ── via subject_role_taxonomy
+    └── biosamples[] (Biosample) ─ via biosample_in_collection
+        ├── anatomy (Anatomy) ──── via anatomy ID
+        └── subjects[] (Subject) ─ via biosample_from_subject
+            └── taxonomy (NCBITaxonomy) ── via subject_role_taxonomy
 ```
 
-Files are linked to collections through a `file_in_collection` cross-reference table, and biosamples are linked to collections through a `biosample_in_collection` cross-reference table.
+Cross-reference tables:
+- `file_in_collection` - Links files to collections
+- `biosample_in_collection` - Links biosamples to collections
+- `subject_in_collection` - Links subjects directly to collections
+- `biosample_from_subject` - Links biosamples to their source subjects
+- `collection_anatomy` - Links anatomy terms to collections
+- `subject_role_taxonomy` - Links subjects to NCBI taxonomy terms
 
 ### GraphiQL IDE
 
