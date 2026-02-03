@@ -710,3 +710,77 @@ The following table maps 4DN data portal search dimensions to CFDB/C2M2 fields:
 | **Provider** | Lab/Project | `project.name` | ✅ | Via project FK |
 
 **Legend:** ✅ Supported | ⚠️ Partial | ❌ Not Available
+
+## ENCODE Data Portal Filter Mapping
+
+The following table maps ENCODE portal search dimensions to CFDB/C2M2 fields:
+
+| Category | ENCODE Dimension | CFDB Field | Status | Notes |
+|----------|------------------|------------|--------|-------|
+| **File** | Accession | `local_id` | ✅ | Primary identifier |
+| **File** | File Format | `file_format.name` | ✅ | EDAM CV terms (BAM, FASTQ, etc.) |
+| **File** | File Size | `size_in_bytes` | ✅ | Integer bytes |
+| **File** | MD5 Checksum | `md5` | ✅ | From md5sum field |
+| **File** | Output Type | `data_type.name` | ✅ | EDAM data terms (alignments, peaks, etc.) |
+| **File** | Output Type (raw) | `extra.output_type` | ✅ | Original ENCODE value |
+| **File** | Download URL | `access_url` | ✅ | Direct from metadata TSV |
+| **File** | Status | `status` | ✅ | e.g., "released" |
+| **File** | Access Level | `data_access_level` | ✅ | Always "public" |
+| **File** | Assembly | `extra.assembly` | ✅ | GRCh38, mm10, etc. |
+| **File** | File Type | `extra.file_type` | ✅ | e.g., "alignments", "peaks" |
+| **File** | Format Type | `extra.file_format_type` | ✅ | narrowPeak, broadPeak, etc. |
+| **File** | Read Length | `extra.read_length` | ✅ | Sequencing read length |
+| **File** | Mapped Read Length | `extra.mapped_read_length` | ✅ | Mapped read length |
+| **File** | Run Type | `extra.run_type` | ✅ | single-ended/paired-ended |
+| **File** | Paired End | `extra.paired_end` | ✅ | 1 or 2 for paired reads |
+| **File** | Paired With | `extra.paired_with` | ✅ | Paired file accession |
+| **File** | Index Of | `extra.index_of` | ✅ | Indexed file accession |
+| **File** | Derived From | `extra.derived_from` | ✅ | Upstream file accessions |
+| **File** | Controlled By | `extra.controlled_by` | ✅ | Control file accessions |
+| **File** | s3 URI | `extra.s3_uri` | ✅ | S3 storage path |
+| **File** | Azure URL | `extra.azure_url` | ✅ | Azure storage URL |
+| **File** | Analysis Title | `extra.file_analysis_title` | ✅ | Analysis pipeline name |
+| **File** | Analysis Status | `extra.file_analysis_status` | ✅ | Analysis pipeline status |
+| **Experiment** | Accession | `extra.experiment_accession` | ✅ | Parent experiment |
+| **Experiment** | Assay | `assay_type.name` | ✅ | OBI CV terms (ATAC-seq, ChIP-seq, etc.) |
+| **Experiment** | Target | `extra.experiment_target` | ✅ | ChIP-seq target, etc. |
+| **Experiment** | Date Released | `creation_time` | ✅ | ISO date |
+| **Experiment** | Project | `extra.project` | ✅ | ENCODE project phase |
+| **Experiment** | Lab | `extra.lab` | ✅ | Lab/PI name |
+| **Experiment** | Platform | `extra.platform` | ✅ | Sequencing platform |
+| **Experiment** | dbxrefs | `extra.dbxrefs` | ✅ | External cross-references |
+| **Experiment** | Genome Annotation | `extra.genome_annotation` | ✅ | e.g., V29, M21 |
+| **Sample** | Biosample Term ID | `collections.anatomy.id` | ✅ | EFO/CL/UBERON ontology IDs |
+| **Sample** | Biosample Term Name | `collections.name`, `collections.anatomy.name` | ✅ | Cell type/tissue name |
+| **Sample** | Biosample Type | `collections.biosamples.extra.biosample_type` | ✅ | primary cell, tissue, cell line, etc. |
+| **Sample** | Organism | `collections.subjects.taxonomy.name` | ✅ | NCBI taxonomy (Homo sapiens, etc.) |
+| **Sample** | Treatments | `collections.biosamples.extra.biosample_treatments` | ✅ | Treatment details |
+| **Sample** | Genetic Modifications | `collections.biosamples.extra.biosample_genetic_modifications` | ✅ | CRISPR, RNAi, etc. |
+| **Donor** | Donor ID | `collections.subjects.local_id` | ✅ | ENCODE donor accession |
+| **Replicate** | Biological Replicate | `extra.biological_replicates` | ✅ | Biological replicate number(s) |
+| **Replicate** | Technical Replicate | `extra.technical_replicates` | ✅ | Technical replicate number(s) |
+| **Library** | Made From | `extra.library_made_from` | ✅ | RNA, DNA, etc. |
+| **Library** | Depleted In | `extra.library_depleted_in` | ✅ | rRNA, etc. |
+| **Library** | Extraction Method | `extra.library_extraction_method` | ✅ | |
+| **Library** | Lysis Method | `extra.library_lysis_method` | ✅ | |
+| **Library** | Crosslinking Method | `extra.library_crosslinking_method` | ✅ | |
+| **Library** | Fragmentation Method | `extra.library_fragmentation_method` | ✅ | |
+| **Library** | Strand Specific | `extra.library_strand_specific` | ✅ | |
+| **Library** | Size Range | `extra.library_size_range` | ✅ | |
+| **Provider** | DCC | `dcc.dcc_abbreviation` | ✅ | Always "ENCODE" |
+| **Donor** | Sex | — | ❌ | Not in metadata TSV; requires per-donor API calls |
+| **Donor** | Age | — | ❌ | Not in metadata TSV; requires per-donor API calls |
+| **Sample** | Life Stage | — | ❌ | Not in metadata TSV |
+
+**Legend:** ✅ Supported | ⚠️ Partial | ❌ Not Available
+
+### ENCODE Integration Notes
+
+Unlike 4DN and HuBMAP which use C2M2-formatted ZIP files from CFDE, ENCODE data is fetched from the ENCODE metadata TSV endpoint at `https://www.encodeproject.org/metadata/`. Key differences:
+
+- **Data Source**: Single metadata TSV download (`/metadata/?type=Experiment&status=released`) instead of paginated JSON API or C2M2 ZIP files
+- **Materialization**: Pre-materialized during sync (no Rust materializer needed)
+- **File Access**: Direct HTTPS streaming (no DRS service)
+- **Access Control**: All released files are publicly accessible
+- **Biosample/Subject Data**: Biosample term, organism, and donor IDs are mapped to C2M2 collections, biosamples, and subjects; biosample-specific metadata (type, treatments, genetic modifications) is stored in `biosample.extra`
+- **Missing Demographics**: Subject sex, age, and life stage are not available in the metadata TSV and would require per-donor API calls to `/human-donors/{id}/`

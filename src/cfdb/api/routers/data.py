@@ -29,14 +29,15 @@ async def stream_file(
 
     For 4DN files: Streams file contents directly via HTTPS.
     For HuBMAP files: Streams public file contents via HTTPS (Globus/protected files not supported).
+    For ENCODE files: Streams directly from ENCODE servers via HTTPS.
 
     Path Parameters:
-        dcc: DCC abbreviation (4dn, hubmap) - case insensitive
+        dcc: DCC abbreviation (4dn, hubmap, encode) - case insensitive
         local_id: The file's unique ID within the DCC
 
     Headers:
         Range: Optional "bytes=start-end" for partial content requests
-            - Supported for HTTPS-accessible files (4DN and public HuBMAP)
+            - Supported for HTTPS-accessible files (4DN, public HuBMAP, ENCODE)
             - Not supported for Globus transfers
 
     Returns:
@@ -95,9 +96,16 @@ async def stream_file(
             f"Looking up file: id_namespace={id_namespace}, local_id={local_id}"
         )
 
-        file_doc = await api.db.file.find_one(
-            {"id_namespace": id_namespace, "local_id": local_id}
-        )
+        # ENCODE files are stored in the pre-materialized 'files' collection
+        # Other DCCs use the 'file' collection (raw C2M2 tables)
+        if normalized_dcc == "encode":
+            file_doc = await api.db.files.find_one(
+                {"id_namespace": id_namespace, "local_id": local_id}
+            )
+        else:
+            file_doc = await api.db.file.find_one(
+                {"id_namespace": id_namespace, "local_id": local_id}
+            )
 
         if not file_doc:
             logger.warning(f"File not found: {id_namespace}/{local_id}")
@@ -140,6 +148,12 @@ async def stream_file(
             raise HTTPException(status_code=501, detail="File has no access URL")
 
         logger.info(f"File access_url: {file_metadata.access_url}")
+
+        # ENCODE files: Stream directly via HTTPS (bypass DRS)
+        if normalized_dcc == "encode":
+            return await _stream_encode_file(
+                file_doc, file_metadata, request, range
+            )
 
         # 5. Fetch DRS object metadata
         try:
@@ -366,3 +380,116 @@ async def stream_file(
     except Exception as e:
         logger.error(f"Unexpected error in stream_file: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+async def _stream_encode_file(
+    file_doc: dict,
+    file_metadata,
+    request: Request,
+    range_header: Optional[str] = None,
+):
+    """
+    Stream ENCODE file directly via HTTPS.
+
+    ENCODE files are publicly accessible and don't require DRS resolution.
+    We stream directly from the ENCODE download URL.
+
+    Args:
+        file_doc: MongoDB document for the file
+        file_metadata: Parsed file metadata (FileMetadataModel or MinimalMetadata)
+        request: FastAPI request object
+        range_header: Optional Range header value
+
+    Returns:
+        StreamingResponse with file contents
+    """
+    download_url = file_metadata.access_url
+    filename = getattr(file_metadata, "filename", None) or file_doc.get("filename", "file")
+    file_size = file_doc.get("size_in_bytes")
+
+    logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
+
+    # Prepare response headers
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Accept-Ranges": "bytes",
+    }
+
+    status_code = 200
+    range_to_send = None
+
+    # Handle Range request if present
+    if range_header:
+        if not file_size:
+            logger.warning("Range request for ENCODE file without size metadata")
+            raise HTTPException(
+                status_code=500,
+                detail="Cannot process range request: file size unavailable",
+            )
+
+        try:
+            start, end, content_length = drs.parse_range_header(range_header, file_size)
+
+            logger.debug(f"Range request: bytes {start}-{end}/{file_size}")
+
+            range_to_send = range_header
+            status_code = 206
+            response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            response_headers["Content-Length"] = str(content_length)
+
+        except drs.RangeNotSatisfiableError as e:
+            logger.warning(f"Range not satisfiable: {range_header} for file size {e.file_size}")
+            raise HTTPException(
+                status_code=416,
+                headers={
+                    "Content-Range": f"bytes */{e.file_size}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+
+        except ValueError as e:
+            logger.warning(f"Invalid Range header syntax: {range_header}")
+            raise HTTPException(status_code=400, detail=f"Invalid Range header: {str(e)}")
+
+    # Determine media type from filename or default to binary
+    media_type = "application/octet-stream"
+    if filename:
+        if filename.endswith(".gz"):
+            media_type = "application/gzip"
+        elif filename.endswith(".bam"):
+            media_type = "application/octet-stream"
+        elif filename.endswith(".fastq") or filename.endswith(".fq"):
+            media_type = "text/plain"
+        elif filename.endswith(".bed"):
+            media_type = "text/plain"
+        elif filename.endswith(".bigWig") or filename.endswith(".bw"):
+            media_type = "application/octet-stream"
+        elif filename.endswith(".bigBed") or filename.endswith(".bb"):
+            media_type = "application/octet-stream"
+
+    # For full file requests, include Content-Length if available
+    if not range_header and file_size:
+        response_headers["Content-Length"] = str(file_size)
+
+    # HEAD request - return headers only, no body
+    if request.method == "HEAD":
+        return Response(
+            status_code=status_code,
+            media_type=media_type,
+            headers=response_headers,
+        )
+
+    # Stream file content
+    try:
+        chunk_gen = drs.stream_from_url(download_url, range_to_send)
+
+        return StreamingResponse(
+            chunk_gen,
+            status_code=status_code,
+            media_type=media_type,
+            headers=response_headers,
+        )
+
+    except Exception as e:
+        logger.error(f"ENCODE streaming error: {str(e)}")
+        raise HTTPException(status_code=502, detail="Failed to stream ENCODE file")

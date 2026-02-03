@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Optional
 
 from cfdb import api
-from cfdb.dcc_registry import get_all_dcc_names, get_dcc_config, normalize_dcc_name
+from cfdb.dcc_registry import (
+    get_all_dcc_names,
+    get_dcc_config,
+    get_dcc_type,
+    normalize_dcc_name,
+)
 from cfdb.downloader import cleanup_zip, download_file, extract_zip
 from cfdb.services import locks
 
@@ -121,53 +126,136 @@ async def _sync_dccs(task: SyncTask) -> None:
 
     for dcc in task.dcc_names:
         task.current_dcc = dcc
-        config = get_dcc_config(dcc)
+        dcc_type = get_dcc_type(dcc)
 
-        # Step 1: Download
-        task.current_step = "downloading"
-        task.progress = f"Downloading {dcc.upper()} datapackage..."
-        logger.info(task.progress)
-
-        url = config["latest_url"]
-        zip_filename = Path(url).name
-        zip_path = downloads_path / zip_filename
-
-        await download_file(url, zip_path, show_progress=False)
-
-        # Step 2: Extract
-        task.current_step = "extracting"
-        task.progress = f"Extracting {dcc.upper()} datapackage..."
-        logger.info(task.progress)
-
-        extract_dir = data_path / dcc
-        extract_zip(zip_path, extract_dir)
-
-        # Step 3 & 4: Clear + Load (CUTOVER - acquire DB lock)
-        task.current_step = "cutover"
-        task.progress = f"Performing database cutover for {dcc.upper()}..."
-        logger.info(task.progress)
-
-        async with locks.CutoverLock(dcc):
-            await _clear_dcc_data_async(dcc)
-            await _load_dataset_async(extract_dir, dcc)
-
-        # Step 5: Cleanup
-        task.current_step = "cleanup"
-        task.progress = f"Cleaning up {dcc.upper()}..."
-        logger.info(task.progress)
-
-        cleanup_zip(zip_path)
-
-        # Step 6: Materialize files collection for this DCC
-        task.current_step = "materializing"
-        task.progress = f"Materializing files for {dcc.upper()}..."
-        logger.info(task.progress)
-
-        await _materialize_files(dcc)
+        # Branch on DCC type
+        if dcc_type == "rest_api" and dcc == "encode":
+            await _sync_encode(task)
+        else:
+            await _sync_c2m2_zip(task, data_path, downloads_path)
 
         logger.info(f"{dcc.upper()} synced successfully")
 
     task.progress = "All DCCs synced successfully"
+    logger.info(task.progress)
+
+
+async def _sync_c2m2_zip(
+    task: SyncTask, data_path: Path, downloads_path: Path
+) -> None:
+    """Sync a DCC using C2M2 ZIP datapackage."""
+    dcc = task.current_dcc
+    config = get_dcc_config(dcc)
+
+    # Step 1: Download
+    task.current_step = "downloading"
+    task.progress = f"Downloading {dcc.upper()} datapackage..."
+    logger.info(task.progress)
+
+    url = config["latest_url"]
+    zip_filename = Path(url).name
+    zip_path = downloads_path / zip_filename
+
+    await download_file(url, zip_path, show_progress=False)
+
+    # Step 2: Extract
+    task.current_step = "extracting"
+    task.progress = f"Extracting {dcc.upper()} datapackage..."
+    logger.info(task.progress)
+
+    extract_dir = data_path / dcc
+    extract_zip(zip_path, extract_dir)
+
+    # Step 3 & 4: Clear + Load (CUTOVER - acquire DB lock)
+    task.current_step = "cutover"
+    task.progress = f"Performing database cutover for {dcc.upper()}..."
+    logger.info(task.progress)
+
+    async with locks.CutoverLock(dcc):
+        await _clear_dcc_data_async(dcc)
+        await _load_dataset_async(extract_dir, dcc)
+
+    # Step 5: Cleanup
+    task.current_step = "cleanup"
+    task.progress = f"Cleaning up {dcc.upper()}..."
+    logger.info(task.progress)
+
+    cleanup_zip(zip_path)
+
+    # Step 6: Materialize files collection for this DCC
+    task.current_step = "materializing"
+    task.progress = f"Materializing files for {dcc.upper()}..."
+    logger.info(task.progress)
+
+    await _materialize_files(dcc)
+
+
+async def _sync_encode(task: SyncTask) -> None:
+    """
+    Sync ENCODE data from REST API.
+
+    Unlike C2M2 ZIP sources, ENCODE data is fetched from the REST API
+    and pre-materialized directly into the files collection.
+    """
+    from cfdb.services.encode import (
+        build_encode_dcc_record,
+        fetch_encode_metadata,
+        transform_to_c2m2,
+    )
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    # Step 1: Clear existing ENCODE data
+    task.current_step = "clearing"
+    task.progress = "Clearing existing ENCODE data..."
+    logger.info(task.progress)
+
+    async with locks.CutoverLock("encode"):
+        await _clear_dcc_data_async("encode")
+
+        # Step 2: Upsert DCC record
+        task.current_step = "dcc_record"
+        task.progress = "Creating ENCODE DCC record..."
+        logger.info(task.progress)
+
+        dcc_record = build_encode_dcc_record()
+        await api.db.dcc.update_one(
+            {"submission": "encode"},
+            {"$set": dcc_record},
+            upsert=True,
+        )
+
+        # Step 3: Fetch and transform files from ENCODE API
+        task.current_step = "fetching"
+        task.progress = "Fetching files from ENCODE API..."
+        logger.info(task.progress)
+
+        batch = []
+        count = 0
+
+        async for encode_file in fetch_encode_metadata():
+            # Transform to C2M2 format
+            doc = transform_to_c2m2(encode_file)
+            if doc is None:
+                continue
+
+            batch.append(doc)
+            count += 1
+
+            # Insert in batches
+            if len(batch) >= BATCH_SIZE:
+                await api.db.files.insert_many(batch)
+                task.progress = f"Inserted {count} ENCODE files..."
+                logger.info(task.progress)
+                batch.clear()
+
+        # Insert remaining batch
+        if batch:
+            await api.db.files.insert_many(batch)
+            logger.info(f"Inserted final batch, total: {count} ENCODE files")
+
+    task.progress = f"ENCODE sync complete: {count} files"
     logger.info(task.progress)
 
 

@@ -1,6 +1,7 @@
-from typing import get_type_hints
+from typing import Optional, Union, get_type_hints
 
 import strawberry
+import strawberry.scalars
 from bson import ObjectId
 from pydantic import BaseModel
 
@@ -48,6 +49,23 @@ def build_strawberry_type(type):
     return T
 
 
+def _resolve_json_type(field_type):
+    """Replace dict types with strawberry.scalars.JSON for GraphQL compatibility."""
+    if getattr(field_type, "__origin__", None) is dict:
+        return strawberry.scalars.JSON
+    args = getattr(field_type, "__args__", None)
+    if args and any(getattr(a, "__origin__", None) is dict for a in args):
+        new_args = tuple(
+            strawberry.scalars.JSON if getattr(a, "__origin__", None) is dict else a
+            for a in args
+        )
+        if len(new_args) == 2 and type(None) in new_args:
+            non_none = next(a for a in new_args if a is not type(None))
+            return Optional[non_none]
+        return Union[new_args]
+    return field_type
+
+
 def annotate(model, name=None):
     def wrapper(cls):
         if name:
@@ -57,7 +75,7 @@ def annotate(model, name=None):
                 if field_type is ObjectId:
                     cls.__annotations__[field_name] = ObjectIdScalar
                 else:
-                    cls.__annotations__[field_name] = field_type
+                    cls.__annotations__[field_name] = _resolve_json_type(field_type)
             else:
                 try:
                     if isinstance(field_type, type) and issubclass(

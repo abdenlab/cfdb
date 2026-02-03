@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, field_validator
 
@@ -101,6 +101,10 @@ class FileMetadataModel(BaseModel):
             HuBMAP data access level ("public", "consortium", "protected") cached
             from HuBMAP Search API.
 
+        extra:
+            DCC-specific metadata that doesn't map to C2M2 fields. For ENCODE:
+            assembly, output_type, platform, etc.
+
         project:
             The primary project within which this file was created.
     """
@@ -133,6 +137,7 @@ class FileMetadataModel(BaseModel):
     access_url: Optional[str] = None
     status: Optional[str] = None
     data_access_level: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
 
 
 class DCC(BaseModel):
@@ -358,6 +363,7 @@ class Biosample(BaseModel):
     anatomy: Optional[Anatomy] = None
     biofluid: Optional[str] = None
     subjects: List[Subject] = []
+    extra: Optional[Dict[str, Any]] = None
 
 
 class Anatomy(BaseModel):
