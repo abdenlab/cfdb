@@ -325,10 +325,43 @@ fn load_lookup_tables(db: &mongodb::sync::Database, submission_filter: &Option<S
     }
 }
 
+/// Map file extension to enriched file format name for ambiguous container formats.
+/// Returns Some(format_name) if the extension indicates a specific data format
+/// that would otherwise be obscured by a generic container format (e.g., HDF5).
+fn get_enriched_file_format(filename: &str) -> Option<&'static str> {
+    // Extract extension (handle compound extensions like .pairs.gz)
+    let lower = filename.to_lowercase();
+
+    // Check compound extensions first
+    if lower.ends_with(".pairs.gz") {
+        return Some("pairs");
+    }
+
+    // Extract simple extension
+    let ext = lower.rsplit('.').next()?;
+
+    match ext {
+        // Hi-C related formats (HDF5-based or custom binary)
+        "mcool" => Some("mcool"),
+        "cool" => Some("cool"),
+        "hic" => Some("hic"),
+        "pairs" => Some("pairs"),
+        // Microscopy formats
+        "r3d" => Some("r3d"),
+        "nd2" => Some("nd2"),
+        "flex" => Some("flex"),
+        "spt" => Some("spt"),
+        // Other specialized formats that may lack proper file_format
+        "matrix" => Some("matrix"),
+        _ => None,
+    }
+}
+
 fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
     let submission = file.get_str("submission").unwrap_or_default().to_string();
     let id_namespace = file.get_str("id_namespace").unwrap_or_default().to_string();
     let local_id = file.get_str("local_id").unwrap_or_default().to_string();
+    let filename = file.get_str("filename").unwrap_or_default().to_string();
 
     // Lookup DCC
     if let Some(dcc) = lookups.dccs.get(&submission) {
@@ -352,15 +385,32 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
     }
 
     // Lookup file_format (skip empty strings)
-    if let Some(format_id) = file.get_str("file_format").ok() {
-        if !format_id.is_empty() {
-            if let Some(format) = lookups.file_formats.get(&(submission.clone(), format_id.to_string())) {
-                let mut format_copy = format.clone();
-                format_copy.remove("_id");
-                file.insert("file_format", format_copy);
+    let file_format_id = file.get_str("file_format").unwrap_or_default().to_string();
+    if !file_format_id.is_empty() {
+        if let Some(format) = lookups.file_formats.get(&(submission.clone(), file_format_id.clone())) {
+            let mut format_copy = format.clone();
+            format_copy.remove("_id");
+            file.insert("file_format", format_copy);
+        }
+    } else {
+        file.remove("file_format");
+    }
+
+    // Enrich file format for ambiguous container formats.
+    // When file_format is a generic container (e.g., HDF5) or missing entirely,
+    // derive a more specific format from the filename extension.
+    if let Some(enriched_format) = get_enriched_file_format(&filename) {
+        let is_ambiguous = file_format_id.is_empty()
+            || file_format_id == "format:3590"  // HDF5
+            || file_format_id == "format:2330";  // Plain text (e.g., .pairs)
+
+        if is_ambiguous {
+            let extra = file.entry("extra".to_string())
+                .or_insert_with(|| bson::Bson::Document(Document::new()))
+                .as_document_mut();
+            if let Some(extra_doc) = extra {
+                extra_doc.insert("enriched_file_format", enriched_format);
             }
-        } else {
-            file.remove("file_format");
         }
     }
 

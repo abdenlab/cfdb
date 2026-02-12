@@ -7,6 +7,7 @@ DCC_CONFIG = {
         "type": "c2m2_zip",
         "s3_base": "https://cfde-drc.s3.amazonaws.com/4DN/C2M2/",
         "latest_url": "https://cfde-drc.s3.amazonaws.com/4DN/C2M2/2025-09-24/250924_c2m2_4dn_sub.zip",
+        "api_base": "https://data.4dnucleome.org",
     },
     "hubmap": {
         "name": "HuBMAP",

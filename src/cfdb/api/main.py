@@ -8,6 +8,7 @@ from strawberry.fastapi import GraphQLRouter
 from cfdb import api
 from cfdb.api.gql.schema import schema
 from cfdb.api.routers.data import router as data_router
+from cfdb.api.routers.index import router as index_router
 from cfdb.api.routers.sync import router as sync_router
 
 logging.basicConfig(level=logging.INFO)
@@ -44,4 +45,5 @@ async def lifespan(_: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.include_router(GraphQLRouter(schema), prefix="/metadata")
 app.include_router(data_router)
+app.include_router(index_router)
 app.include_router(sync_router)

@@ -51,6 +51,15 @@ class SubjectInput:
 
 
 @strawberry.input
+class EnrichedBiosampleInput:
+    biosample_type: list[str] | None = None
+    biosample_treatments: list[str] | None = None
+    biosample_treatments_amount: list[str] | None = None
+    biosample_treatments_duration: list[str] | None = None
+    biosample_genetic_modifications: list[str] | None = None
+
+
+@strawberry.input
 class BiosampleInput:
     id_namespace: list[str] | None = None
     local_id: list[str] | None = None
@@ -62,6 +71,32 @@ class BiosampleInput:
     anatomy: list[AnatomyInput] | None = None
     biofluid: list[str] | None = None
     subjects: list[SubjectInput] | None = None
+    extra: list[EnrichedBiosampleInput] | None = None
+
+
+@strawberry.input
+class EnrichedCollectionInput:
+    display_title: list[str] | None = None
+    experiment_type: list[str] | None = None
+    targeted_factor: list[str] | None = None
+    digestion_enzyme: list[str] | None = None
+    lab: list[str] | None = None
+    crosslinking_method: list[str] | None = None
+    crosslinking_temperature: list[str] | None = None
+    crosslinking_time: list[str] | None = None
+    ligation_temperature: list[str] | None = None
+    ligation_volume: list[str] | None = None
+    ligation_time: list[str] | None = None
+    digestion_temperature: list[str] | None = None
+    digestion_time: list[str] | None = None
+    tagging_method: list[str] | None = None
+    fragmentation_method: list[str] | None = None
+    biotin_removed: list[str] | None = None
+    library_prep_kit: list[str] | None = None
+    average_fragment_size: list[str] | None = None
+    fragment_size_range: list[str] | None = None
+    status: list[str] | None = None
+    date_created: list[str] | None = None
 
 
 @strawberry.input
@@ -76,6 +111,7 @@ class CollectionInput:
     description: list[str] | None = None
     anatomy: list[AnatomyInput] | None = None
     subjects: list[SubjectInput] | None = None
+    extra: list[EnrichedCollectionInput] | None = None
 
 
 @strawberry.input
@@ -106,6 +142,60 @@ class FileFormatInput:
 
 
 @strawberry.input
+class EnrichedFileInput:
+    # 4DN materializer
+    enriched_file_format: list[str] | None = None
+    # 4DN API enrichment
+    genome_assembly: list[str] | None = None
+    file_type: list[str] | None = None
+    file_type_detailed: list[str] | None = None
+    condition: list[str] | None = None
+    biosource_name: list[str] | None = None
+    dataset: list[str] | None = None
+    experiment_type: list[str] | None = None
+    assay_info: list[str] | None = None
+    replicate_info: list[str] | None = None
+    cell_line_tier: list[str] | None = None
+    # ENCODE
+    assembly: list[str] | None = None
+    file_format_type: list[str] | None = None
+    output_type: list[str] | None = None
+    experiment_accession: list[str] | None = None
+    experiment_target: list[str] | None = None
+    project: list[str] | None = None
+    lab: list[str] | None = None
+    platform: list[str] | None = None
+    dbxrefs: list[str] | None = None
+    genome_annotation: list[str] | None = None
+    controlled_by: list[str] | None = None
+    s3_uri: list[str] | None = None
+    azure_url: list[str] | None = None
+    file_analysis_title: list[str] | None = None
+    file_analysis_status: list[str] | None = None
+    biological_replicates: list[str] | None = None
+    technical_replicates: list[str] | None = None
+    read_length: list[str] | None = None
+    mapped_read_length: list[str] | None = None
+    run_type: list[str] | None = None
+    paired_end: list[str] | None = None
+    paired_with: list[str] | None = None
+    index_of: list[str] | None = None
+    derived_from: list[str] | None = None
+    library_made_from: list[str] | None = None
+    library_depleted_in: list[str] | None = None
+    library_extraction_method: list[str] | None = None
+    library_lysis_method: list[str] | None = None
+    library_crosslinking_method: list[str] | None = None
+    library_strand_specific: list[str] | None = None
+    library_fragmentation_method: list[str] | None = None
+    library_size_range: list[str] | None = None
+    rbns_protein_concentration: list[str] | None = None
+    audit_warning: list[str] | None = None
+    audit_not_compliant: list[str] | None = None
+    audit_error: list[str] | None = None
+
+
+@strawberry.input
 class FileMetadataInput:
     dcc: list[DCCInput] | None = None
     collections: list[CollectionInput] | None = None
@@ -131,6 +221,7 @@ class FileMetadataInput:
     dbgap_study_id: list[str] | None = None
     access_url: list[str] | None = None
     data_access_level: list[str] | None = None
+    extra: list[EnrichedFileInput] | None = None
 
 
 def to_dict(obj):

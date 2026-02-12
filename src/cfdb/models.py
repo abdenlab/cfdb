@@ -1,8 +1,146 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, field_validator
+
+
+class ExtraFile(BaseModel):
+    """
+    An associated index or auxiliary file from 4DN.
+
+    Stored in EnrichedFile.extra_files for files that have companion index
+    files (e.g., .px2, .bai).
+
+    Attributes:
+        href:
+            Relative URL path to the file on the 4DN data portal.
+
+        md5sum:
+            MD5 checksum of the file.
+
+        file_size:
+            Size of the file in bytes.
+
+        file_format:
+            Format identifier (e.g., "pairs_px2", "bai").
+    """
+
+    href: Optional[str] = None
+    md5sum: Optional[str] = None
+    file_size: Optional[int] = None
+    file_format: Optional[str] = None
+
+
+class EnrichedFile(BaseModel):
+    """
+    DCC-specific file-level metadata that supplements C2M2 fields.
+
+    Union of extra fields populated by the 4DN materializer, 4DN API
+    enrichment, and ENCODE metadata ingest. Not all fields are present on
+    every file — each DCC populates a different subset.
+    """
+
+    # 4DN materializer
+    enriched_file_format: Optional[str] = None
+
+    # 4DN API enrichment
+    genome_assembly: Optional[str] = None
+    file_type: Optional[str] = None
+    file_type_detailed: Optional[str] = None
+    condition: Optional[str] = None
+    biosource_name: Optional[str] = None
+    dataset: Optional[str] = None
+    experiment_type: Optional[str] = None
+    assay_info: Optional[str] = None
+    replicate_info: Optional[str] = None
+    cell_line_tier: Optional[str] = None
+    extra_files: Optional[List[ExtraFile]] = None
+
+    # ENCODE
+    assembly: Optional[str] = None
+    file_format_type: Optional[str] = None
+    output_type: Optional[str] = None
+    experiment_accession: Optional[str] = None
+    experiment_target: Optional[str] = None
+    project: Optional[str] = None
+    lab: Optional[str] = None
+    platform: Optional[str] = None
+    dbxrefs: Optional[str] = None
+    genome_annotation: Optional[str] = None
+    controlled_by: Optional[str] = None
+    s3_uri: Optional[str] = None
+    azure_url: Optional[str] = None
+    file_analysis_title: Optional[str] = None
+    file_analysis_status: Optional[str] = None
+    biological_replicates: Optional[str] = None
+    technical_replicates: Optional[str] = None
+    read_length: Optional[str] = None
+    mapped_read_length: Optional[str] = None
+    run_type: Optional[str] = None
+    paired_end: Optional[str] = None
+    paired_with: Optional[str] = None
+    index_of: Optional[str] = None
+    derived_from: Optional[str] = None
+    library_made_from: Optional[str] = None
+    library_depleted_in: Optional[str] = None
+    library_extraction_method: Optional[str] = None
+    library_lysis_method: Optional[str] = None
+    library_crosslinking_method: Optional[str] = None
+    library_strand_specific: Optional[str] = None
+    library_fragmentation_method: Optional[str] = None
+    library_size_range: Optional[str] = None
+    rbns_protein_concentration: Optional[str] = None
+    audit_warning: Optional[str] = None
+    audit_not_compliant: Optional[str] = None
+    audit_error: Optional[str] = None
+
+
+class EnrichedCollection(BaseModel):
+    """
+    DCC-specific collection-level metadata from 4DN experiment API.
+
+    Populated during 4DN sync by fetching experiment details (ExperimentHiC,
+    ExperimentSeq, ExperimentDamid, ExperimentChiapet) from the 4DN Search
+    API. Not all fields are present on every experiment type.
+    """
+
+    display_title: Optional[str] = None
+    experiment_type: Optional[str] = None
+    targeted_factor: Optional[List[str]] = None
+    digestion_enzyme: Optional[str] = None
+    lab: Optional[str] = None
+    crosslinking_method: Optional[str] = None
+    crosslinking_temperature: Optional[str] = None
+    crosslinking_time: Optional[str] = None
+    ligation_temperature: Optional[str] = None
+    ligation_volume: Optional[str] = None
+    ligation_time: Optional[str] = None
+    digestion_temperature: Optional[str] = None
+    digestion_time: Optional[str] = None
+    tagging_method: Optional[str] = None
+    fragmentation_method: Optional[str] = None
+    biotin_removed: Optional[str] = None
+    library_prep_kit: Optional[str] = None
+    average_fragment_size: Optional[str] = None
+    fragment_size_range: Optional[str] = None
+    status: Optional[str] = None
+    date_created: Optional[str] = None
+
+
+class EnrichedBiosample(BaseModel):
+    """
+    DCC-specific biosample-level metadata from ENCODE.
+
+    Populated during ENCODE sync from the metadata TSV. Contains biosample
+    classification and treatment information.
+    """
+
+    biosample_type: Optional[str] = None
+    biosample_treatments: Optional[str] = None
+    biosample_treatments_amount: Optional[str] = None
+    biosample_treatments_duration: Optional[str] = None
+    biosample_genetic_modifications: Optional[str] = None
 
 
 class FileMetadataModel(BaseModel):
@@ -102,8 +240,7 @@ class FileMetadataModel(BaseModel):
             from HuBMAP Search API.
 
         extra:
-            DCC-specific metadata that doesn't map to C2M2 fields. For ENCODE:
-            assembly, output_type, platform, etc.
+            DCC-specific file metadata. See EnrichedFile for available fields.
 
         project:
             The primary project within which this file was created.
@@ -137,7 +274,7 @@ class FileMetadataModel(BaseModel):
     access_url: Optional[str] = None
     status: Optional[str] = None
     data_access_level: Optional[str] = None
-    extra: Optional[Dict[str, Any]] = None
+    extra: Optional[EnrichedFile] = None
 
 
 class DCC(BaseModel):
@@ -305,6 +442,7 @@ class Collection(BaseModel):
     description: Optional[str] = None
     anatomy: List[Anatomy] = []
     subjects: List[Subject] = []
+    extra: Optional[EnrichedCollection] = None
 
 
 class Biosample(BaseModel):
@@ -363,7 +501,7 @@ class Biosample(BaseModel):
     anatomy: Optional[Anatomy] = None
     biofluid: Optional[str] = None
     subjects: List[Subject] = []
-    extra: Optional[Dict[str, Any]] = None
+    extra: Optional[EnrichedBiosample] = None
 
 
 class Anatomy(BaseModel):

@@ -206,6 +206,7 @@ The central entity representing a stable digital asset.
 | `access_url` | string? | DRS URI or publicly accessible URL |
 | `status` | string? | Dataset status (e.g., "Published", "QA") - HuBMAP specific |
 | `data_access_level` | string? | Access level: public, consortium, or protected - HuBMAP specific |
+| `extra` | EnrichedFile? | DCC-specific file metadata (see EnrichedFile) |
 
 ##### DCC
 
@@ -239,6 +240,7 @@ A grouping of files, biosamples, and/or subjects.
 | `abbreviation` | string? | Short display label |
 | `name` | string | Human-readable label |
 | `description` | string? | Human-readable description |
+| `extra` | EnrichedCollection? | DCC-specific collection metadata (see EnrichedCollection) |
 
 ##### Biosample
 
@@ -256,6 +258,7 @@ A tissue sample or other physical specimen.
 | `anatomy` | Anatomy? | UBERON CV term for anatomical origin |
 | `biofluid` | string? | UBERON/InterLex term for fluid origin |
 | `subjects` | Subject[] | Subjects (donors) from which this biosample was derived |
+| `extra` | EnrichedBiosample? | DCC-specific biosample metadata (see EnrichedBiosample) |
 
 ##### Anatomy
 
@@ -340,6 +343,112 @@ A node in the C2M2 project hierarchy.
 | `abbreviation` | string? | Short display label |
 | `description` | string? | Human-readable description |
 | `persistent_id` | string? | Permanent URI or compact ID |
+
+##### EnrichedFile
+
+DCC-specific file-level metadata. Union of fields from 4DN materializer, 4DN API enrichment, and ENCODE ingest.
+
+| Field | Type | Source | Description |
+|-------|------|--------|-------------|
+| `enriched_file_format` | string? | 4DN materializer | Derived format (mcool, hic, pairs, etc.) |
+| `genome_assembly` | string? | 4DN API | Reference genome (e.g., "GRCh38") |
+| `file_type` | string? | 4DN API | Semantic file type (e.g., "contact matrix") |
+| `file_type_detailed` | string? | 4DN API | Detailed type (e.g., "contact matrix (mcool)") |
+| `condition` | string? | 4DN API | Experimental condition |
+| `biosource_name` | string? | 4DN API | Cell line or tissue name |
+| `dataset` | string? | 4DN API | Dataset description |
+| `experiment_type` | string? | 4DN API | Experiment type |
+| `assay_info` | string? | 4DN API | Assay details |
+| `replicate_info` | string? | 4DN API | Replicate details |
+| `cell_line_tier` | string? | 4DN API | Cell line tier (Tier 1/Tier 2) |
+| `extra_files` | ExtraFile[]? | 4DN API | Associated index files |
+| `assembly` | string? | ENCODE | Genome assembly (GRCh38, mm10, etc.) |
+| `file_format_type` | string? | ENCODE | narrowPeak, broadPeak, etc. |
+| `output_type` | string? | ENCODE | Original ENCODE output type |
+| `experiment_accession` | string? | ENCODE | Parent experiment accession |
+| `experiment_target` | string? | ENCODE | ChIP-seq target, etc. |
+| `project` | string? | ENCODE | ENCODE project phase |
+| `lab` | string? | ENCODE | Lab/PI name |
+| `platform` | string? | ENCODE | Sequencing platform |
+| `dbxrefs` | string? | ENCODE | External cross-references |
+| `genome_annotation` | string? | ENCODE | Genome annotation version |
+| `controlled_by` | string? | ENCODE | Control file accessions |
+| `s3_uri` | string? | ENCODE | S3 storage path |
+| `azure_url` | string? | ENCODE | Azure storage URL |
+| `file_analysis_title` | string? | ENCODE | Analysis pipeline name |
+| `file_analysis_status` | string? | ENCODE | Analysis pipeline status |
+| `biological_replicates` | string? | ENCODE | Biological replicate number(s) |
+| `technical_replicates` | string? | ENCODE | Technical replicate number(s) |
+| `read_length` | string? | ENCODE | Sequencing read length |
+| `mapped_read_length` | string? | ENCODE | Mapped read length |
+| `run_type` | string? | ENCODE | single-ended/paired-ended |
+| `paired_end` | string? | ENCODE | 1 or 2 for paired reads |
+| `paired_with` | string? | ENCODE | Paired file accession |
+| `index_of` | string? | ENCODE | Indexed file accession |
+| `derived_from` | string? | ENCODE | Upstream file accessions |
+| `library_made_from` | string? | ENCODE | RNA, DNA, etc. |
+| `library_depleted_in` | string? | ENCODE | rRNA, etc. |
+| `library_extraction_method` | string? | ENCODE | Extraction method |
+| `library_lysis_method` | string? | ENCODE | Lysis method |
+| `library_crosslinking_method` | string? | ENCODE | Crosslinking method |
+| `library_strand_specific` | string? | ENCODE | Strand specificity |
+| `library_fragmentation_method` | string? | ENCODE | Fragmentation method |
+| `library_size_range` | string? | ENCODE | Library size range |
+| `rbns_protein_concentration` | string? | ENCODE | RBNS protein concentration |
+| `audit_warning` | string? | ENCODE | Audit warnings |
+| `audit_not_compliant` | string? | ENCODE | Audit non-compliance |
+| `audit_error` | string? | ENCODE | Audit errors |
+
+##### ExtraFile
+
+An associated index or auxiliary file from 4DN.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `href` | string? | Relative URL path on 4DN data portal |
+| `md5sum` | string? | MD5 checksum |
+| `file_size` | int? | File size in bytes |
+| `file_format` | string? | Format identifier (e.g., "pairs_px2", "bai") |
+
+##### EnrichedCollection
+
+DCC-specific collection-level metadata from 4DN experiment API.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `display_title` | string? | Experiment display name |
+| `experiment_type` | string? | Experiment type (e.g., "in situ Hi-C") |
+| `targeted_factor` | string[]? | Target proteins/marks (e.g., ["CTCF protein"]) |
+| `digestion_enzyme` | string? | Restriction enzyme (e.g., "DpnII") |
+| `lab` | string? | Lab/PI name |
+| `crosslinking_method` | string? | Crosslinking method |
+| `crosslinking_temperature` | string? | Crosslinking temperature |
+| `crosslinking_time` | string? | Crosslinking time |
+| `ligation_temperature` | string? | Ligation temperature |
+| `ligation_volume` | string? | Ligation volume |
+| `ligation_time` | string? | Ligation time |
+| `digestion_temperature` | string? | Digestion temperature |
+| `digestion_time` | string? | Digestion time |
+| `tagging_method` | string? | Tagging method (DamID) |
+| `fragmentation_method` | string? | Fragmentation method |
+| `biotin_removed` | string? | Whether biotin was removed |
+| `library_prep_kit` | string? | Library prep kit used |
+| `average_fragment_size` | string? | Average fragment size |
+| `fragment_size_range` | string? | Fragment size range |
+| `status` | string? | Experiment status |
+| `date_created` | string? | Experiment creation date |
+
+##### EnrichedBiosample
+
+DCC-specific biosample-level metadata from ENCODE.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `biosample_type` | string? | primary cell, tissue, cell line, etc. |
+| `biosample_treatments` | string? | Treatment details |
+| `biosample_treatments_amount` | string? | Treatment amount |
+| `biosample_treatments_duration` | string? | Treatment duration |
+| `biosample_genetic_modifications` | string? | CRISPR, RNAi, etc. |
 
 #### Query Mechanics
 
@@ -556,6 +665,44 @@ curl -O http://localhost:8000/data/4dn/abc123
 curl -H "Range: bytes=0-1023" http://localhost:8000/data/hubmap/xyz789
 ```
 
+### Index File Streaming Endpoint
+
+**URL:** `GET /index/{dcc}/{local_id}` | `HEAD /index/{dcc}/{local_id}`
+
+Stream index files (e.g., `.px2`, `.bai`) associated with DCC data files. Index files are typically used to determine byte ranges for tiling visualizations — fetch the index first, then stream specific byte ranges from `/data/{dcc}/{local_id}`.
+
+**Path Parameters:**
+- `dcc` - DCC abbreviation (e.g., `4dn`) - case insensitive
+- `local_id` - The file's unique ID within the DCC
+
+**Headers:**
+- `Range` (optional) - Supports `bytes=start-end` for partial content requests
+
+**Response Codes:**
+| Code | Description |
+|------|-------------|
+| 200 | Full index file content (GET) or file metadata (HEAD) |
+| 206 | Partial content (Range request) |
+| 400 | Invalid DCC or Range header |
+| 404 | File not found or no index file available |
+| 502 | Upstream service error |
+
+**Example:**
+
+```bash
+# Check index file availability (HEAD request)
+curl -I http://localhost:8000/index/4dn/4DNFIG5NX1EC
+
+# Download the index file
+curl -O http://localhost:8000/index/4dn/4DNFIG5NX1EC
+
+# Use with data endpoint for tiling visualization
+# 1. Fetch index to determine byte ranges
+curl -o index.px2 http://localhost:8000/index/4dn/4DNFIG5NX1EC
+# 2. Stream specific byte ranges from the data file
+curl -H "Range: bytes=0-65535" http://localhost:8000/data/4dn/4DNFIG5NX1EC
+```
+
 ### Sync Endpoint
 
 **URL:** `POST /sync`
@@ -700,16 +847,97 @@ The following table maps 4DN data portal search dimensions to CFDB/C2M2 fields:
 | **File** | File Size | `size_in_bytes` | ✅ | Integer bytes |
 | **Sample** | Tissue/Anatomy | `collections.anatomy.name` | ✅ | UBERON CV terms |
 | **Sample** | Sample Prep | `collections.biosamples.sample_prep_method` | ✅ | OBI CV terms |
-| **Sample** | Biosource/Cell Line | `collections.biosamples.local_id` | ⚠️ | Cell line in biosample ID |
+| **Sample** | Biosource/Cell Line | `collections.biosamples.local_id`, `extra.biosource_name` | ✅ | Cell line in biosample ID + API-enriched name |
 | **Sample** | Organism | `collections.subjects.taxonomy.name` | ✅ | NCBI taxonomy |
-| **Sample** | Cell Line Tier | — | ❌ | 4DN-specific |
-| **Dataset** | Dataset/Collection | `collections.name` | ✅ | Collection grouping |
+| **Sample** | Cell Line Tier | `extra.cell_line_tier` | ✅ | Tier 1/Tier 2 from 4DN API (~17 classified cell lines) |
+| **Dataset** | Dataset/Collection | `collections.name`, `extra.dataset` | ✅ | Collection grouping + API-enriched dataset name |
 | **Dataset** | Publication/DOI | `collections.persistent_id` | ⚠️ | If DOI linked |
-| **Dataset** | Condition | — | ❌ | 4DN-specific |
+| **Dataset** | Condition | `extra.condition` | ✅ | From 4DN API (e.g., "Formaldehyde+DSG, DpnII") |
+| **File** | Genome Assembly | `extra.genome_assembly` | ✅ | From 4DN API (e.g., "GRCh38") |
+| **File** | File Type | `extra.file_type` | ✅ | From 4DN API (e.g., "contact matrix") |
+| **File** | File Type Detailed | `extra.file_type_detailed` | ✅ | From 4DN API (e.g., "contact matrix (mcool)") |
+| **Experiment** | Experiment Type | `extra.experiment_type` | ✅ | From 4DN API (e.g., "in situ Hi-C") |
+| **Experiment** | Assay Info | `extra.assay_info` | ✅ | From 4DN API (e.g., "DpnII") |
+| **Replicate** | Replicate Info | `extra.replicate_info` | ✅ | From 4DN API (e.g., "Biorep 1, Techrep 1") |
 | **Provider** | DCC | `dcc.dcc_abbreviation` | ✅ | Always "4DN" |
 | **Provider** | Lab/Project | `project.name` | ✅ | Via project FK |
+| **Experiment** | Targeted Factor | `collections.extra.targeted_factor` | ✅ | Protein target (e.g., ["CTCF protein"]) from experiment API |
+| **Experiment** | Digestion Enzyme | `collections.extra.digestion_enzyme` | ✅ | Restriction enzyme from experiment API |
+| **Experiment** | Lab | `collections.extra.lab` | ✅ | Lab/PI from experiment API |
 
 **Legend:** ✅ Supported | ⚠️ Partial | ❌ Not Available
+
+### 4DN Enriched File Format
+
+The C2M2 `file_format` field uses EDAM ontology terms that describe container formats (e.g., HDF5) rather than the specific data format. For 4DN this is particularly limiting: `.mcool`, `.cool`, and `.hic` files are all HDF5-based, and `.hic` files have no `file_format` at all.
+
+During materialization, the materializer derives `extra.enriched_file_format` from the filename extension when `file_format` is ambiguous (empty, HDF5, or Plain text):
+
+| Extension | `file_format` (C2M2) | `extra.enriched_file_format` | Description |
+|-----------|----------------------|------------------------------|-------------|
+| `.mcool` | HDF5 | `mcool` | Multi-resolution cooler (Hi-C contact matrix) |
+| `.cool` | HDF5 | `cool` | Single-resolution cooler (Hi-C contact matrix) |
+| `.hic` | _(empty)_ | `hic` | Juicer Hi-C contact matrix |
+| `.pairs` / `.pairs.gz` | Plain text | `pairs` | 4DN pairs format (Hi-C read pairs) |
+| `.r3d` | _(empty)_ | `r3d` | 3D reconstruction data |
+| `.nd2` | _(empty)_ | `nd2` | Nikon microscopy image |
+| `.flex` | _(empty)_ | `flex` | Flex microscopy data |
+| `.spt` | _(empty)_ | `spt` | Single-particle tracking data |
+| `.matrix` | _(empty)_ | `matrix` | Matrix data |
+
+Files with unambiguous formats (FASTQ, BAM, BED, bigWig, etc.) are not enriched since the EDAM `file_format` term is already specific.
+
+### 4DN API Enrichment
+
+After materialization, a post-processing step fetches additional metadata from the [4DN Search API](https://data.4dnucleome.org) and merges it into the `extra` field on materialized file documents. This supplements the C2M2 data dump (which lacks many 4DN-specific fields) without modifying the Rust materializer.
+
+| Extra Field | Source | Description |
+|-------------|--------|-------------|
+| `extra.genome_assembly` | `FileProcessed.genome_assembly` | Reference genome (e.g., "GRCh38"); absent on FASTQ/image files |
+| `extra.file_type` | `FileProcessed.file_type` / `FileFastq.file_type` | Semantic file type (e.g., "contact matrix") |
+| `extra.file_type_detailed` | `FileProcessed.file_type_detailed` / `FileFastq.file_type_detailed` | Detailed type (e.g., "contact matrix (mcool)") |
+| `extra.condition` | `track_and_facet_info.condition` | Experimental condition (e.g., "Formaldehyde+DSG, DpnII") |
+| `extra.biosource_name` | `track_and_facet_info.biosource_name` | Cell line or tissue name (e.g., "GM12878") |
+| `extra.dataset` | `track_and_facet_info.dataset` | Dataset description (e.g., "in situ Hi-C on GM12878") |
+| `extra.experiment_type` | `track_and_facet_info.experiment_type` | Experiment type (e.g., "in situ Hi-C") |
+| `extra.assay_info` | `track_and_facet_info.assay_info` | Assay details (e.g., "DpnII") |
+| `extra.replicate_info` | `track_and_facet_info.replicate_info` | Replicate details (e.g., "Biorep 1, Techrep 1") |
+| `extra.cell_line_tier` | Derived from `biosource_name` | 4DN cell line tier ("Tier 1" or "Tier 2"); only ~17 classified cell lines |
+| `extra.extra_files` | `FileProcessed.extra_files` / `FileFastq.extra_files` | Array of associated index files (e.g., `.px2`, `.bai`) with `href`, `md5sum`, `file_size`, `file_format` |
+
+Not all fields are present on every file. The enrichment uses `$set` with dot notation to merge into `extra` without overwriting the materializer's `enriched_file_format` field.
+
+### 4DN Collection Enrichment
+
+Before materialization, a pre-processing step fetches experiment metadata from the [4DN Search API](https://data.4dnucleome.org) and stores it on collection documents as `extra`. Since C2M2 collections map to 4DN experiments (`4DNEX*`) and experiment sets (`4DNES*`), this enriches collections with structured experiment-level data. The materializer then propagates `collection.extra` into `files.collections[].extra` via `coll.clone()`.
+
+**Experiment types queried:** ExperimentHiC, ExperimentSeq, ExperimentDamid, ExperimentChiapet
+
+| Collection Extra Field | Source | Description |
+|------------------------|--------|-------------|
+| `extra.display_title` | `Experiment.display_title` | Experiment display name |
+| `extra.experiment_type` | `Experiment.experiment_type.display_title` | Experiment type (e.g., "in situ Hi-C", "ChIP-seq") |
+| `extra.targeted_factor` | `Experiment.targeted_factor[].display_title` | Array of target proteins/marks (e.g., ["CTCF protein"], ["H3K27ac"]) |
+| `extra.digestion_enzyme` | `Experiment.digestion_enzyme.display_title` | Restriction enzyme (e.g., "DpnII", "MboI") |
+| `extra.lab` | `Experiment.lab.display_title` | Lab/PI name |
+| `extra.crosslinking_method` | `Experiment.crosslinking_method` | Crosslinking method |
+| `extra.crosslinking_temperature` | `Experiment.crosslinking_temperature` | Crosslinking temperature |
+| `extra.crosslinking_time` | `Experiment.crosslinking_time` | Crosslinking time |
+| `extra.ligation_temperature` | `Experiment.ligation_temperature` | Ligation temperature |
+| `extra.ligation_volume` | `Experiment.ligation_volume` | Ligation volume |
+| `extra.ligation_time` | `Experiment.ligation_time` | Ligation time |
+| `extra.digestion_temperature` | `Experiment.digestion_temperature` | Digestion temperature |
+| `extra.digestion_time` | `Experiment.digestion_time` | Digestion time |
+| `extra.tagging_method` | `Experiment.tagging_method` | Tagging method (DamID) |
+| `extra.fragmentation_method` | `Experiment.fragmentation_method` | Fragmentation method |
+| `extra.biotin_removed` | `Experiment.biotin_removed` | Whether biotin was removed |
+| `extra.library_prep_kit` | `Experiment.library_prep_kit` | Library prep kit used |
+| `extra.average_fragment_size` | `Experiment.average_fragment_size` | Average fragment size |
+| `extra.fragment_size_range` | `Experiment.fragment_size_range` | Fragment size range |
+| `extra.status` | `Experiment.status` | Experiment status |
+| `extra.date_created` | `Experiment.date_created` | Experiment creation date |
+
+Not all fields are present on every experiment type. For example, `targeted_factor` is primarily available on ChIP-seq (ExperimentSeq), DamID, and ChIA-PET experiments.
 
 ## ENCODE Data Portal Filter Mapping
 

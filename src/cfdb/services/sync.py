@@ -182,12 +182,163 @@ async def _sync_c2m2_zip(
 
     cleanup_zip(zip_path)
 
-    # Step 6: Materialize files collection for this DCC
+    # Step 6: Enrich 4DN collections from experiment API (pre-materialization)
+    if dcc == "4dn":
+        task.current_step = "enriching_collections"
+        task.progress = "Enriching 4DN collections from experiment API..."
+        logger.info(task.progress)
+        await _enrich_4dn_collections()
+
+    # Step 7: Materialize files collection for this DCC
     task.current_step = "materializing"
     task.progress = f"Materializing files for {dcc.upper()}..."
     logger.info(task.progress)
 
     await _materialize_files(dcc)
+
+    # Step 8: Enrich from 4DN portal API (post-materialization)
+    if dcc == "4dn":
+        task.current_step = "enriching"
+        task.progress = "Enriching 4DN files from portal API..."
+        logger.info(task.progress)
+        await _enrich_4dn_api_metadata()
+
+
+async def _enrich_4dn_api_metadata() -> None:
+    """Enrich materialized 4DN files with metadata from the 4DN Search API."""
+    from pymongo import UpdateOne
+
+    from cfdb.services.fourdn import (
+        extract_accession,
+        fetch_biosource_tiers,
+        fetch_file_metadata_bulk,
+    )
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    # Fetch API data
+    file_metadata = await fetch_file_metadata_bulk()
+    biosource_tiers = await fetch_biosource_tiers()
+
+    logger.info(
+        f"4DN enrichment: {len(file_metadata)} file entries, "
+        f"{len(biosource_tiers)} biosource tier entries"
+    )
+
+    # Build accession -> _id lookup from existing files (avoids $regex per update)
+    accession_to_id: dict[str, object] = {}
+    cursor = api.db.files.find(
+        {"submission": "4dn"},
+        {"_id": 1, "persistent_id": 1},
+    )
+    async for doc in cursor:
+        acc = extract_accession(doc.get("persistent_id", ""))
+        if acc:
+            accession_to_id[acc] = doc["_id"]
+
+    logger.info(f"4DN enrichment: {len(accession_to_id)} files in DB mapped by accession")
+
+    # Build bulk update operations matched by _id
+    operations = []
+    for accession, meta in file_metadata.items():
+        doc_id = accession_to_id.get(accession)
+        if not doc_id:
+            continue
+
+        update: dict = {}
+
+        for key in (
+            "genome_assembly",
+            "file_type",
+            "file_type_detailed",
+            "condition",
+            "biosource_name",
+            "dataset",
+            "experiment_type",
+            "assay_info",
+            "replicate_info",
+            "extra_files",
+        ):
+            val = meta.get(key)
+            if val:
+                update[f"extra.{key}"] = val
+
+        # Derive cell_line_tier from biosource_name
+        biosource_name = meta.get("biosource_name")
+        if biosource_name and biosource_name in biosource_tiers:
+            update["extra.cell_line_tier"] = biosource_tiers[biosource_name]
+
+        if not update:
+            continue
+
+        operations.append(UpdateOne({"_id": doc_id}, {"$set": update}))
+
+    if not operations:
+        logger.warning("4DN enrichment: no updates to apply")
+        return
+
+    # Execute in batches
+    total_modified = 0
+    for i in range(0, len(operations), BATCH_SIZE):
+        batch = operations[i : i + BATCH_SIZE]
+        result = await api.db.files.bulk_write(batch, ordered=False)
+        total_modified += result.modified_count
+
+    logger.info(f"4DN enrichment: updated {total_modified} files")
+
+
+async def _enrich_4dn_collections() -> None:
+    """Enrich 4DN collection documents with experiment metadata from the 4DN Search API."""
+    from pymongo import UpdateOne
+
+    from cfdb.services.fourdn import (
+        extract_experiment_accession,
+        fetch_experiment_metadata_bulk,
+    )
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    # Fetch experiment metadata from 4DN API
+    experiment_metadata = await fetch_experiment_metadata_bulk()
+
+    logger.info(f"4DN collection enrichment: {len(experiment_metadata)} experiment entries")
+
+    # Build bulk updates: match collection docs by experiment accession in persistent_id
+    operations = []
+    cursor = api.db.collection.find(
+        {"submission": "4dn"},
+        {"_id": 1, "persistent_id": 1},
+    )
+    matched = 0
+    async for doc in cursor:
+        accession = extract_experiment_accession(doc.get("persistent_id", ""))
+        if not accession:
+            continue
+
+        meta = experiment_metadata.get(accession)
+        if not meta:
+            continue
+
+        matched += 1
+        operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"extra": meta}}))
+
+    if not operations:
+        logger.warning("4DN collection enrichment: no updates to apply")
+        return
+
+    # Execute in batches
+    total_modified = 0
+    for i in range(0, len(operations), BATCH_SIZE):
+        batch = operations[i : i + BATCH_SIZE]
+        result = await api.db.collection.bulk_write(batch, ordered=False)
+        total_modified += result.modified_count
+
+    logger.info(
+        f"4DN collection enrichment: matched {matched} collections, "
+        f"updated {total_modified}"
+    )
 
 
 async def _sync_encode(task: SyncTask) -> None:
