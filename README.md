@@ -1012,3 +1012,32 @@ Unlike 4DN and HuBMAP which use C2M2-formatted ZIP files from CFDE, ENCODE data 
 - **Access Control**: All released files are publicly accessible
 - **Biosample/Subject Data**: Biosample term, organism, and donor IDs are mapped to C2M2 collections, biosamples, and subjects; biosample-specific metadata (type, treatments, genetic modifications) is stored in `biosample.extra`
 - **Missing Demographics**: Subject sex, age, and life stage are not available in the metadata TSV and would require per-donor API calls to `/human-donors/{id}/`
+
+## Open Questions
+
+### ENCODE Index Files for Genomic Visualization
+
+The `/index/{dcc}/{local_id}` endpoint currently supports 4DN only, because 4DN provides index files (`.px2`, `.bai`) as structured entries in its API response (`extra_files` array). Extending this to ENCODE was investigated and found to be **not feasible with ENCODE's current data offerings**.
+
+**Findings:**
+
+1. **ENCODE does not provide genomic index files.** BAM files are released without `.bai` indexes, VCF/BED files without `.tbi` indexes. Users are expected to generate indexes locally (e.g., `samtools index`). See [Broad Institute GDR issue #8](https://github.com/broadinstitute/gdr-ingest/issues/8) for precedent.
+
+2. **The `index_of` field is unrelated.** ENCODE's `index_of` (mapped to `extra.index_of`) refers to FASTQ index reads (barcode sequences for demultiplexing), not `.bai`/`.tbi` genomic index files. The [ENCODE file schema](https://www.encodeproject.org/profiles/file.json) defines it as linking `output_type: "index reads"` files to parent FASTQs.
+
+3. **No `extra_files` equivalent.** Unlike 4DN's API which returns an `extra_files` array with index file metadata (href, md5sum, file_size, file_format), ENCODE file objects have no field for companion index files.
+
+4. **Self-indexed formats already work.** bigWig, bigBed, and hic files are self-indexed and support random access via HTTP Range requests on the existing `/data/encode/{local_id}` endpoint — no separate index endpoint needed.
+
+| Format | Index Type | ENCODE Provides? | Self-Indexed? |
+|--------|-----------|-------------------|---------------|
+| BAM | .bai | No | No |
+| VCF.gz | .tbi | No | No |
+| BED.gz | .tbi | No | No |
+| bigWig | — | N/A | Yes |
+| bigBed | — | N/A | Yes |
+| hic | — | N/A | Yes |
+
+**Future options** if BAM visualization becomes a requirement:
+- **Server-side index generation**: Run `samtools index` during ENCODE sync and store `.bai` files (adds compute + storage cost)
+- **On-demand indexing**: Generate `.bai` on first request and cache (adds latency on first access)
