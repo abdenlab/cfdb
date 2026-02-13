@@ -182,12 +182,17 @@ async def _sync_c2m2_zip(
 
     cleanup_zip(zip_path)
 
-    # Step 6: Enrich 4DN collections from experiment API (pre-materialization)
+    # Step 6: Pre-materialization enrichment
     if dcc == "4dn":
         task.current_step = "enriching_collections"
         task.progress = "Enriching 4DN collections from experiment API..."
         logger.info(task.progress)
         await _enrich_4dn_collections()
+    elif dcc == "hubmap":
+        task.current_step = "enriching_collections"
+        task.progress = "Enriching HuBMAP collections and subjects from Search API..."
+        logger.info(task.progress)
+        await _enrich_hubmap_collections_and_subjects()
 
     # Step 7: Materialize files collection for this DCC
     task.current_step = "materializing"
@@ -196,12 +201,17 @@ async def _sync_c2m2_zip(
 
     await _materialize_files(dcc)
 
-    # Step 8: Enrich from 4DN portal API (post-materialization)
+    # Step 8: Post-materialization enrichment
     if dcc == "4dn":
         task.current_step = "enriching"
         task.progress = "Enriching 4DN files from portal API..."
         logger.info(task.progress)
         await _enrich_4dn_api_metadata()
+    elif dcc == "hubmap":
+        task.current_step = "enriching"
+        task.progress = "Enriching HuBMAP files from Search API..."
+        logger.info(task.progress)
+        await _enrich_hubmap_files()
 
 
 async def _enrich_4dn_api_metadata() -> None:
@@ -339,6 +349,280 @@ async def _enrich_4dn_collections() -> None:
         f"4DN collection enrichment: matched {matched} collections, "
         f"updated {total_modified}"
     )
+
+
+async def _enrich_hubmap_collections_and_subjects() -> None:
+    """Enrich HuBMAP collections and subjects with metadata from the Search API.
+
+    Performs a single bulk fetch of all HuBMAP datasets, then:
+    1. Stores dataset-level metadata on collection.extra.hubmap
+    2. Stores donor demographics on subject.extra.hubmap
+    """
+    from pymongo import UpdateOne
+
+    from cfdb.services.hubmap import fetch_dataset_metadata_bulk
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    # Single bulk fetch for all datasets
+    dataset_metadata = await fetch_dataset_metadata_bulk()
+    logger.info(f"HuBMAP enrichment: {len(dataset_metadata)} dataset entries fetched")
+
+    # --- Collection enrichment ---
+    collection_ops = []
+    cursor = api.db.collection.find(
+        {"submission": "hubmap"},
+        {"_id": 1, "persistent_id": 1},
+    )
+    async for doc in cursor:
+        persistent_id = doc.get("persistent_id", "")
+        meta = dataset_metadata.get(persistent_id)
+        if not meta:
+            continue
+
+        extra = {}
+        for key in (
+            "dataset_type",
+            "pipeline",
+            "processing",
+            "group_name",
+            "analyte_class",
+            "visualization",
+            "vitessce_hints",
+            "metadata",
+        ):
+            val = meta.get(key)
+            if val is not None:
+                extra[key] = val
+
+        if extra:
+            collection_ops.append(
+                UpdateOne({"_id": doc["_id"]}, {"$set": {"extra.hubmap": extra}})
+            )
+
+    if collection_ops:
+        total_modified = 0
+        for i in range(0, len(collection_ops), BATCH_SIZE):
+            batch = collection_ops[i : i + BATCH_SIZE]
+            result = await api.db.collection.bulk_write(batch, ordered=False)
+            total_modified += result.modified_count
+        logger.info(f"HuBMAP collection enrichment: updated {total_modified} collections")
+    else:
+        logger.warning("HuBMAP collection enrichment: no updates to apply")
+
+    # --- Subject enrichment ---
+    # Build donor_uuid -> donor_metadata lookup from the bulk fetch
+    donor_lookup: dict[str, dict] = {}
+    for meta in dataset_metadata.values():
+        donor_uuid = meta.get("donor_uuid")
+        donor_metadata = meta.get("donor_metadata")
+        if donor_uuid and donor_metadata:
+            donor_lookup[donor_uuid] = donor_metadata
+
+    if not donor_lookup:
+        logger.info("HuBMAP subject enrichment: no donor metadata available")
+        return
+
+    # Match subjects by local_id containing the donor UUID (HuBMAP C2M2 uses
+    # donor UUID as part of the subject local_id)
+    subject_ops = []
+    cursor = api.db.subject.find(
+        {"submission": "hubmap"},
+        {"_id": 1, "local_id": 1},
+    )
+    async for doc in cursor:
+        local_id = doc.get("local_id", "")
+        # Try to match donor UUID in the subject local_id
+        matched_donor = None
+        for donor_uuid, donor_meta in donor_lookup.items():
+            if donor_uuid in local_id:
+                matched_donor = donor_meta
+                break
+
+        if not matched_donor:
+            continue
+
+        extra: dict = {}
+        for key in (
+            "age_value",
+            "age_unit",
+            "body_mass_index_value",
+            "body_mass_index_unit",
+            "cause_of_death",
+            "death_event",
+            "mechanism_of_injury",
+            "height_value",
+            "height_unit",
+            "weight_value",
+            "weight_unit",
+        ):
+            val = matched_donor.get(key)
+            if val is not None:
+                # HuBMAP returns single-element lists for some fields
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                extra[key] = val
+
+        # String list fields
+        for key in ("sex", "race"):
+            val = matched_donor.get(key)
+            if val is not None:
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                extra[key] = val
+
+        for key in ("medical_history", "social_history"):
+            val = matched_donor.get(key)
+            if isinstance(val, list) and val:
+                extra[key] = val
+
+        if extra:
+            subject_ops.append(
+                UpdateOne({"_id": doc["_id"]}, {"$set": {"extra.hubmap": extra}})
+            )
+
+    if subject_ops:
+        total_modified = 0
+        for i in range(0, len(subject_ops), BATCH_SIZE):
+            batch = subject_ops[i : i + BATCH_SIZE]
+            result = await api.db.subject.bulk_write(batch, ordered=False)
+            total_modified += result.modified_count
+        logger.info(f"HuBMAP subject enrichment: updated {total_modified} subjects")
+    else:
+        logger.warning("HuBMAP subject enrichment: no updates to apply")
+
+
+async def _enrich_hubmap_files() -> None:
+    """Enrich materialized HuBMAP files with metadata from the Search API.
+
+    Sets top-level ``data_access_level`` and stores ``genome_assembly``,
+    ``is_data_product``, and ``rel_path`` on ``extra``.
+    """
+    from pymongo import UpdateOne
+
+    from cfdb.services.hubmap import fetch_dataset_metadata_bulk
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    # Bulk fetch (should be fast from API cache if collections step already ran)
+    dataset_metadata = await fetch_dataset_metadata_bulk()
+
+    # Build DOI -> file-level lookup
+    doi_file_info: dict[str, dict] = {}
+    for doi_url, meta in dataset_metadata.items():
+        info: dict = {}
+
+        access_level = meta.get("data_access_level")
+        if access_level:
+            info["data_access_level"] = access_level
+
+        genome_assembly = meta.get("genome_assembly")
+        if genome_assembly:
+            info["genome_assembly"] = genome_assembly
+
+        # Build filename -> file metadata lookup from files array
+        files_list = meta.get("files", [])
+        file_lookup: dict[str, dict] = {}
+        for f in files_list:
+            rel_path = f.get("rel_path")
+            if rel_path:
+                entry = {"rel_path": rel_path}
+                is_data_product = f.get("is_data_product")
+                if is_data_product is not None:
+                    entry["is_data_product"] = is_data_product
+                # Use the basename as key for matching with C2M2 filename
+                basename = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
+                file_lookup[basename] = entry
+        if file_lookup:
+            info["file_lookup"] = file_lookup
+
+        if info:
+            doi_file_info[doi_url] = info
+
+    if not doi_file_info:
+        logger.warning("HuBMAP file enrichment: no dataset metadata available")
+        return
+
+    # Get DOI URLs for all HuBMAP collections (to map files to datasets)
+    collection_doi_map: dict[str, str] = {}  # (id_namespace, local_id) key -> doi_url
+    cursor = api.db.collection.find(
+        {"submission": "hubmap"},
+        {"_id": 1, "id_namespace": 1, "local_id": 1, "persistent_id": 1},
+    )
+    async for doc in cursor:
+        persistent_id = doc.get("persistent_id", "")
+        if persistent_id in doi_file_info:
+            key = f"{doc.get('id_namespace', '')}|{doc.get('local_id', '')}"
+            collection_doi_map[key] = persistent_id
+
+    logger.info(
+        f"HuBMAP file enrichment: {len(collection_doi_map)} collections matched to datasets"
+    )
+
+    # Iterate materialized files and build updates
+    operations = []
+    cursor = api.db.files.find(
+        {"submission": "hubmap"},
+        {"_id": 1, "filename": 1, "collections": 1},
+    )
+    async for doc in cursor:
+        # Find matching dataset via collection DOI
+        collections = doc.get("collections", [])
+        matched_info = None
+        for coll in collections:
+            if isinstance(coll, dict):
+                key = f"{coll.get('id_namespace', '')}|{coll.get('local_id', '')}"
+            else:
+                continue
+            doi_url = collection_doi_map.get(key)
+            if doi_url:
+                matched_info = doi_file_info.get(doi_url)
+                if matched_info:
+                    break
+
+        if not matched_info:
+            continue
+
+        update: dict = {}
+
+        # Top-level field
+        access_level = matched_info.get("data_access_level")
+        if access_level:
+            update["data_access_level"] = access_level
+
+        # Extra fields
+        genome_assembly = matched_info.get("genome_assembly")
+        if genome_assembly:
+            update["extra.genome_assembly"] = genome_assembly
+
+        # Try to match by filename to get per-file metadata
+        filename = doc.get("filename", "")
+        file_lookup = matched_info.get("file_lookup", {})
+        if filename and filename in file_lookup:
+            file_meta = file_lookup[filename]
+            rel_path = file_meta.get("rel_path")
+            if rel_path:
+                update["extra.rel_path"] = rel_path
+            is_data_product = file_meta.get("is_data_product")
+            if is_data_product is not None:
+                update["extra.is_data_product"] = is_data_product
+
+        if update:
+            operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
+
+    if not operations:
+        logger.warning("HuBMAP file enrichment: no updates to apply")
+        return
+
+    total_modified = 0
+    for i in range(0, len(operations), BATCH_SIZE):
+        batch = operations[i : i + BATCH_SIZE]
+        result = await api.db.files.bulk_write(batch, ordered=False)
+        total_modified += result.modified_count
+
+    logger.info(f"HuBMAP file enrichment: updated {total_modified} files")
 
 
 async def _sync_encode(task: SyncTask) -> None:

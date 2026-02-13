@@ -96,15 +96,55 @@ class EnrichedFile(BaseModel):
     audit_error: Optional[str] = None
 
 
+class HuBMAPCollectionExtra(BaseModel):
+    """HuBMAP dataset-level metadata from Search API."""
+
+    dataset_type: Optional[str] = None
+    pipeline: Optional[str] = None
+    processing: Optional[str] = None
+    group_name: Optional[str] = None
+    analyte_class: Optional[str] = None
+    visualization: Optional[bool] = None
+    vitessce_hints: Optional[List[str]] = None
+    metadata: Optional[dict] = None
+
+
+class HuBMAPSubjectExtra(BaseModel):
+    """HuBMAP donor demographics from Search API."""
+
+    age_value: Optional[float] = None
+    age_unit: Optional[str] = None
+    sex: Optional[str] = None
+    race: Optional[str] = None
+    body_mass_index_value: Optional[float] = None
+    body_mass_index_unit: Optional[str] = None
+    cause_of_death: Optional[str] = None
+    death_event: Optional[str] = None
+    mechanism_of_injury: Optional[str] = None
+    medical_history: Optional[List[str]] = None
+    social_history: Optional[List[str]] = None
+    height_value: Optional[float] = None
+    height_unit: Optional[str] = None
+    weight_value: Optional[float] = None
+    weight_unit: Optional[str] = None
+
+
+class EnrichedSubject(BaseModel):
+    """DCC-specific subject-level metadata."""
+
+    hubmap: Optional[HuBMAPSubjectExtra] = None
+
+
 class EnrichedCollection(BaseModel):
     """
-    DCC-specific collection-level metadata from 4DN experiment API.
+    DCC-specific collection-level metadata from DCC APIs.
 
-    Populated during 4DN sync by fetching experiment details (ExperimentHiC,
-    ExperimentSeq, ExperimentDamid, ExperimentChiapet) from the 4DN Search
-    API. Not all fields are present on every experiment type.
+    Populated during sync by fetching metadata from DCC-specific APIs.
+    4DN: experiment details (ExperimentHiC, ExperimentSeq, etc.)
+    HuBMAP: dataset-level metadata from Search API.
     """
 
+    # 4DN experiment fields
     display_title: Optional[str] = None
     experiment_type: Optional[str] = None
     targeted_factor: Optional[List[str]] = None
@@ -126,6 +166,9 @@ class EnrichedCollection(BaseModel):
     fragment_size_range: Optional[str] = None
     status: Optional[str] = None
     date_created: Optional[str] = None
+
+    # HuBMAP
+    hubmap: Optional[HuBMAPCollectionExtra] = None
 
 
 class EnrichedBiosample(BaseModel):
@@ -666,6 +709,7 @@ class Subject(BaseModel):
     age_at_sampling: Optional[float] = None
     race: List[str] = []
     taxonomy: Optional[NCBITaxonomy] = None
+    extra: Optional[EnrichedSubject] = None
 
     @field_validator("age_at_enrollment", "age_at_sampling", mode="before")
     @classmethod

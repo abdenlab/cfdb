@@ -15,6 +15,7 @@ DCC_CONFIG = {
         "type": "c2m2_zip",
         "s3_base": "https://cfde-drc.s3.amazonaws.com/HuBMAP/C2M2/",
         "latest_url": "https://cfde-drc.s3.amazonaws.com/HuBMAP/C2M2/2025-09-15/HuBMAP_C2M2_Fall_2025.zip",
+        "api_base": "https://search.api.hubmapconsortium.org/v3",
     },
     "encode": {
         "name": "ENCODE",
