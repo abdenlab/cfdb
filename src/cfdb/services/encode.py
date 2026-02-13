@@ -197,6 +197,7 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         doc["assay_type"] = assay_type_obi
 
     # --- Build collections with biosamples and subjects ---
+    experiment_accession = _nonempty(row.get("Experiment accession"))
     biosample_term_id = _nonempty(row.get("Biosample term id"))
     biosample_term_name = _nonempty(row.get("Biosample term name"))
     biosample_type = _nonempty(row.get("Biosample type"))
@@ -251,6 +252,38 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         if genetic_mods:
             biosample_extra["biosample_genetic_modifications"] = genetic_mods
 
+        # Library metadata on biosample
+        _add_extra(biosample_extra, "library_made_from", row.get("Library made from"))
+        _add_extra(
+            biosample_extra, "library_depleted_in", row.get("Library depleted in")
+        )
+        _add_extra(
+            biosample_extra,
+            "library_extraction_method",
+            row.get("Library extraction method"),
+        )
+        _add_extra(
+            biosample_extra, "library_lysis_method", row.get("Library lysis method")
+        )
+        _add_extra(
+            biosample_extra,
+            "library_crosslinking_method",
+            row.get("Library crosslinking method"),
+        )
+        _add_extra(
+            biosample_extra,
+            "library_strand_specific",
+            row.get("Library strand specific"),
+        )
+        _add_extra(
+            biosample_extra,
+            "library_fragmentation_method",
+            row.get("Library fragmentation method"),
+        )
+        _add_extra(
+            biosample_extra, "library_size_range", row.get("Library size range")
+        )
+
         # Build biosample
         biosample = {
             "id_namespace": id_namespace,
@@ -264,16 +297,48 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         if biosample_extra:
             biosample["extra"] = biosample_extra
 
-        # Build collection
+        # Build collection extra (experiment-level fields)
+        collection_encode_extra = {}
+        _add_extra(
+            collection_encode_extra,
+            "experiment_target",
+            row.get("Experiment target"),
+        )
+        _add_extra(collection_encode_extra, "project", row.get("Project"))
+        _add_extra(collection_encode_extra, "lab", row.get("Lab"))
+        _add_extra(collection_encode_extra, "platform", row.get("Platform"))
+        _add_extra(collection_encode_extra, "dbxrefs", row.get("dbxrefs"))
+        _add_extra(
+            collection_encode_extra,
+            "rbns_protein_concentration",
+            row.get("RBNS protein concentration"),
+        )
+
+        # Build collection — keyed by experiment accession, fallback to biosample
+        if experiment_accession:
+            collection_local_id = experiment_accession
+            collection_name = experiment_accession
+            collection_persistent_id = (
+                f"https://www.encodeproject.org/experiments/{experiment_accession}/"
+            )
+        else:
+            collection_local_id = f"biosample:{biosample_term_name}"
+            collection_name = biosample_term_name
+            collection_persistent_id = None
+
         collection = {
             "id_namespace": id_namespace,
-            "local_id": f"biosample:{biosample_term_name}",
-            "name": biosample_term_name,
+            "local_id": collection_local_id,
+            "name": collection_name,
             "biosamples": [biosample],
             "subjects": subjects,
         }
+        if collection_persistent_id:
+            collection["persistent_id"] = collection_persistent_id
         if anatomy:
             collection["anatomy"] = [anatomy]
+        if collection_encode_extra:
+            collection["extra"] = {"encode": collection_encode_extra}
 
         doc["collections"] = [collection]
     else:
@@ -284,29 +349,9 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
 
     # File metadata
     _add_extra(extra, "assembly", row.get("File assembly"))
-    _add_extra(extra, "file_type", row.get("File type"))
     _add_extra(extra, "file_format_type", row.get("File format type"))
     if output_type:
         extra["output_type"] = output_type
-
-    # Experiment metadata
-    _add_extra(extra, "experiment_accession", row.get("Experiment accession"))
-    _add_extra(extra, "experiment_target", row.get("Experiment target"))
-    _add_extra(extra, "project", row.get("Project"))
-
-    # Library metadata
-    _add_extra(extra, "library_made_from", row.get("Library made from"))
-    _add_extra(extra, "library_depleted_in", row.get("Library depleted in"))
-    _add_extra(extra, "library_extraction_method", row.get("Library extraction method"))
-    _add_extra(extra, "library_lysis_method", row.get("Library lysis method"))
-    _add_extra(
-        extra, "library_crosslinking_method", row.get("Library crosslinking method")
-    )
-    _add_extra(extra, "library_strand_specific", row.get("Library strand specific"))
-    _add_extra(
-        extra, "library_fragmentation_method", row.get("Library fragmentation method")
-    )
-    _add_extra(extra, "library_size_range", row.get("Library size range"))
 
     # Replicate/sequencing metadata
     _add_extra(extra, "biological_replicates", row.get("Biological replicate(s)"))
@@ -319,11 +364,8 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     _add_extra(extra, "index_of", row.get("Index of"))
     _add_extra(extra, "derived_from", row.get("Derived from"))
 
-    # Provenance metadata
-    _add_extra(extra, "lab", row.get("Lab"))
-    _add_extra(extra, "dbxrefs", row.get("dbxrefs"))
+    # File-level provenance
     _add_extra(extra, "genome_annotation", row.get("Genome annotation"))
-    _add_extra(extra, "platform", row.get("Platform"))
     _add_extra(extra, "controlled_by", row.get("Controlled by"))
     _add_extra(extra, "s3_uri", row.get("s3_uri"))
     _add_extra(extra, "azure_url", row.get("Azure URL"))
@@ -331,11 +373,6 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     # Analysis metadata
     _add_extra(extra, "file_analysis_title", row.get("File analysis title"))
     _add_extra(extra, "file_analysis_status", row.get("File analysis status"))
-
-    # RBNS
-    _add_extra(
-        extra, "rbns_protein_concentration", row.get("RBNS protein concentration")
-    )
 
     # Audit fields
     _add_extra(extra, "audit_warning", row.get("Audit WARNING"))

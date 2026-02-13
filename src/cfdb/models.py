@@ -61,12 +61,6 @@ class EnrichedFile(BaseModel):
     assembly: Optional[str] = None
     file_format_type: Optional[str] = None
     output_type: Optional[str] = None
-    experiment_accession: Optional[str] = None
-    experiment_target: Optional[str] = None
-    project: Optional[str] = None
-    lab: Optional[str] = None
-    platform: Optional[str] = None
-    dbxrefs: Optional[str] = None
     genome_annotation: Optional[str] = None
     controlled_by: Optional[str] = None
     s3_uri: Optional[str] = None
@@ -82,15 +76,6 @@ class EnrichedFile(BaseModel):
     paired_with: Optional[str] = None
     index_of: Optional[str] = None
     derived_from: Optional[str] = None
-    library_made_from: Optional[str] = None
-    library_depleted_in: Optional[str] = None
-    library_extraction_method: Optional[str] = None
-    library_lysis_method: Optional[str] = None
-    library_crosslinking_method: Optional[str] = None
-    library_strand_specific: Optional[str] = None
-    library_fragmentation_method: Optional[str] = None
-    library_size_range: Optional[str] = None
-    rbns_protein_concentration: Optional[str] = None
     audit_warning: Optional[str] = None
     audit_not_compliant: Optional[str] = None
     audit_error: Optional[str] = None
@@ -135,6 +120,17 @@ class EnrichedSubject(BaseModel):
     hubmap: Optional[HuBMAPSubjectExtra] = None
 
 
+class ENCODECollectionExtra(BaseModel):
+    """ENCODE experiment-level metadata from metadata TSV."""
+
+    experiment_target: Optional[str] = None
+    project: Optional[str] = None
+    lab: Optional[str] = None
+    platform: Optional[str] = None
+    dbxrefs: Optional[str] = None
+    rbns_protein_concentration: Optional[str] = None
+
+
 class EnrichedCollection(BaseModel):
     """
     DCC-specific collection-level metadata from DCC APIs.
@@ -142,6 +138,7 @@ class EnrichedCollection(BaseModel):
     Populated during sync by fetching metadata from DCC-specific APIs.
     4DN: experiment details (ExperimentHiC, ExperimentSeq, etc.)
     HuBMAP: dataset-level metadata from Search API.
+    ENCODE: experiment-level metadata from metadata TSV.
     """
 
     # 4DN experiment fields
@@ -170,13 +167,16 @@ class EnrichedCollection(BaseModel):
     # HuBMAP
     hubmap: Optional[HuBMAPCollectionExtra] = None
 
+    # ENCODE
+    encode: Optional[ENCODECollectionExtra] = None
+
 
 class EnrichedBiosample(BaseModel):
     """
     DCC-specific biosample-level metadata from ENCODE.
 
     Populated during ENCODE sync from the metadata TSV. Contains biosample
-    classification and treatment information.
+    classification, treatment, and library information.
     """
 
     biosample_type: Optional[str] = None
@@ -184,6 +184,14 @@ class EnrichedBiosample(BaseModel):
     biosample_treatments_amount: Optional[str] = None
     biosample_treatments_duration: Optional[str] = None
     biosample_genetic_modifications: Optional[str] = None
+    library_made_from: Optional[str] = None
+    library_depleted_in: Optional[str] = None
+    library_extraction_method: Optional[str] = None
+    library_lysis_method: Optional[str] = None
+    library_crosslinking_method: Optional[str] = None
+    library_strand_specific: Optional[str] = None
+    library_fragmentation_method: Optional[str] = None
+    library_size_range: Optional[str] = None
 
 
 class FileMetadataModel(BaseModel):

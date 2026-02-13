@@ -16,7 +16,7 @@ Requires Python 3.10 or later.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SYNC_API_KEY` | API key for the sync endpoint (required - API won't start without it) | - |
+| `SYNC_API_KEY` | API key for the sync endpoint. If unset, sync is unprotected (suitable for local dev). | - |
 | `SYNC_DATA_DIR` | Directory for downloaded sync data files | - |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
 | `DATABASE_URL` | MongoDB connection string | `mongodb://localhost:27017` |
@@ -34,7 +34,7 @@ make mongodb
 make api
 
 # 3. (Optional) Sync latest DCC metadata
-curl -X POST -H "X-API-Key: dev-sync-key" http://localhost:8000/sync
+curl -X POST http://localhost:8000/sync
 ```
 
 This starts:
@@ -490,11 +490,14 @@ Trigger a sync of C2M2 datapackages from DCCs. Requires API key authentication.
 | 500 | Server configuration error |
 
 ```bash
-# Sync all DCCs
-curl -X POST -H "X-API-Key: your-key" http://localhost:8000/sync
+# Sync all DCCs (no API key needed when SYNC_API_KEY is unset)
+curl -X POST http://localhost:8000/sync
 
 # Sync specific DCCs
-curl -X POST -H "X-API-Key: your-key" "http://localhost:8000/sync?dccs=4dn&dccs=hubmap"
+curl -X POST "http://localhost:8000/sync?dccs=4dn&dccs=hubmap"
+
+# With API key (required in production when SYNC_API_KEY is set)
+curl -X POST -H "X-API-Key: your-key" http://localhost:8000/sync
 ```
 
 ### Sync Status

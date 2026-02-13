@@ -15,8 +15,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
 
 
-async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
-    """Verify API key for sync endpoints."""
+async def verify_api_key(x_api_key: str | None = Header(None, alias="X-API-Key")):
+    """Verify API key for sync endpoints. Skipped when SYNC_API_KEY is unset."""
+    if not api.SYNC_API_KEY:
+        return None
     if x_api_key != api.SYNC_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key

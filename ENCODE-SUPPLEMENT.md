@@ -109,19 +109,36 @@ Set to a constant ENCODE DCC document:
 
 ## Collection + Biosample + Subject Construction
 
-ENCODE files don't arrive with C2M2 collection/biosample/subject records. These are synthesized from the TSV's biosample and donor columns and embedded inline on each file document.
+ENCODE files don't arrive with C2M2 collection/biosample/subject records. These are synthesized from the TSV's experiment, biosample, and donor columns and embedded inline on each file document.
 
 ### Collection
 
-One collection per unique biosample term, embedded on `file.collections[]`:
+One collection per unique experiment accession, embedded on `file.collections[]`:
 
 | CFDB Field | ENCODE TSV Column | Notes |
 |------------|-------------------|-------|
-| `local_id` | `Biosample term name` | Prefixed: `biosample:{name}` |
-| `name` | `Biosample term name` | e.g., `"GM12878"`, `"heart"` |
+| `local_id` | `Experiment accession` | e.g., `"ENCSR000AAA"` |
+| `name` | `Experiment accession` | Same as `local_id` |
+| `persistent_id` | `Experiment accession` | `https://www.encodeproject.org/experiments/{accession}/` |
 | `anatomy[]` | `Biosample term id` + `Biosample term name` | `{id, name}` object |
 | `biosamples[]` | — | Single biosample (see below) |
 | `subjects[]` | `Donor(s)` | Subject records (see below) |
+| `extra.encode` | — | Experiment-level metadata (see below) |
+
+**Fallback**: if `Experiment accession` is missing, falls back to biosample-keyed collection (`biosample:{name}`).
+
+#### Collection Extra (`extra.encode`)
+
+Experiment-level fields stored on `collection.extra.encode` (`ENCODECollectionExtra`):
+
+| CFDB Field | ENCODE TSV Column |
+|------------|-------------------|
+| `extra.encode.experiment_target` | `Experiment target` |
+| `extra.encode.project` | `Project` |
+| `extra.encode.lab` | `Lab` |
+| `extra.encode.platform` | `Platform` |
+| `extra.encode.dbxrefs` | `dbxrefs` |
+| `extra.encode.rbns_protein_concentration` | `RBNS protein concentration` |
 
 ### Biosample
 
@@ -137,6 +154,14 @@ One biosample per file, nested inside the collection:
 | `extra.biosample_treatments_amount` | `Biosample treatments amount` | Dosage |
 | `extra.biosample_treatments_duration` | `Biosample treatments duration` | Duration |
 | `extra.biosample_genetic_modifications` | `Biosample genetic modifications methods/categories/targets/gene targets/site coordinates/zygosity` | Compound column |
+| `extra.library_made_from` | `Library made from` | e.g., `"RNA"`, `"DNA"` |
+| `extra.library_depleted_in` | `Library depleted in` | e.g., `"rRNA"` |
+| `extra.library_extraction_method` | `Library extraction method` | |
+| `extra.library_lysis_method` | `Library lysis method` | |
+| `extra.library_crosslinking_method` | `Library crosslinking method` | |
+| `extra.library_strand_specific` | `Library strand specific` | |
+| `extra.library_fragmentation_method` | `Library fragmentation method` | |
+| `extra.library_size_range` | `Library size range` | |
 
 ### Subject
 
@@ -149,37 +174,15 @@ One subject per donor accession, nested inside collection and biosample:
 
 ## File Extra Fields
 
-All stored on `file.extra` (`EnrichedFile`). Every field is `Optional[str]`.
+All stored on `file.extra` (`EnrichedFile`). Every field is `Optional[str]`. Only file-scoped fields remain here — experiment-level and library-level fields have been moved to `collection.extra.encode` and `biosample.extra` respectively.
 
 ### File Metadata
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
 | `extra.assembly` | `File assembly` |
-| `extra.file_type` | `File type` |
 | `extra.file_format_type` | `File format type` |
 | `extra.output_type` | `Output type` |
-
-### Experiment Metadata
-
-| CFDB Field | ENCODE TSV Column |
-|------------|-------------------|
-| `extra.experiment_accession` | `Experiment accession` |
-| `extra.experiment_target` | `Experiment target` |
-| `extra.project` | `Project` |
-
-### Library Metadata
-
-| CFDB Field | ENCODE TSV Column |
-|------------|-------------------|
-| `extra.library_made_from` | `Library made from` |
-| `extra.library_depleted_in` | `Library depleted in` |
-| `extra.library_extraction_method` | `Library extraction method` |
-| `extra.library_lysis_method` | `Library lysis method` |
-| `extra.library_crosslinking_method` | `Library crosslinking method` |
-| `extra.library_strand_specific` | `Library strand specific` |
-| `extra.library_fragmentation_method` | `Library fragmentation method` |
-| `extra.library_size_range` | `Library size range` |
 
 ### Sequencing / Replicate Metadata
 
@@ -195,13 +198,10 @@ All stored on `file.extra` (`EnrichedFile`). Every field is `Optional[str]`.
 | `extra.index_of` | `Index of` |
 | `extra.derived_from` | `Derived from` |
 
-### Provenance Metadata
+### Provenance / Access Metadata
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
-| `extra.lab` | `Lab` |
-| `extra.platform` | `Platform` |
-| `extra.dbxrefs` | `dbxrefs` |
 | `extra.genome_annotation` | `Genome annotation` |
 | `extra.controlled_by` | `Controlled by` |
 | `extra.s3_uri` | `s3_uri` |
@@ -213,7 +213,6 @@ All stored on `file.extra` (`EnrichedFile`). Every field is `Optional[str]`.
 |------------|-------------------|
 | `extra.file_analysis_title` | `File analysis title` |
 | `extra.file_analysis_status` | `File analysis status` |
-| `extra.rbns_protein_concentration` | `RBNS protein concentration` |
 
 ### Audit Fields
 

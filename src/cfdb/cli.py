@@ -78,12 +78,6 @@ def sync(dcc_names: tuple[str, ...], api_url: str, api_key: str):
 
         cfdb sync 4dn hubmap
     """
-    if not api_key:
-        click.echo(
-            "Error: API key required (--api-key or SYNC_API_KEY env var)", err=True
-        )
-        raise click.Abort()
-
     # Build URL with query params
     url = f"{api_url}/sync"
     if dcc_names:
@@ -91,8 +85,12 @@ def sync(dcc_names: tuple[str, ...], api_url: str, api_key: str):
         url = f"{url}?{params}"
 
     # Make POST request
+    headers = {}
+    if api_key:
+        headers["X-API-Key"] = api_key
+
     try:
-        response = requests.post(url, headers={"X-API-Key": api_key})
+        response = requests.post(url, headers=headers)
     except requests.RequestException as e:
         click.echo(f"Error: Failed to connect to API: {e}", err=True)
         raise SystemExit(1)
