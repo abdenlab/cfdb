@@ -16,7 +16,7 @@ Parameters:
   SyncApiKey:
     Type: String
     NoEcho: true
-    Description: API key for the /sync endpoint
+    Description: API key for the /sync endpoint (stored in Secrets Manager)
   DesiredCount:
     Type: Number
     Default: 1
@@ -32,6 +32,14 @@ Parameters:
     Default: cfdb.vis-api.link
 
 Resources:
+  # ---------- Secrets ----------
+  SyncApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-sync-api-key"
+      Description: API key for the CFDB /sync endpoint
+      SecretString: !Ref SyncApiKey
+
   # ---------- ACM certificate ----------
   Certificate:
     Type: AWS::CertificateManager::Certificate
@@ -159,14 +167,14 @@ Resources:
               Value: "true"
             - Name: MONGODB_RETRY_WRITES
               Value: "false"
-            - Name: SYNC_API_KEY
-              Value: !Ref SyncApiKey
             - Name: SYNC_DATA_DIR
               Value: /tmp/sync-data
           Secrets:
             - Name: DATABASE_URL
               ValueFrom:
                 Fn::ImportValue: !Sub "${DatabaseStackName}-ConnectionURLSecretArn"
+            - Name: SYNC_API_KEY
+              ValueFrom: !Ref SyncApiKeySecret
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -245,7 +253,8 @@ Resources:
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource:
-                  Fn::ImportValue: !Sub "${DatabaseStackName}-ConnectionURLSecretArn"
+                  - Fn::ImportValue: !Sub "${DatabaseStackName}-ConnectionURLSecretArn"
+                  - !Ref SyncApiKeySecret
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-execution-role"
