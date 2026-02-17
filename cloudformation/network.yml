@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CFDB network infrastructure — VPC with public subnets (ALB + ECS) and
+  private subnets (DocumentDB) across two Availability Zones.
+
+Parameters:
+  CidrBlock:
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    Default: 10.2.0.0/21
+    Description: VPC CIDR block
+    Type: String
+  CidrPublicSubnetA:
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    Default: 10.2.0.0/24
+    Type: String
+  CidrPublicSubnetB:
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    Default: 10.2.1.0/24
+    Type: String
+  CidrPrivateSubnetA:
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    Default: 10.2.2.0/24
+    Type: String
+  CidrPrivateSubnetB:
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    Default: 10.2.3.0/24
+    Type: String
+
+Mappings:
+  # Deterministic AZ-ID-to-name mapping (account-independent)
+  RegionMap:
+    us-east-1:
+      ZoneId1: use1-az6
+      ZoneId2: use1-az4
+    us-east-2:
+      ZoneId1: use2-az2
+      ZoneId2: use2-az3
+    us-west-2:
+      ZoneId1: usw2-az1
+      ZoneId2: usw2-az2
+
+Resources:
+  # ---------- VPC ----------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref CidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------- AZ resolution ----------
+  AvailabilityZone1:
+    Type: Custom::AvailabilityZone
+    DependsOn: LogGroupGetAZLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt GetAZLambdaFunction.Arn
+      ZoneId: !FindInMap [RegionMap, !Ref "AWS::Region", ZoneId1]
+
+  AvailabilityZone2:
+    Type: Custom::AvailabilityZone
+    DependsOn: LogGroupGetAZLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt GetAZLambdaFunction.Arn
+      ZoneId: !FindInMap [RegionMap, !Ref "AWS::Region", ZoneId2]
+
+  LogGroupGetAZLambdaFunction:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GetAZLambdaFunction}
+      RetentionInDays: 7
+
+  GetAZLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Resolve AZ ID to AZ name
+      Timeout: 60
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt GetAZLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          from json import dumps
+          from boto3 import client
+          EC2 = client('ec2')
+          def handler(event, context):
+              if event['RequestType'] in ('Create', 'Update'):
+                  print(dumps(event, default=str))
+                  data = {}
+                  try:
+                      response = EC2.describe_availability_zones(
+                          Filters=[{'Name': 'zone-id', 'Values': [event['ResourceProperties']['ZoneId']]}]
+                      )
+                      print(dumps(response, default=str))
+                      data['ZoneName'] = response['AvailabilityZones'][0]['ZoneName']
+                  except Exception as error:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(error))
+                      return
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data)
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  GetAZLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: !Sub "lambda.${AWS::URLSuffix}"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: DescribeAZs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeAvailabilityZones
+                Resource: "*"
+
+  # ---------- Public subnets (ALB + ECS) ----------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref CidrPublicSubnetA
+      AvailabilityZone: !GetAtt AvailabilityZone1.ZoneName
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-a"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref CidrPublicSubnetB
+      AvailabilityZone: !GetAtt AvailabilityZone2.ZoneName
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-b"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------- Private subnets (DocumentDB) ----------
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref CidrPrivateSubnetA
+      AvailabilityZone: !GetAtt AvailabilityZone1.ZoneName
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref CidrPrivateSubnetB
+      AvailabilityZone: !GetAtt AvailabilityZone2.ZoneName
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-b"
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt-a"
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt-b"
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # ---------- Security groups ----------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB — allow HTTP/HTTPS from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks — allow 8000 from ALB, all egress
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ecs-sg"
+
+  DocumentDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DocumentDB — allow 27017 from ECS only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-docdb-sg"
+
+  # ---------- DocumentDB subnet group ----------
+  DocumentDBSubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for DocumentDB
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-docdb-subnet-group"
+
+  # ---------- S3 VPC endpoint ----------
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+  PublicSubnetIds:
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnetIds"
+  PrivateSubnetIds:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnetIds"
+  ALBSecurityGroupId:
+    Value: !GetAtt ALBSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBSecurityGroupId"
+  ECSSecurityGroupId:
+    Value: !GetAtt ECSSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSSecurityGroupId"
+  DocumentDBSecurityGroupId:
+    Value: !GetAtt DocumentDBSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-DocumentDBSecurityGroupId"
+  DocumentDBSubnetGroupName:
+    Value: !Ref DocumentDBSubnetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-DocumentDBSubnetGroupName"
