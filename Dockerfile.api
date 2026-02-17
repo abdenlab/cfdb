@@ -1,5 +1,5 @@
 # Build stage for the Rust materializer
-FROM rust:1.83 AS builder
+FROM rust:1.85 AS builder
 WORKDIR /build
 COPY materialize/ .
 RUN cargo build --release
