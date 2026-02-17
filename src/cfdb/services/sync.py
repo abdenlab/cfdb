@@ -4,6 +4,7 @@ import asyncio
 import csv
 import logging
 import os
+import re
 import shutil
 import subprocess
 from copy import copy
@@ -258,18 +259,32 @@ async def _enrich_4dn_api_metadata() -> None:
 
         update: dict = {}
 
-        for key in (
-            "genome_assembly",
-            "file_type",
-            "file_type_detailed",
-            "condition",
-            "biosource_name",
-            "dataset",
-            "experiment_type",
-            "assay_info",
-            "replicate_info",
-            "extra_files",
-        ):
+        # Promoted to file top-level
+        top_level_map = {
+            "genome_assembly": "genome_assembly",
+            "file_type": "output_type",
+            "file_type_detailed": "output_type_detail",
+            "condition": "condition",
+            "assay_info": "assay_info",
+        }
+        for src_key, dest_key in top_level_map.items():
+            val = meta.get(src_key)
+            if val:
+                update[dest_key] = val
+
+        # Parse replicate_info into separate fields
+        replicate_info = meta.get("replicate_info")
+        if replicate_info:
+            update["extra.replicate_info"] = replicate_info
+            bio = re.search(r"Biorep\s+(\S+)", replicate_info)
+            tech = re.search(r"Techrep\s+(\S+)", replicate_info)
+            if bio:
+                update["biological_replicates"] = bio.group(1)
+            if tech:
+                update["technical_replicates"] = tech.group(1)
+
+        # Stay on extra (DCC-specific, no cross-DCC equivalent)
+        for key in ("biosource_name", "dataset", "extra_files"):
             val = meta.get(key)
             if val:
                 update[f"extra.fourdn.{key}"] = val
@@ -332,12 +347,21 @@ async def _enrich_4dn_collections() -> None:
             continue
 
         matched += 1
-        # Extract lab to top-level collection field; nest remaining under extra.fourdn
-        update: dict = {"extra.fourdn": meta}
-        lab = meta.get("lab")
-        if lab:
-            update["lab"] = lab
-        operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
+        update: dict = {}
+
+        # Promote selected fields to Collection top-level
+        if meta.get("lab"):
+            update["lab"] = meta["lab"]
+        if meta.get("experiment_type"):
+            update["experiment_type"] = meta["experiment_type"]
+
+        # Nest remaining under extra.fourdn
+        remaining = {k: v for k, v in meta.items() if k not in ("lab", "experiment_type")}
+        if remaining:
+            update["extra.fourdn"] = remaining
+
+        if update:
+            operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
 
     if not operations:
         logger.warning("4DN collection enrichment: no updates to apply")
@@ -386,24 +410,36 @@ async def _enrich_hubmap_collections_and_subjects() -> None:
         if not meta:
             continue
 
-        extra = {}
+        update_set: dict = {}
+
+        # Promoted to Collection top-level
+        dataset_type = meta.get("dataset_type")
+        if dataset_type is not None:
+            update_set["experiment_type"] = dataset_type
+        analyte_class = meta.get("analyte_class")
+        if analyte_class is not None:
+            update_set["analyte_class"] = analyte_class
+
+        # HuBMAP-specific fields stay nested on extra.hubmap
+        hubmap_extra: dict = {}
         for key in (
-            "dataset_type",
             "pipeline",
             "processing",
             "group_name",
-            "analyte_class",
             "visualization",
             "vitessce_hints",
             "metadata",
         ):
             val = meta.get(key)
             if val is not None:
-                extra[key] = val
+                hubmap_extra[key] = val
 
-        if extra:
+        if hubmap_extra:
+            update_set["extra.hubmap"] = hubmap_extra
+
+        if update_set:
             collection_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": {"extra.hubmap": extra}})
+                UpdateOne({"_id": doc["_id"]}, {"$set": update_set})
             )
 
     if collection_ops:
@@ -597,10 +633,10 @@ async def _enrich_hubmap_files() -> None:
         if access_level:
             update["data_access_level"] = access_level
 
-        # Extra fields
+        # Promoted field
         genome_assembly = matched_info.get("genome_assembly")
         if genome_assembly:
-            update["extra.hubmap.genome_assembly"] = genome_assembly
+            update["genome_assembly"] = genome_assembly
 
         # Try to match by filename to get per-file metadata
         filename = doc.get("filename", "")

@@ -299,11 +299,6 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
 
         # Build collection extra (experiment-level fields)
         collection_encode_extra = {}
-        _add_extra(
-            collection_encode_extra,
-            "experiment_target",
-            row.get("Experiment target"),
-        )
         _add_extra(collection_encode_extra, "project", row.get("Project"))
         _add_extra(collection_encode_extra, "platform", row.get("Platform"))
         _add_extra(collection_encode_extra, "dbxrefs", row.get("dbxrefs"))
@@ -340,6 +335,12 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         lab = _nonempty(row.get("Lab"))
         if lab:
             collection["lab"] = lab
+        # Promoted collection-level fields
+        if assay:
+            collection["experiment_type"] = assay
+        _add_extra(collection, "experiment_target", row.get("Experiment target"))
+        _add_extra(collection, "analyte_class", row.get("Library made from"))
+
         if collection_encode_extra:
             collection["extra"] = {"encode": collection_encode_extra}
 
@@ -347,18 +348,19 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     else:
         doc["collections"] = []
 
-    # --- Build file-level extra dict ---
+    # --- Promoted file-level fields (top-level) ---
+    _add_extra(doc, "genome_assembly", row.get("File assembly"))
+    _add_extra(doc, "genome_annotation", row.get("Genome annotation"))
+    if output_type:
+        doc["output_type"] = output_type
+    _add_extra(doc, "output_type_detail", row.get("File format type"))
+    _add_extra(doc, "biological_replicates", row.get("Biological replicate(s)"))
+    _add_extra(doc, "technical_replicates", row.get("Technical replicate(s)"))
+
+    # --- Build file-level extra dict (DCC-specific fields) ---
     extra = {}
 
-    # File metadata
-    _add_extra(extra, "assembly", row.get("File assembly"))
-    _add_extra(extra, "file_format_type", row.get("File format type"))
-    if output_type:
-        extra["output_type"] = output_type
-
     # Replicate/sequencing metadata
-    _add_extra(extra, "biological_replicates", row.get("Biological replicate(s)"))
-    _add_extra(extra, "technical_replicates", row.get("Technical replicate(s)"))
     _add_extra(extra, "read_length", row.get("Read length"))
     _add_extra(extra, "mapped_read_length", row.get("Mapped read length"))
     _add_extra(extra, "run_type", row.get("Run type"))
@@ -368,7 +370,6 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     _add_extra(extra, "derived_from", row.get("Derived from"))
 
     # File-level provenance
-    _add_extra(extra, "genome_annotation", row.get("Genome annotation"))
     _add_extra(extra, "controlled_by", row.get("Controlled by"))
     _add_extra(extra, "s3_uri", row.get("s3_uri"))
     _add_extra(extra, "azure_url", row.get("Azure URL"))

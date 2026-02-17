@@ -90,7 +90,6 @@ class BiosampleInput:
 @strawberry.input
 class FourDNCollectionExtraInput:
     display_title: list[str] | None = None
-    experiment_type: list[str] | None = None
     targeted_factor: list[str] | None = None
     digestion_enzyme: list[str] | None = None
     crosslinking_method: list[str] | None = None
@@ -148,6 +147,9 @@ class CollectionInput:
     name: list[str] | None = None
     description: list[str] | None = None
     lab: list[str] | None = None
+    experiment_type: list[str] | None = None
+    experiment_target: list[str] | None = None
+    analyte_class: list[str] | None = None
     anatomy: list[AnatomyInput] | None = None
     subjects: list[SubjectInput] | None = None
     extra: list[EnrichedCollectionInput] | None = None
@@ -189,8 +191,6 @@ class FourDNFileExtraInput:
     condition: list[str] | None = None
     biosource_name: list[str] | None = None
     dataset: list[str] | None = None
-    experiment_type: list[str] | None = None
-    assay_info: list[str] | None = None
     replicate_info: list[str] | None = None
     cell_line_tier: list[str] | None = None
 
@@ -206,8 +206,6 @@ class ENCODEFileExtraInput:
     azure_url: list[str] | None = None
     file_analysis_title: list[str] | None = None
     file_analysis_status: list[str] | None = None
-    biological_replicates: list[str] | None = None
-    technical_replicates: list[str] | None = None
     read_length: list[str] | None = None
     mapped_read_length: list[str] | None = None
     run_type: list[str] | None = None
@@ -260,6 +258,14 @@ class FileMetadataInput:
     dbgap_study_id: list[str] | None = None
     access_url: list[str] | None = None
     data_access_level: list[str] | None = None
+    genome_assembly: list[str] | None = None
+    genome_annotation: list[str] | None = None
+    output_type: list[str] | None = None
+    output_type_detail: list[str] | None = None
+    biological_replicates: list[str] | None = None
+    technical_replicates: list[str] | None = None
+    assay_info: list[str] | None = None
+    condition: list[str] | None = None
     extra: list[EnrichedFileInput] | None = None
 
 

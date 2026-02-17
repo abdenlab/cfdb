@@ -42,8 +42,6 @@ class FourDNFileExtra(BaseModel):
     condition: Optional[str] = None
     biosource_name: Optional[str] = None
     dataset: Optional[str] = None
-    experiment_type: Optional[str] = None
-    assay_info: Optional[str] = None
     replicate_info: Optional[str] = None
     cell_line_tier: Optional[str] = None
     extra_files: Optional[List[ExtraFile]] = None
@@ -98,11 +96,9 @@ class EnrichedFile(BaseModel):
 class HuBMAPCollectionExtra(BaseModel):
     """HuBMAP dataset-level metadata from Search API."""
 
-    dataset_type: Optional[str] = None
     pipeline: Optional[str] = None
     processing: Optional[str] = None
     group_name: Optional[str] = None
-    analyte_class: Optional[str] = None
     visualization: Optional[bool] = None
     vitessce_hints: Optional[List[str]] = None
     metadata: Optional[dict] = None
@@ -137,7 +133,6 @@ class EnrichedSubject(BaseModel):
 class ENCODECollectionExtra(BaseModel):
     """ENCODE experiment-level metadata from metadata TSV."""
 
-    experiment_target: Optional[str] = None
     project: Optional[str] = None
     platform: Optional[str] = None
     dbxrefs: Optional[str] = None
@@ -148,7 +143,6 @@ class FourDNCollectionExtra(BaseModel):
     """4DN experiment-level metadata from Search API."""
 
     display_title: Optional[str] = None
-    experiment_type: Optional[str] = None
     targeted_factor: Optional[List[str]] = None
     digestion_enzyme: Optional[str] = None
     crosslinking_method: Optional[str] = None
@@ -344,6 +338,14 @@ class FileMetadataModel(BaseModel):
     access_url: Optional[str] = None
     status: Optional[str] = None
     data_access_level: Optional[str] = None
+    genome_assembly: Optional[str] = None
+    genome_annotation: Optional[str] = None
+    output_type: Optional[str] = None
+    output_type_detail: Optional[str] = None
+    biological_replicates: Optional[str] = None
+    technical_replicates: Optional[str] = None
+    assay_info: Optional[str] = None
+    condition: Optional[str] = None
     extra: Optional[EnrichedFile] = None
 
 
@@ -515,6 +517,9 @@ class Collection(BaseModel):
     name: str = str()
     description: Optional[str] = None
     lab: Optional[str] = None
+    experiment_type: Optional[str] = None
+    experiment_target: Optional[str] = None
+    analyte_class: Optional[str] = None
     anatomy: List[Anatomy] = []
     subjects: List[Subject] = []
     extra: Optional[EnrichedCollection] = None

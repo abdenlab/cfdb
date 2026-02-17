@@ -43,6 +43,6 @@ api:
 	@docker rm api 2>/dev/null || true
 	@echo "Building the API Docker image..."
 	docker build -t api -f Dockerfile.api .
-	@echo "Starting the API container..."
-	docker run -d --name api --network cvh-backend-network --network-alias cvh-backend -p 8000:8000 -e SYNC_API_KEY=dev-sync-key -e SYNC_DATA_DIR=/tmp/sync-data api
+	@echo "Starting the API container in DEVELOPMENT mode (no TLS)..."
+	docker run -d --name api --network cvh-backend-network --network-alias cvh-backend -p 8000:8000 -e SYNC_DATA_DIR=/tmp/sync-data api
 	@echo "API container is up and running on port 8000 (http://0.0.0.0:8000/metadata)."
