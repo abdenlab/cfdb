@@ -35,9 +35,87 @@ Mappings:
     us-east-2:
       ZoneId1: use2-az2
       ZoneId2: use2-az3
+    us-west-1:
+      ZoneId1: usw1-az1
+      ZoneId2: usw1-az3
     us-west-2:
       ZoneId1: usw2-az1
       ZoneId2: usw2-az2
+    eu-central-1:
+      ZoneId1: euc1-az3
+      ZoneId2: euc1-az2
+    eu-west-1:
+      ZoneId1: euw1-az1
+      ZoneId2: euw1-az2
+    eu-west-2:
+      ZoneId1: euw2-az2
+      ZoneId2: euw2-az3
+    eu-west-3:
+      ZoneId1: euw3-az1
+      ZoneId2: euw3-az2
+    eu-north-1:
+      ZoneId1: eun1-az2
+      ZoneId2: eun1-az1
+    ca-central-1:
+      ZoneId1: cac1-az2
+      ZoneId2: cac1-az1
+    eu-south-1:
+      ZoneId1: eus1-az2
+      ZoneId2: eus1-az1
+    ap-east-1:
+      ZoneId1: ape1-az3
+      ZoneId2: ape1-az2
+    ap-northeast-1:
+      ZoneId1: apne1-az4
+      ZoneId2: apne1-az1
+    ap-northeast-2:
+      ZoneId1: apne2-az1
+      ZoneId2: apne2-az3
+    ap-south-1:
+      ZoneId1: aps1-az2
+      ZoneId2: aps1-az3
+    ap-southeast-1:
+      ZoneId1: apse1-az1
+      ZoneId2: apse1-az2
+    ap-southeast-2:
+      ZoneId1: apse2-az3
+      ZoneId2: apse2-az1
+    us-gov-west-1:
+      ZoneId1: usgw1-az1
+      ZoneId2: usgw1-az2
+    ap-northeast-3:
+      ZoneId1: apne3-az3
+      ZoneId2: apne3-az2
+    sa-east-1:
+      ZoneId1: sae1-az3
+      ZoneId2: sae1-az2
+    af-south-1:
+      ZoneId1: afs1-az3
+      ZoneId2: afs1-az2
+    ap-south-2:
+      ZoneId1: aps2-az3
+      ZoneId2: aps2-az2
+    ap-southeast-3:
+      ZoneId1: apse3-az3
+      ZoneId2: apse3-az2
+    ap-southeast-4:
+      ZoneId1: apse4-az3
+      ZoneId2: apse4-az2
+    ca-west-1:
+      ZoneId1: caw1-az3
+      ZoneId2: caw1-az2
+    eu-central-2:
+      ZoneId1: euc2-az3
+      ZoneId2: euc2-az2
+    eu-south-2:
+      ZoneId1: eus2-az3
+      ZoneId2: eus2-az2
+    il-central-1:
+      ZoneId1: ilc1-az3
+      ZoneId2: ilc1-az2
+    me-central-1:
+      ZoneId1: mec1-az3
+      ZoneId2: mec1-az2
 
 Resources:
   # ---------- VPC ----------
@@ -50,6 +128,40 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-vpc"
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Sub "${AWS::StackName}-VPCFlowLogs"
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}-VPCFlowLogs:*"
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
