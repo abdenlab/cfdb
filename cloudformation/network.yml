@@ -352,7 +352,7 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ALB — allow HTTP/HTTPS from internet
+      GroupDescription: ALB - allow HTTP/HTTPS from internet
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - CidrIp: 0.0.0.0/0
@@ -370,7 +370,7 @@ Resources:
   ECSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ECS tasks — allow 8000 from ALB, all egress
+      GroupDescription: ECS tasks - allow 8000 from ALB, all egress
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -387,7 +387,7 @@ Resources:
   DocumentDBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: DocumentDB — allow 27017 from ECS only
+      GroupDescription: DocumentDB - allow 27017 from ECS only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
