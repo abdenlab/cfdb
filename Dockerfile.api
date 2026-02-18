@@ -10,6 +10,12 @@ EXPOSE 8000
 ENV DATABASE_URL="mongodb://cvh-backend:27017"
 WORKDIR /app
 
+# Install curl (for ECS health checks) and download AWS DocumentDB CA bundle
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /etc/cfdb/certs \
+    && curl --fail -sS -o /etc/cfdb/certs/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    && chmod 644 /etc/cfdb/certs/global-bundle.pem
+
 # Install the materializer binary
 COPY --from=builder /build/target/release/materialize /usr/local/bin/materialize
 
