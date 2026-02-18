@@ -13,7 +13,7 @@ Parameters:
     NoEcho: true
   InstanceClass:
     Type: String
-    Default: db.t3.micro
+    Default: db.t3.medium
     Description: DocumentDB instance class
   InstanceCount:
     Type: Number
