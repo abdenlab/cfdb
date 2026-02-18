@@ -1,7 +1,9 @@
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from strawberry.fastapi import GraphQLRouter
 
@@ -14,20 +16,28 @@ from cfdb.api.routers.sync import router as sync_router
 logging.basicConfig(level=logging.INFO)
 
 
+def redact_url(url: str) -> str:
+    """Redact password from a MongoDB connection string for safe logging."""
+    return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", url)
+
+
 def create_mongodb_client() -> AsyncIOMotorClient:
-    """Create MongoDB client with optional TLS/X.509 authentication."""
+    """Create MongoDB client with optional TLS authentication."""
+    kwargs: dict = {}
+
+    if not api.MONGODB_RETRY_WRITES:
+        kwargs["retryWrites"] = False
+
     if api.MONGODB_TLS_ENABLED:
-        print(f"Connecting to MongoDB at {api.DATABASE_URL} with X.509 authentication")
+        print(f"Connecting to MongoDB at {redact_url(api.DATABASE_URL)} with TLS")
         return AsyncIOMotorClient(
             api.DATABASE_URL,
-            authMechanism="MONGODB-X509",
             tls=True,
-            tlsCertificateKeyFile=api.MONGODB_CERT_PATH,
             tlsCAFile=api.MONGODB_CA_PATH,
-            authSource="$external",
+            **kwargs,
         )
     print(f"Connecting to MongoDB at {api.DATABASE_URL} (no authentication)")
-    return AsyncIOMotorClient(api.DATABASE_URL)
+    return AsyncIOMotorClient(api.DATABASE_URL, **kwargs)
 
 
 @asynccontextmanager
@@ -48,3 +58,8 @@ app.include_router(GraphQLRouter(schema), prefix="/metadata")
 app.include_router(data_router)
 app.include_router(index_router)
 app.include_router(sync_router)
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
