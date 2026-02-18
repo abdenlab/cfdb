@@ -12,6 +12,7 @@ rayon = "1"
 indicatif = "0.17"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 
 [profile.release]
 lto = true

@@ -2,7 +2,7 @@ use anyhow::Result;
 use bson::{doc, Document};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use mongodb::options::{AuthMechanism, ClientOptions, Credential, TlsOptions};
+use mongodb::options::{ClientOptions, TlsOptions};
 use mongodb::sync::{Client, Collection};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -54,40 +54,43 @@ struct LookupTables {
     subject_in_collection: MultiMap,
 }
 
-/// Create MongoDB client with optional TLS/X.509 authentication.
+/// Create MongoDB client with optional TLS authentication.
+/// When TLS is enabled, SCRAM credentials are parsed from the URI automatically.
 fn create_mongodb_client() -> Result<Client> {
     let uri = env::var("DATABASE_URL").unwrap_or_else(|_| "mongodb://localhost:27017".to_string());
     let tls_enabled = env::var("MONGODB_TLS_ENABLED")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
+    let retry_writes = env::var("MONGODB_RETRY_WRITES")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    let mut options = ClientOptions::parse(&uri).run()?;
+
+    if !retry_writes {
+        options.retry_writes = Some(false);
+    }
 
     if tls_enabled {
-        let cert_path = env::var("MONGODB_CERT_PATH")
-            .unwrap_or_else(|_| "/etc/cfdb/certs/client-bundle.pem".to_string());
         let ca_path = env::var("MONGODB_CA_PATH")
-            .unwrap_or_else(|_| "/etc/cfdb/certs/ca.pem".to_string());
+            .unwrap_or_else(|_| "/etc/cfdb/certs/global-bundle.pem".to_string());
 
-        println!("Connecting to MongoDB at {} with X.509 authentication", uri);
-
-        let mut options = ClientOptions::parse(&uri).run()?;
+        // Redact password from URI for logging
+        let redacted = regex::Regex::new(r"://([^:]+):([^@]+)@")
+            .unwrap()
+            .replace(&uri, "://$1:***@");
+        println!("Connecting to MongoDB at {} with TLS", redacted);
 
         let tls_options = TlsOptions::builder()
             .ca_file_path(Some(PathBuf::from(ca_path)))
-            .cert_key_file_path(Some(PathBuf::from(cert_path)))
             .build();
 
         options.tls = Some(mongodb::options::Tls::Enabled(tls_options));
-        options.credential = Some(
-            Credential::builder()
-                .mechanism(AuthMechanism::MongoDbX509)
-                .source(Some("$external".to_string()))
-                .build(),
-        );
 
         Ok(Client::with_options(options)?)
     } else {
         println!("Connecting to MongoDB at {} (no authentication)", uri);
-        Ok(Client::with_uri_str(&uri)?)
+        Ok(Client::with_options(options)?)
     }
 }
 

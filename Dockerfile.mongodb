@@ -3,87 +3,37 @@ FROM mongo:latest
 # Copy database dump and scripts
 COPY database/ /data/database/
 COPY scripts/create-indexes.js /scripts/create-indexes.js
-COPY scripts/create-x509-users.js /scripts/create-x509-users.js
 
-# Copy TLS configuration
-COPY docker/mongodb/mongod-tls.conf /etc/mongodb/mongod-tls.conf
-
-# Create startup script with conditional TLS support
+# Create startup script (development mode only)
 COPY <<'EOF' /startup.sh
 #!/bin/bash
 set -e
 
-# Check if TLS certificates are mounted (production mode)
-if [ -f /etc/mongodb/certs/server-bundle.pem ] && [ -f /etc/mongodb/certs/ca.pem ]; then
-    echo "=== TLS certificates found - starting in PRODUCTION mode ==="
+echo "=== Starting MongoDB in DEVELOPMENT mode ==="
 
-    # Phase 1: Start MongoDB with TLS but WITHOUT auth (for initial setup)
-    echo "Phase 1: Starting MongoDB with TLS (no auth for setup)..."
-    mongod --bind_ip_all \
-           --tlsMode requireTLS \
-           --tlsCertificateKeyFile /etc/mongodb/certs/server-bundle.pem \
-           --tlsCAFile /etc/mongodb/certs/ca.pem \
-           --tlsAllowConnectionsWithoutCertificates &
-    MONGOD_PID=$!
+# Start MongoDB without TLS
+mongod --bind_ip_all &
+MONGOD_PID=$!
 
-    # Wait for MongoDB to be ready
-    echo "Waiting for MongoDB to start..."
-    until mongosh --tls --tlsAllowInvalidCertificates \
-                  --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
-        sleep 1
-    done
-    echo "MongoDB started with TLS (no auth)."
+# Wait for MongoDB to be ready
+echo "Waiting for MongoDB to start..."
+until mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
+    sleep 1
+done
+echo "MongoDB started."
 
-    # Restore database
-    echo "Restoring database..."
-    mongorestore --gzip /data/database \
-                 --ssl --sslAllowInvalidCertificates
+# Restore database
+echo "Restoring database..."
+mongorestore --gzip /data/database
 
-    # Create indexes
-    echo "Creating indexes..."
-    mongosh --tls --tlsAllowInvalidCertificates \
-            cfdb /scripts/create-indexes.js
+# Create indexes
+echo "Creating indexes..."
+mongosh cfdb /scripts/create-indexes.js
 
-    # Create X.509 users
-    echo "Creating X.509 users..."
-    mongosh --tls --tlsAllowInvalidCertificates \
-            admin /scripts/create-x509-users.js
+echo "=== Development initialization complete ==="
 
-    echo "Phase 1 complete. Restarting MongoDB with auth enabled..."
-
-    # Phase 2: Shutdown and restart with full security
-    kill $MONGOD_PID
-    wait $MONGOD_PID 2>/dev/null
-
-    echo "Phase 2: Starting MongoDB with TLS and X.509 authentication..."
-    exec mongod --config /etc/mongodb/mongod-tls.conf --setParameter authenticationMechanisms=MONGODB-X509
-else
-    echo "=== No TLS certificates found - starting in DEVELOPMENT mode ==="
-
-    # Start MongoDB without TLS (original behavior)
-    mongod --bind_ip_all &
-    MONGOD_PID=$!
-
-    # Wait for MongoDB to be ready
-    echo "Waiting for MongoDB to start..."
-    until mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
-        sleep 1
-    done
-    echo "MongoDB started."
-
-    # Restore database
-    echo "Restoring database..."
-    mongorestore --gzip /data/database
-
-    # Create indexes
-    echo "Creating indexes..."
-    mongosh cfdb /scripts/create-indexes.js
-
-    echo "=== Development initialization complete ==="
-
-    # Keep MongoDB running
-    wait $MONGOD_PID
-fi
+# Keep MongoDB running
+wait $MONGOD_PID
 EOF
 
 RUN chmod +x /startup.sh
