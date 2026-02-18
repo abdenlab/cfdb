@@ -13,10 +13,6 @@ Parameters:
   ImageURI:
     Type: String
     Description: ECR image URI for the CFDB API
-  SyncApiKey:
-    Type: String
-    NoEcho: true
-    Description: API key for the /sync endpoint (stored in Secrets Manager)
   DesiredCount:
     Type: Number
     Default: 1
@@ -38,7 +34,9 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-sync-api-key"
       Description: API key for the CFDB /sync endpoint
-      SecretString: !Ref SyncApiKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
 
   # ---------- ACM certificate ----------
   Certificate:

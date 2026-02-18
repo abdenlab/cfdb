@@ -9,18 +9,17 @@ Parameters:
     Description: Name of the network stack (for cross-stack imports)
   DBMasterUsername:
     Type: String
-    Default: cfdbadmin
     Description: Master username for the DocumentDB cluster
     NoEcho: true
   InstanceClass:
     Type: String
-    Default: db.t3.medium
+    Default: db.t3.micro
     Description: DocumentDB instance class
   InstanceCount:
     Type: Number
     Default: 1
     MinValue: 1
-    MaxValue: 3
+    MaxValue: 1
     Description: Number of DocumentDB instances
 
 Resources:
