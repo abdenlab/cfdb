@@ -15,7 +15,7 @@ Field mapping from the 4D Nucleome (4DN) Search API and C2M2 datapackage to the 
 |-------------|------------------|---------------------|
 | File | `persistent_id` contains `4DNF*` | `accession` (e.g., `4DNFI1234ABC`) |
 | Collection | `persistent_id` contains `4DNEX*` or `4DNES*` | `accession` (e.g., `4DNEXH4ZUIH6`) |
-| Biosource tier | `extra.biosource_name` | `Biosource.display_title` |
+| Biosource tier | `extra.fourdn.biosource_name` | `Biosource.display_title` |
 
 Accessions are extracted from persistent_id URLs via regex: `4DNF[A-Z0-9]+` for files, `4DNE[A-Z][A-Z0-9]+` for experiments.
 
@@ -49,7 +49,7 @@ file
 
 ### File Format Enrichment
 
-For files with ambiguous container formats (HDF5, plain text) or missing `file_format`, the materializer derives a specific format from the filename extension. Stored on `extra.enriched_file_format`.
+For files with ambiguous container formats (HDF5, plain text) or missing `file_format`, the materializer derives a specific format from the filename extension. Stored on `extra.fourdn.enriched_file_format`.
 
 | Extension | Enriched Format | Triggered When |
 |-----------|----------------|----------------|
@@ -65,7 +65,7 @@ For files with ambiguous container formats (HDF5, plain text) or missing `file_f
 
 ## Collection Enrichment (Pre-Materialization)
 
-Stored on `collection.extra` (`EnrichedCollection`). Fetched from 4DN Search API by querying `ExperimentHiC`, `ExperimentSeq`, `ExperimentDamid`, and `ExperimentChiapet` types. Paginated at 1000 records/page with 100ms rate limiting.
+Stored on `collection.extra.fourdn` (`FourDNCollectionExtra`), with `lab` promoted to `collection.lab`. Fetched from 4DN Search API by querying `ExperimentHiC`, `ExperimentSeq`, `ExperimentDamid`, and `ExperimentChiapet` types. Paginated at 1000 records/page with 100ms rate limiting.
 
 ### Direct Fields
 
@@ -83,7 +83,8 @@ These API fields return objects; the materializer extracts `display_title`:
 |------------|-------------|------|---------|
 | `experiment_type` | `experiment_type.display_title` | string | `"in situ Hi-C"` |
 | `digestion_enzyme` | `digestion_enzyme.display_title` | string | `"DpnII"` |
-| `lab` | `lab.display_title` | string | `"Erez Lieberman Aiden, Baylor"` |
+
+`lab` is extracted from `lab.display_title` and promoted to the top-level `collection.lab` field (e.g., `"Erez Lieberman Aiden, Baylor"`).
 
 ### Array Field
 
@@ -114,15 +115,15 @@ All stored as `Optional[str]`:
 
 ## File Enrichment (Post-Materialization)
 
-Stored on `file.extra` (`EnrichedFile`). Fetched from 4DN Search API by querying `FileProcessed` and `FileFastq` types. Paginated at 1000 records/page with 100ms rate limiting.
+Stored on `file.extra.fourdn` (`FourDNFileExtra`). Fetched from 4DN Search API by querying `FileProcessed` and `FileFastq` types. Paginated at 1000 records/page with 100ms rate limiting.
 
 ### Direct File Fields
 
 | CFDB Field | 4DN API Path | Type | Example |
 |------------|-------------|------|---------|
-| `extra.genome_assembly` | `genome_assembly` | string | `"GRCh38"` |
-| `extra.file_type` | `file_type` | string | `"contact matrix"` |
-| `extra.file_type_detailed` | `file_type_detailed` | string | `"contact matrix (mcool)"` |
+| `extra.fourdn.genome_assembly` | `genome_assembly` | string | `"GRCh38"` |
+| `extra.fourdn.file_type` | `file_type` | string | `"contact matrix"` |
+| `extra.fourdn.file_type_detailed` | `file_type_detailed` | string | `"contact matrix (mcool)"` |
 
 ### Track and Facet Info Fields
 
@@ -130,22 +131,22 @@ Extracted from `track_and_facet_info` sub-object:
 
 | CFDB Field | 4DN API Path | Type | Example |
 |------------|-------------|------|---------|
-| `extra.condition` | `track_and_facet_info.condition` | string | `"untreated"` |
-| `extra.biosource_name` | `track_and_facet_info.biosource_name` | string | `"GM12878"` |
-| `extra.dataset` | `track_and_facet_info.dataset` | string | `"Rao et al. (2014)"` |
-| `extra.experiment_type` | `track_and_facet_info.experiment_type` | string | `"in situ Hi-C"` |
-| `extra.assay_info` | `track_and_facet_info.assay_info` | string | `"DpnII, bio"` |
-| `extra.replicate_info` | `track_and_facet_info.replicate_info` | string | `"Biorep 1, Techrep 1"` |
+| `extra.fourdn.condition` | `track_and_facet_info.condition` | string | `"untreated"` |
+| `extra.fourdn.biosource_name` | `track_and_facet_info.biosource_name` | string | `"GM12878"` |
+| `extra.fourdn.dataset` | `track_and_facet_info.dataset` | string | `"Rao et al. (2014)"` |
+| `extra.fourdn.experiment_type` | `track_and_facet_info.experiment_type` | string | `"in situ Hi-C"` |
+| `extra.fourdn.assay_info` | `track_and_facet_info.assay_info` | string | `"DpnII, bio"` |
+| `extra.fourdn.replicate_info` | `track_and_facet_info.replicate_info` | string | `"Biorep 1, Techrep 1"` |
 
 ### Derived Field
 
 | CFDB Field | Source | Type | Notes |
 |------------|--------|------|-------|
-| `extra.cell_line_tier` | `Biosource` type query | string | Derived by looking up `biosource_name` in a separate Biosource tier query. Values: `"Tier 1"`, `"Tier 2"`. ~17 classified cell lines. |
+| `extra.fourdn.cell_line_tier` | `Biosource` type query | string | Derived by looking up `biosource_name` in a separate Biosource tier query. Values: `"Tier 1"`, `"Tier 2"`. ~17 classified cell lines. |
 
 ### Index Files
 
-Stored on `extra.extra_files` as `ExtraFile[]`:
+Stored on `extra.fourdn.extra_files` as `ExtraFile[]`:
 
 | CFDB Field | 4DN API Path | Type | Example |
 |------------|-------------|------|---------|
@@ -175,7 +176,8 @@ C2M2 ZIP (download + extract)
   │     ├─ fetch_experiment_metadata_bulk()
   │     │    └─ Query ExperimentHiC, ExperimentSeq, ExperimentDamid, ExperimentChiapet
   │     └─ Match collection.persistent_id -> 4DNEX* accession
-  │        └─ Write EnrichedCollection -> collection.extra
+  │        ├─ Write FourDNCollectionExtra -> collection.extra.fourdn
+  │        └─ Promote lab -> collection.lab
   │
   ├─> _materialize_files()                          [Rust materializer]
   │     ├─ Denormalize all C2M2 joins into files collection
@@ -187,5 +189,5 @@ C2M2 ZIP (download + extract)
         ├─ fetch_biosource_tiers()
         │    └─ Query Biosource (Tier 1, Tier 2)
         └─ Match files.persistent_id -> 4DNF* accession
-           └─ Write genome_assembly, file_type, extra_files, cell_line_tier -> files.extra
+           └─ Write genome_assembly, file_type, extra_files, cell_line_tier -> files.extra.fourdn
 ```

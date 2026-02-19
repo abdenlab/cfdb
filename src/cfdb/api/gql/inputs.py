@@ -51,12 +51,25 @@ class SubjectInput:
 
 
 @strawberry.input
-class EnrichedBiosampleInput:
+class ENCODEBiosampleExtraInput:
     biosample_type: list[str] | None = None
     biosample_treatments: list[str] | None = None
     biosample_treatments_amount: list[str] | None = None
     biosample_treatments_duration: list[str] | None = None
     biosample_genetic_modifications: list[str] | None = None
+    library_made_from: list[str] | None = None
+    library_depleted_in: list[str] | None = None
+    library_extraction_method: list[str] | None = None
+    library_lysis_method: list[str] | None = None
+    library_crosslinking_method: list[str] | None = None
+    library_strand_specific: list[str] | None = None
+    library_fragmentation_method: list[str] | None = None
+    library_size_range: list[str] | None = None
+
+
+@strawberry.input
+class EnrichedBiosampleInput:
+    encode: list[ENCODEBiosampleExtraInput] | None = None
 
 
 @strawberry.input
@@ -75,12 +88,11 @@ class BiosampleInput:
 
 
 @strawberry.input
-class EnrichedCollectionInput:
+class FourDNCollectionExtraInput:
     display_title: list[str] | None = None
     experiment_type: list[str] | None = None
     targeted_factor: list[str] | None = None
     digestion_enzyme: list[str] | None = None
-    lab: list[str] | None = None
     crosslinking_method: list[str] | None = None
     crosslinking_temperature: list[str] | None = None
     crosslinking_time: list[str] | None = None
@@ -100,6 +112,32 @@ class EnrichedCollectionInput:
 
 
 @strawberry.input
+class ENCODECollectionExtraInput:
+    experiment_target: list[str] | None = None
+    project: list[str] | None = None
+    platform: list[str] | None = None
+    dbxrefs: list[str] | None = None
+    rbns_protein_concentration: list[str] | None = None
+
+
+@strawberry.input
+class HuBMAPCollectionExtraInput:
+    dataset_type: list[str] | None = None
+    pipeline: list[str] | None = None
+    processing: list[str] | None = None
+    group_name: list[str] | None = None
+    analyte_class: list[str] | None = None
+    visualization: list[bool] | None = None
+
+
+@strawberry.input
+class EnrichedCollectionInput:
+    fourdn: list[FourDNCollectionExtraInput] | None = None
+    encode: list[ENCODECollectionExtraInput] | None = None
+    hubmap: list[HuBMAPCollectionExtraInput] | None = None
+
+
+@strawberry.input
 class CollectionInput:
     biosamples: list[BiosampleInput] | None = None
     id_namespace: list[str] | None = None
@@ -109,6 +147,7 @@ class CollectionInput:
     abbreviation: list[str] | None = None
     name: list[str] | None = None
     description: list[str] | None = None
+    lab: list[str] | None = None
     anatomy: list[AnatomyInput] | None = None
     subjects: list[SubjectInput] | None = None
     extra: list[EnrichedCollectionInput] | None = None
@@ -142,10 +181,8 @@ class FileFormatInput:
 
 
 @strawberry.input
-class EnrichedFileInput:
-    # 4DN materializer
+class FourDNFileExtraInput:
     enriched_file_format: list[str] | None = None
-    # 4DN API enrichment
     genome_assembly: list[str] | None = None
     file_type: list[str] | None = None
     file_type_detailed: list[str] | None = None
@@ -156,16 +193,13 @@ class EnrichedFileInput:
     assay_info: list[str] | None = None
     replicate_info: list[str] | None = None
     cell_line_tier: list[str] | None = None
-    # ENCODE
+
+
+@strawberry.input
+class ENCODEFileExtraInput:
     assembly: list[str] | None = None
     file_format_type: list[str] | None = None
     output_type: list[str] | None = None
-    experiment_accession: list[str] | None = None
-    experiment_target: list[str] | None = None
-    project: list[str] | None = None
-    lab: list[str] | None = None
-    platform: list[str] | None = None
-    dbxrefs: list[str] | None = None
     genome_annotation: list[str] | None = None
     controlled_by: list[str] | None = None
     s3_uri: list[str] | None = None
@@ -181,18 +215,23 @@ class EnrichedFileInput:
     paired_with: list[str] | None = None
     index_of: list[str] | None = None
     derived_from: list[str] | None = None
-    library_made_from: list[str] | None = None
-    library_depleted_in: list[str] | None = None
-    library_extraction_method: list[str] | None = None
-    library_lysis_method: list[str] | None = None
-    library_crosslinking_method: list[str] | None = None
-    library_strand_specific: list[str] | None = None
-    library_fragmentation_method: list[str] | None = None
-    library_size_range: list[str] | None = None
-    rbns_protein_concentration: list[str] | None = None
     audit_warning: list[str] | None = None
     audit_not_compliant: list[str] | None = None
     audit_error: list[str] | None = None
+
+
+@strawberry.input
+class HuBMAPFileExtraInput:
+    genome_assembly: list[str] | None = None
+    rel_path: list[str] | None = None
+    is_data_product: list[bool] | None = None
+
+
+@strawberry.input
+class EnrichedFileInput:
+    fourdn: list[FourDNFileExtraInput] | None = None
+    encode: list[ENCODEFileExtraInput] | None = None
+    hubmap: list[HuBMAPFileExtraInput] | None = None
 
 
 @strawberry.input

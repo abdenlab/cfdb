@@ -9,7 +9,7 @@ class ExtraFile(BaseModel):
     """
     An associated index or auxiliary file from 4DN.
 
-    Stored in EnrichedFile.extra_files for files that have companion index
+    Stored in FourDNFileExtra.extra_files for files that have companion index
     files (e.g., .px2, .bai).
 
     Attributes:
@@ -32,19 +32,10 @@ class ExtraFile(BaseModel):
     file_format: Optional[str] = None
 
 
-class EnrichedFile(BaseModel):
-    """
-    DCC-specific file-level metadata that supplements C2M2 fields.
+class FourDNFileExtra(BaseModel):
+    """4DN file-level metadata from the materializer and Search API."""
 
-    Union of extra fields populated by the 4DN materializer, 4DN API
-    enrichment, and ENCODE metadata ingest. Not all fields are present on
-    every file — each DCC populates a different subset.
-    """
-
-    # 4DN materializer
     enriched_file_format: Optional[str] = None
-
-    # 4DN API enrichment
     genome_assembly: Optional[str] = None
     file_type: Optional[str] = None
     file_type_detailed: Optional[str] = None
@@ -57,7 +48,10 @@ class EnrichedFile(BaseModel):
     cell_line_tier: Optional[str] = None
     extra_files: Optional[List[ExtraFile]] = None
 
-    # ENCODE
+
+class ENCODEFileExtra(BaseModel):
+    """ENCODE file-level metadata from metadata TSV."""
+
     assembly: Optional[str] = None
     file_format_type: Optional[str] = None
     output_type: Optional[str] = None
@@ -79,6 +73,26 @@ class EnrichedFile(BaseModel):
     audit_warning: Optional[str] = None
     audit_not_compliant: Optional[str] = None
     audit_error: Optional[str] = None
+
+
+class HuBMAPFileExtra(BaseModel):
+    """HuBMAP file-level metadata from Search API."""
+
+    genome_assembly: Optional[str] = None
+    rel_path: Optional[str] = None
+    is_data_product: Optional[bool] = None
+
+
+class EnrichedFile(BaseModel):
+    """
+    DCC-specific file-level metadata that supplements C2M2 fields.
+
+    Each DCC's extra fields are namespaced under a dedicated submodel.
+    """
+
+    fourdn: Optional[FourDNFileExtra] = None
+    encode: Optional[ENCODEFileExtra] = None
+    hubmap: Optional[HuBMAPFileExtra] = None
 
 
 class HuBMAPCollectionExtra(BaseModel):
@@ -125,28 +139,18 @@ class ENCODECollectionExtra(BaseModel):
 
     experiment_target: Optional[str] = None
     project: Optional[str] = None
-    lab: Optional[str] = None
     platform: Optional[str] = None
     dbxrefs: Optional[str] = None
     rbns_protein_concentration: Optional[str] = None
 
 
-class EnrichedCollection(BaseModel):
-    """
-    DCC-specific collection-level metadata from DCC APIs.
+class FourDNCollectionExtra(BaseModel):
+    """4DN experiment-level metadata from Search API."""
 
-    Populated during sync by fetching metadata from DCC-specific APIs.
-    4DN: experiment details (ExperimentHiC, ExperimentSeq, etc.)
-    HuBMAP: dataset-level metadata from Search API.
-    ENCODE: experiment-level metadata from metadata TSV.
-    """
-
-    # 4DN experiment fields
     display_title: Optional[str] = None
     experiment_type: Optional[str] = None
     targeted_factor: Optional[List[str]] = None
     digestion_enzyme: Optional[str] = None
-    lab: Optional[str] = None
     crosslinking_method: Optional[str] = None
     crosslinking_temperature: Optional[str] = None
     crosslinking_time: Optional[str] = None
@@ -164,19 +168,24 @@ class EnrichedCollection(BaseModel):
     status: Optional[str] = None
     date_created: Optional[str] = None
 
-    # HuBMAP
-    hubmap: Optional[HuBMAPCollectionExtra] = None
 
-    # ENCODE
+class EnrichedCollection(BaseModel):
+    """
+    DCC-specific collection-level metadata from DCC APIs.
+
+    Each DCC's extra fields are namespaced under a dedicated submodel.
+    """
+
+    fourdn: Optional[FourDNCollectionExtra] = None
+    hubmap: Optional[HuBMAPCollectionExtra] = None
     encode: Optional[ENCODECollectionExtra] = None
 
 
-class EnrichedBiosample(BaseModel):
+class ENCODEBiosampleExtra(BaseModel):
     """
-    DCC-specific biosample-level metadata from ENCODE.
+    ENCODE biosample-level metadata from metadata TSV.
 
-    Populated during ENCODE sync from the metadata TSV. Contains biosample
-    classification, treatment, and library information.
+    Contains biosample classification, treatment, and library information.
     """
 
     biosample_type: Optional[str] = None
@@ -192,6 +201,16 @@ class EnrichedBiosample(BaseModel):
     library_strand_specific: Optional[str] = None
     library_fragmentation_method: Optional[str] = None
     library_size_range: Optional[str] = None
+
+
+class EnrichedBiosample(BaseModel):
+    """
+    DCC-specific biosample-level metadata.
+
+    Each DCC's extra fields are namespaced under a dedicated submodel.
+    """
+
+    encode: Optional[ENCODEBiosampleExtra] = None
 
 
 class FileMetadataModel(BaseModel):
@@ -474,6 +493,10 @@ class Collection(BaseModel):
         description:
             A human-readable description of this collection.
 
+        lab:
+            Lab or PI name associated with the experiment. Shared across 4DN
+            and ENCODE.
+
         anatomy:
             Anatomy terms associated with this collection. Populated from the
             collection_anatomy junction table.
@@ -491,6 +514,7 @@ class Collection(BaseModel):
     abbreviation: Optional[str] = None
     name: str = str()
     description: Optional[str] = None
+    lab: Optional[str] = None
     anatomy: List[Anatomy] = []
     subjects: List[Subject] = []
     extra: Optional[EnrichedCollection] = None

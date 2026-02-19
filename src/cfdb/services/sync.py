@@ -272,12 +272,12 @@ async def _enrich_4dn_api_metadata() -> None:
         ):
             val = meta.get(key)
             if val:
-                update[f"extra.{key}"] = val
+                update[f"extra.fourdn.{key}"] = val
 
         # Derive cell_line_tier from biosource_name
         biosource_name = meta.get("biosource_name")
         if biosource_name and biosource_name in biosource_tiers:
-            update["extra.cell_line_tier"] = biosource_tiers[biosource_name]
+            update["extra.fourdn.cell_line_tier"] = biosource_tiers[biosource_name]
 
         if not update:
             continue
@@ -332,7 +332,12 @@ async def _enrich_4dn_collections() -> None:
             continue
 
         matched += 1
-        operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"extra": meta}}))
+        # Extract lab to top-level collection field; nest remaining under extra.fourdn
+        update: dict = {"extra.fourdn": meta}
+        lab = meta.get("lab")
+        if lab:
+            update["lab"] = lab
+        operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
 
     if not operations:
         logger.warning("4DN collection enrichment: no updates to apply")
@@ -595,7 +600,7 @@ async def _enrich_hubmap_files() -> None:
         # Extra fields
         genome_assembly = matched_info.get("genome_assembly")
         if genome_assembly:
-            update["extra.genome_assembly"] = genome_assembly
+            update["extra.hubmap.genome_assembly"] = genome_assembly
 
         # Try to match by filename to get per-file metadata
         filename = doc.get("filename", "")
@@ -604,10 +609,10 @@ async def _enrich_hubmap_files() -> None:
             file_meta = file_lookup[filename]
             rel_path = file_meta.get("rel_path")
             if rel_path:
-                update["extra.rel_path"] = rel_path
+                update["extra.hubmap.rel_path"] = rel_path
             is_data_product = file_meta.get("is_data_product")
             if is_data_product is not None:
-                update["extra.is_data_product"] = is_data_product
+                update["extra.hubmap.is_data_product"] = is_data_product
 
         if update:
             operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))

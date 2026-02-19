@@ -16,7 +16,7 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 
 ### File Format -> EDAM
 
-40+ mappings from ENCODE `File format` strings to EDAM format CV terms.
+38 mappings from ENCODE `File format` strings to EDAM format CV terms.
 
 | ENCODE Format | EDAM ID | EDAM Name |
 |---------------|---------|-----------|
@@ -35,7 +35,7 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 
 ### Output Type -> EDAM Data
 
-70+ mappings from ENCODE `Output type` strings to EDAM data CV terms.
+53 mappings from ENCODE `Output type` strings to EDAM data CV terms.
 
 | ENCODE Output Type | EDAM ID | EDAM Name |
 |--------------------|---------|-----------|
@@ -50,7 +50,7 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 
 ### Assay -> OBI
 
-80+ mappings from ENCODE `Assay` strings to OBI assay type CV terms.
+63 mappings from ENCODE `Assay` strings to OBI assay type CV terms.
 
 | ENCODE Assay | OBI ID | OBI Name |
 |--------------|--------|----------|
@@ -105,7 +105,12 @@ Set to a constant ENCODE DCC document:
 | `id` | `cfde_registry_dcc:encode` |
 | `dcc_name` | `ENCODE` |
 | `dcc_abbreviation` | `ENCODE` |
+| `dcc_description` | `"The Encyclopedia of DNA Elements (ENCODE) Consortium..."` |
+| `contact_email` | `encode-help@lists.stanford.edu` |
+| `contact_name` | `ENCODE DCC` |
 | `dcc_url` | `https://www.encodeproject.org` |
+| `project_id_namespace` | `https://www.encodeproject.org` |
+| `project_local_id` | `ENCODE` |
 
 ## Collection + Biosample + Subject Construction
 
@@ -127,6 +132,10 @@ One collection per unique experiment accession, embedded on `file.collections[]`
 
 **Fallback**: if `Experiment accession` is missing, falls back to biosample-keyed collection (`biosample:{name}`).
 
+#### Collection Lab (top-level)
+
+`lab` is promoted to a top-level `Collection` field (stored on `collection.lab`), sourced from the `Lab` TSV column (e.g., `"Bradley Bernstein, Broad"`).
+
 #### Collection Extra (`extra.encode`)
 
 Experiment-level fields stored on `collection.extra.encode` (`ENCODECollectionExtra`):
@@ -135,7 +144,6 @@ Experiment-level fields stored on `collection.extra.encode` (`ENCODECollectionEx
 |------------|-------------------|
 | `extra.encode.experiment_target` | `Experiment target` |
 | `extra.encode.project` | `Project` |
-| `extra.encode.lab` | `Lab` |
 | `extra.encode.platform` | `Platform` |
 | `extra.encode.dbxrefs` | `dbxrefs` |
 | `extra.encode.rbns_protein_concentration` | `RBNS protein concentration` |
@@ -149,19 +157,19 @@ One biosample per file, nested inside the collection:
 | `local_id` | `Biosample term name` | Prefixed: `biosample:{name}` |
 | `anatomy` | `Biosample term id` + `Biosample term name` | `{id, name}` object |
 | `subjects[]` | `Donor(s)` | Same subjects as collection |
-| `extra.biosample_type` | `Biosample type` | e.g., `"primary cell"`, `"tissue"`, `"cell line"` |
-| `extra.biosample_treatments` | `Biosample treatments` | Treatment details |
-| `extra.biosample_treatments_amount` | `Biosample treatments amount` | Dosage |
-| `extra.biosample_treatments_duration` | `Biosample treatments duration` | Duration |
-| `extra.biosample_genetic_modifications` | `Biosample genetic modifications methods/categories/targets/gene targets/site coordinates/zygosity` | Compound column |
-| `extra.library_made_from` | `Library made from` | e.g., `"RNA"`, `"DNA"` |
-| `extra.library_depleted_in` | `Library depleted in` | e.g., `"rRNA"` |
-| `extra.library_extraction_method` | `Library extraction method` | |
-| `extra.library_lysis_method` | `Library lysis method` | |
-| `extra.library_crosslinking_method` | `Library crosslinking method` | |
-| `extra.library_strand_specific` | `Library strand specific` | |
-| `extra.library_fragmentation_method` | `Library fragmentation method` | |
-| `extra.library_size_range` | `Library size range` | |
+| `extra.encode.biosample_type` | `Biosample type` | e.g., `"primary cell"`, `"tissue"`, `"cell line"` |
+| `extra.encode.biosample_treatments` | `Biosample treatments` | Treatment details |
+| `extra.encode.biosample_treatments_amount` | `Biosample treatments amount` | Dosage |
+| `extra.encode.biosample_treatments_duration` | `Biosample treatments duration` | Duration |
+| `extra.encode.biosample_genetic_modifications` | `Biosample genetic modifications methods/categories/targets/gene targets/site coordinates/zygosity` | Compound column |
+| `extra.encode.library_made_from` | `Library made from` | e.g., `"RNA"`, `"DNA"` |
+| `extra.encode.library_depleted_in` | `Library depleted in` | e.g., `"rRNA"` |
+| `extra.encode.library_extraction_method` | `Library extraction method` | |
+| `extra.encode.library_lysis_method` | `Library lysis method` | |
+| `extra.encode.library_crosslinking_method` | `Library crosslinking method` | |
+| `extra.encode.library_strand_specific` | `Library strand specific` | |
+| `extra.encode.library_fragmentation_method` | `Library fragmentation method` | |
+| `extra.encode.library_size_range` | `Library size range` | |
 
 ### Subject
 
@@ -174,53 +182,53 @@ One subject per donor accession, nested inside collection and biosample:
 
 ## File Extra Fields
 
-All stored on `file.extra` (`EnrichedFile`). Every field is `Optional[str]`. Only file-scoped fields remain here — experiment-level and library-level fields have been moved to `collection.extra.encode` and `biosample.extra` respectively.
+All stored on `file.extra.encode` (`ENCODEFileExtra`). Every field is `Optional[str]`. Only file-scoped fields remain here — experiment-level and library-level fields have been moved to `collection.extra.encode` and `biosample.extra.encode` respectively.
 
 ### File Metadata
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
-| `extra.assembly` | `File assembly` |
-| `extra.file_format_type` | `File format type` |
-| `extra.output_type` | `Output type` |
+| `extra.encode.assembly` | `File assembly` |
+| `extra.encode.file_format_type` | `File format type` |
+| `extra.encode.output_type` | `Output type` |
 
 ### Sequencing / Replicate Metadata
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
-| `extra.biological_replicates` | `Biological replicate(s)` |
-| `extra.technical_replicates` | `Technical replicate(s)` |
-| `extra.read_length` | `Read length` |
-| `extra.mapped_read_length` | `Mapped read length` |
-| `extra.run_type` | `Run type` |
-| `extra.paired_end` | `Paired end` |
-| `extra.paired_with` | `Paired with` |
-| `extra.index_of` | `Index of` |
-| `extra.derived_from` | `Derived from` |
+| `extra.encode.biological_replicates` | `Biological replicate(s)` |
+| `extra.encode.technical_replicates` | `Technical replicate(s)` |
+| `extra.encode.read_length` | `Read length` |
+| `extra.encode.mapped_read_length` | `Mapped read length` |
+| `extra.encode.run_type` | `Run type` |
+| `extra.encode.paired_end` | `Paired end` |
+| `extra.encode.paired_with` | `Paired with` |
+| `extra.encode.index_of` | `Index of` |
+| `extra.encode.derived_from` | `Derived from` |
 
 ### Provenance / Access Metadata
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
-| `extra.genome_annotation` | `Genome annotation` |
-| `extra.controlled_by` | `Controlled by` |
-| `extra.s3_uri` | `s3_uri` |
-| `extra.azure_url` | `Azure URL` |
+| `extra.encode.genome_annotation` | `Genome annotation` |
+| `extra.encode.controlled_by` | `Controlled by` |
+| `extra.encode.s3_uri` | `s3_uri` |
+| `extra.encode.azure_url` | `Azure URL` |
 
 ### Analysis Metadata
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
-| `extra.file_analysis_title` | `File analysis title` |
-| `extra.file_analysis_status` | `File analysis status` |
+| `extra.encode.file_analysis_title` | `File analysis title` |
+| `extra.encode.file_analysis_status` | `File analysis status` |
 
 ### Audit Fields
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
-| `extra.audit_warning` | `Audit WARNING` |
-| `extra.audit_not_compliant` | `Audit NOT_COMPLIANT` |
-| `extra.audit_error` | `Audit ERROR` |
+| `extra.encode.audit_warning` | `Audit WARNING` |
+| `extra.encode.audit_not_compliant` | `Audit NOT_COMPLIANT` |
+| `extra.encode.audit_error` | `Audit ERROR` |
 
 ## Sync Flow
 
@@ -242,7 +250,7 @@ fetch_encode_metadata()                 # Streaming TSV from ENCODE API
         ├─ Map Assay -> OBI             # ontology_mappings.get_assay_type()
         ├─ Map Organism -> NCBI         # ontology_mappings.get_taxonomy()
         ├─ Build collection + biosample + subjects inline
-        ├─ Build extra dict (40+ fields)
+        ├─ Build extra.encode dict (21 file fields)
         └─ Insert into files collection (batches of 1000)
 ```
 

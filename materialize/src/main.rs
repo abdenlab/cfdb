@@ -412,7 +412,12 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
                 .or_insert_with(|| bson::Bson::Document(Document::new()))
                 .as_document_mut();
             if let Some(extra_doc) = extra {
-                extra_doc.insert("enriched_file_format", enriched_format);
+                let fourdn = extra_doc.entry("fourdn".to_string())
+                    .or_insert_with(|| bson::Bson::Document(Document::new()))
+                    .as_document_mut();
+                if let Some(fourdn_doc) = fourdn {
+                    fourdn_doc.insert("enriched_file_format", enriched_format);
+                }
             }
         }
     }

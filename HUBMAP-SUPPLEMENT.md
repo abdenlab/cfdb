@@ -72,9 +72,9 @@ Runs post-materialization against the `files` collection. `data_access_level` is
 | CFDB Field | HuBMAP Source Path | Type | Notes |
 |------------|-------------------|------|-------|
 | `data_access_level` | `data_access_level` | string | Top-level field. `"public"` or `"protected"`. Inherited from parent dataset — one value per dataset applies to all its files. |
-| `extra.genome_assembly` | `ingest_metadata.workflow_description` | string | Regex-extracted. Normalized: `hg38` -> `GRCh38`, `hg19` -> `GRCh37`, `mm10` -> `GRCm38`. Inherited from parent dataset. |
-| `extra.is_data_product` | `files[].is_data_product` | bool | Per-file, matched by filename basename. |
-| `extra.rel_path` | `files[].rel_path` | string | Per-file. Enables constructing the assets URL: `https://assets.hubmapconsortium.org/{dataset_uuid}/{rel_path}` |
+| `extra.hubmap.genome_assembly` | `ingest_metadata.workflow_description` | string | Regex-extracted. Normalized: `hg38` -> `GRCh38`, `hg19` -> `GRCh37`, `mm10` -> `GRCm38`. Inherited from parent dataset. |
+| `extra.hubmap.is_data_product` | `files[].is_data_product` | bool | Per-file, matched by filename basename. |
+| `extra.hubmap.rel_path` | `files[].rel_path` | string | Per-file. Enables constructing the assets URL: `https://assets.hubmapconsortium.org/{dataset_uuid}/{rel_path}` |
 
 ### Genome Assembly Extraction
 
@@ -123,5 +123,5 @@ fetch_dataset_metadata_bulk()          # Single bulk Elasticsearch query
   └─> _enrich_hubmap_files()                       [post-materialization]
         ├─ Join files -> collections -> doi_url
         ├─ Set data_access_level (top-level)
-        └─ Set genome_assembly, is_data_product, rel_path (on extra)
+        └─ Set genome_assembly, is_data_product, rel_path (on extra.hubmap)
 ```

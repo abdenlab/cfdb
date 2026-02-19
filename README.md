@@ -253,6 +253,7 @@ A grouping of files, biosamples, and/or subjects.
 | `abbreviation` | string? | Short display label |
 | `name` | string | Human-readable label |
 | `description` | string? | Human-readable description |
+| `lab` | string? | Lab/PI name (shared across 4DN and ENCODE) |
 | `extra` | EnrichedCollection? | DCC-specific collection metadata (see EnrichedCollection) |
 
 #### Biosample
@@ -305,9 +306,15 @@ A node in the C2M2 project hierarchy.
 
 #### EnrichedFile
 
-DCC-specific file-level metadata. Union of fields from 4DN and ENCODE enrichment pipelines.
+DCC-specific file-level metadata. Each DCC's fields are namespaced under a dedicated submodel.
 
-**4DN fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `fourdn` | FourDNFileExtra? | 4DN file-level metadata |
+| `encode` | ENCODEFileExtra? | ENCODE file-level metadata |
+| `hubmap` | HuBMAPFileExtra? | HuBMAP file-level metadata |
+
+**FourDNFileExtra** — 4DN file fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -324,23 +331,39 @@ DCC-specific file-level metadata. Union of fields from 4DN and ENCODE enrichment
 | `cell_line_tier` | string? | Cell line tier (Tier 1/Tier 2) |
 | `extra_files` | ExtraFile[]? | Associated index files |
 
-**ENCODE fields:**
+**ENCODEFileExtra** — ENCODE file fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `assembly` | string? | Genome assembly (GRCh38, mm10, etc.) |
 | `file_format_type` | string? | narrowPeak, broadPeak, etc. |
 | `output_type` | string? | Original ENCODE output type |
-| `experiment_accession` | string? | Parent experiment accession |
-| `experiment_target` | string? | ChIP-seq target, etc. |
-| `project` | string? | ENCODE project phase |
-| `lab` | string? | Lab/PI name |
+| `genome_annotation` | string? | Genome annotation version |
+| `controlled_by` | string? | Control file accession(s) |
+| `s3_uri` | string? | S3 URI |
+| `azure_url` | string? | Azure Blob URL |
+| `file_analysis_title` | string? | Analysis pipeline title |
+| `file_analysis_status` | string? | Analysis pipeline status |
+| `biological_replicates` | string? | Biological replicate(s) |
+| `technical_replicates` | string? | Technical replicate(s) |
+| `read_length` | string? | Read length |
+| `mapped_read_length` | string? | Mapped read length |
+| `run_type` | string? | Run type (single-ended, paired-ended) |
+| `paired_end` | string? | Paired end designation |
+| `paired_with` | string? | Paired-with file accession |
+| `index_of` | string? | File this is an index of |
+| `derived_from` | string? | Parent file accession(s) |
+| `audit_warning` | string? | ENCODE audit warnings |
+| `audit_not_compliant` | string? | ENCODE audit non-compliance |
+| `audit_error` | string? | ENCODE audit errors |
 
-Additional ENCODE sequencing fields: `platform`, `read_length`, `mapped_read_length`, `run_type`, `paired_end`, `paired_with`, `biological_replicates`, `technical_replicates`.
+**HuBMAPFileExtra** — HuBMAP file fields:
 
-Additional ENCODE library fields: `library_made_from`, `library_depleted_in`, `library_extraction_method`, `library_lysis_method`, `library_crosslinking_method`, `library_strand_specific`, `library_fragmentation_method`, `library_size_range`.
-
-Additional ENCODE metadata fields: `genome_annotation`, `dbxrefs`, `controlled_by`, `index_of`, `derived_from`, `s3_uri`, `azure_url`, `file_analysis_title`, `file_analysis_status`, `rbns_protein_concentration`, `audit_warning`, `audit_not_compliant`, `audit_error`.
+| Field | Type | Description |
+|-------|------|-------------|
+| `genome_assembly` | string? | Reference genome (e.g., "GRCh38") |
+| `rel_path` | string? | Relative path within the dataset |
+| `is_data_product` | bool? | Whether this file is a data product |
 
 #### ExtraFile
 
@@ -355,7 +378,15 @@ An associated index or auxiliary file from 4DN.
 
 #### EnrichedCollection
 
-DCC-specific collection-level metadata from 4DN experiment API.
+DCC-specific collection-level metadata. Each DCC's fields are namespaced under a dedicated submodel.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `fourdn` | FourDNCollectionExtra? | 4DN experiment metadata |
+| `encode` | ENCODECollectionExtra? | ENCODE experiment metadata |
+| `hubmap` | HuBMAPCollectionExtra? | HuBMAP dataset metadata |
+
+**FourDNCollectionExtra** — 4DN experiment fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -363,13 +394,41 @@ DCC-specific collection-level metadata from 4DN experiment API.
 | `experiment_type` | string? | Experiment type (e.g., "in situ Hi-C") |
 | `targeted_factor` | string[]? | Target proteins/marks (e.g., ["CTCF protein"]) |
 | `digestion_enzyme` | string? | Restriction enzyme (e.g., "DpnII") |
-| `lab` | string? | Lab/PI name |
 
 Additional protocol fields: `crosslinking_method`, `crosslinking_temperature`, `crosslinking_time`, `ligation_temperature`, `ligation_volume`, `ligation_time`, `digestion_temperature`, `digestion_time`, `tagging_method`, `fragmentation_method`, `biotin_removed`, `library_prep_kit`, `average_fragment_size`, `fragment_size_range`, `status`, `date_created`.
 
+**ENCODECollectionExtra** — ENCODE experiment fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `experiment_target` | string? | ChIP-seq target, etc. |
+| `project` | string? | ENCODE project phase |
+| `platform` | string? | Sequencing platform |
+| `dbxrefs` | string? | Database cross-references |
+| `rbns_protein_concentration` | string? | RBNS protein concentration |
+
+**HuBMAPCollectionExtra** — HuBMAP dataset fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dataset_type` | string? | Dataset type (e.g., "RNAseq") |
+| `pipeline` | string? | Processing pipeline |
+| `processing` | string? | Processing status (raw, processed) |
+| `group_name` | string? | TMC group name |
+| `analyte_class` | string? | Analyte class (RNA, DNA, etc.) |
+| `visualization` | bool? | Whether visualization is available |
+| `vitessce_hints` | string[]? | Vitessce visualization hints |
+| `metadata` | dict? | Full assay-specific metadata |
+
 #### EnrichedBiosample
 
-DCC-specific biosample-level metadata from ENCODE.
+DCC-specific biosample-level metadata. Each DCC's fields are namespaced under a dedicated submodel.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `encode` | ENCODEBiosampleExtra? | ENCODE biosample metadata |
+
+**ENCODEBiosampleExtra** — ENCODE biosample fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -378,6 +437,14 @@ DCC-specific biosample-level metadata from ENCODE.
 | `biosample_treatments_amount` | string? | Treatment amount |
 | `biosample_treatments_duration` | string? | Treatment duration |
 | `biosample_genetic_modifications` | string? | CRISPR, RNAi, etc. |
+| `library_made_from` | string? | Source material (RNA, DNA, etc.) |
+| `library_depleted_in` | string? | Depleted material (e.g., rRNA) |
+| `library_extraction_method` | string? | Extraction method |
+| `library_lysis_method` | string? | Lysis method |
+| `library_crosslinking_method` | string? | Crosslinking method |
+| `library_strand_specific` | string? | Strand specificity |
+| `library_fragmentation_method` | string? | Fragmentation method |
+| `library_size_range` | string? | Library size range |
 
 ### Entity Relationships
 

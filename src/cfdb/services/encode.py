@@ -295,7 +295,7 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         if anatomy:
             biosample["anatomy"] = anatomy
         if biosample_extra:
-            biosample["extra"] = biosample_extra
+            biosample["extra"] = {"encode": biosample_extra}
 
         # Build collection extra (experiment-level fields)
         collection_encode_extra = {}
@@ -305,7 +305,6 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
             row.get("Experiment target"),
         )
         _add_extra(collection_encode_extra, "project", row.get("Project"))
-        _add_extra(collection_encode_extra, "lab", row.get("Lab"))
         _add_extra(collection_encode_extra, "platform", row.get("Platform"))
         _add_extra(collection_encode_extra, "dbxrefs", row.get("dbxrefs"))
         _add_extra(
@@ -337,6 +336,10 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
             collection["persistent_id"] = collection_persistent_id
         if anatomy:
             collection["anatomy"] = [anatomy]
+        # Promote lab to top-level collection field
+        lab = _nonempty(row.get("Lab"))
+        if lab:
+            collection["lab"] = lab
         if collection_encode_extra:
             collection["extra"] = {"encode": collection_encode_extra}
 
@@ -380,7 +383,7 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     _add_extra(extra, "audit_error", row.get("Audit ERROR"))
 
     if extra:
-        doc["extra"] = extra
+        doc["extra"] = {"encode": extra}
 
     # Build DCC record inline
     doc["dcc"] = {
