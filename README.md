@@ -206,7 +206,7 @@ The central entity representing a stable digital asset.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `dcc` | DCC | The Data Coordinating Center that produced this file |
+| `dcc` | Dcc | The Data Coordinating Center that produced this file |
 | `collections` | Collection[] | Collections containing this file |
 | `project` | Project? | The primary project within which this file was created |
 | `size_in_bytes` | int? | File size |
@@ -227,7 +227,7 @@ The central entity representing a stable digital asset.
 | `data_access_level` | string? | Access level: public, consortium, or protected |
 | `extra` | EnrichedFile? | DCC-specific file metadata (see EnrichedFile) |
 
-#### DCC
+#### Dcc
 
 A Common Fund program or Data Coordinating Center.
 
