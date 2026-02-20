@@ -1,4 +1,68 @@
-"""HuBMAP Search API integration for access level metadata and enrichment."""
+"""HuBMAP Search API integration for access level metadata and enrichment.
+
+Fetches dataset, donor, and file metadata from the HuBMAP Search API
+(Elasticsearch-backed) to enrich C2M2-materialized documents. Three
+enrichment targets run during sync: collections and subjects
+(pre-materialization) and files (post-materialization).
+
+API URLs
+--------
+Bulk dataset search (search_after pagination):
+  https://search.api.hubmapconsortium.org/v3/portal/search
+Entity lookup (single UUID):
+  https://search.api.hubmapconsortium.org/v3/entities/{uuid}
+
+Entity Matching
+---------------
+Collection    persistent_id matches doi_url
+Subject       local_id contains donor uuid
+File          matched via collection doi_url → dataset, then filename
+
+Field Mapping (HuBMAP Search API → CFDB)
+------------------------------------------
+
+File (post-materialization)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+data_access_level                       → data_access_level
+ingest_metadata.workflow_description    → genome_assembly (regex-derived)
+
+Enriched File
+~~~~~~~~~~~~~
+files[].rel_path                        → extra.hubmap.rel_path
+files[].is_data_product                 → extra.hubmap.is_data_product
+
+Collection (pre-materialization)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+dataset_type                            → collections[].experiment_type
+analyte_class                           → collections[].analyte_class
+
+Enriched Collection
+~~~~~~~~~~~~~~~~~~~
+pipeline                                → collections[].extra.hubmap.pipeline
+processing                              → collections[].extra.hubmap.processing
+group_name                              → collections[].extra.hubmap.group_name
+visualization                           → collections[].extra.hubmap.visualization
+vitessce-hints                          → collections[].extra.hubmap.vitessce_hints
+metadata                                → collections[].extra.hubmap.metadata
+
+Enriched Subject (pre-materialization, from donor.mapped_metadata)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sex                                     → subjects[].extra.hubmap.sex
+race                                    → subjects[].extra.hubmap.race
+age_value                               → subjects[].extra.hubmap.age_value
+age_unit                                → subjects[].extra.hubmap.age_unit
+height_value                            → subjects[].extra.hubmap.height_value
+height_unit                             → subjects[].extra.hubmap.height_unit
+weight_value                            → subjects[].extra.hubmap.weight_value
+weight_unit                             → subjects[].extra.hubmap.weight_unit
+body_mass_index_value                   → subjects[].extra.hubmap.body_mass_index_value
+body_mass_index_unit                    → subjects[].extra.hubmap.body_mass_index_unit
+cause_of_death                          → subjects[].extra.hubmap.cause_of_death
+death_event                             → subjects[].extra.hubmap.death_event
+mechanism_of_injury                     → subjects[].extra.hubmap.mechanism_of_injury
+medical_history                         → subjects[].extra.hubmap.medical_history
+social_history                          → subjects[].extra.hubmap.social_history
+"""
 
 import asyncio
 import logging
