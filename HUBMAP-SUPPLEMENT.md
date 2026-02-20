@@ -14,7 +14,7 @@ Collections are the primary join point. One HuBMAP dataset = one C2M2 collection
 
 ## Collection Enrichment
 
-Stored on `collection.extra.hubmap` (`HuBMAPCollectionExtra`). Runs pre-materialization.
+Stored on `collection.extra.hubmap` (`EnrichedHubmapCollection`). Runs pre-materialization.
 
 | CFDB Field | HuBMAP Source Path | Type | Example |
 |------------|-------------------|------|---------|
@@ -43,7 +43,7 @@ The `metadata` dict is stored verbatim. Common keys for sequencing assays:
 
 ## Subject Enrichment
 
-Stored on `subject.extra.hubmap` (`HuBMAPSubjectExtra`). Runs pre-materialization.
+Stored on `subject.extra.hubmap` (`EnrichedHubmapSubject`). Runs pre-materialization.
 
 Source path is `donor.mapped_metadata.<field>`. HuBMAP returns some fields as single-element lists (e.g., `["Female"]`); these are unwrapped to scalar values during enrichment.
 
@@ -114,9 +114,9 @@ fetch_dataset_metadata_bulk()          # Single bulk Elasticsearch query
   │
   ├─> _enrich_hubmap_collections_and_subjects()   [pre-materialization]
   │     ├─ Match collection.persistent_id == doi_url
-  │     │  └─ Write HuBMAPCollectionExtra -> collection.extra.hubmap
+  │     │  └─ Write EnrichedHubmapCollection -> collection.extra.hubmap
   │     └─ Match subject.local_id contains donor.uuid
-  │        └─ Write HuBMAPSubjectExtra -> subject.extra.hubmap
+  │        └─ Write EnrichedHubmapSubject -> subject.extra.hubmap
   │
   ├─> _materialize_files()                         [Rust materializer]
   │

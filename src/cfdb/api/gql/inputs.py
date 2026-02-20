@@ -11,7 +11,7 @@ class AnatomyInput:
 
 
 @strawberry.input
-class NCBITaxonomyInput:
+class NcbiTaxonomyInput:
     id: list[str] | None = None
     name: list[str] | None = None
     clade: list[str] | None = None
@@ -47,11 +47,11 @@ class SubjectInput:
     age_at_enrollment: list[float] | None = None
     age_at_sampling: list[float] | None = None
     race: list[str] | None = None
-    taxonomy: list[NCBITaxonomyInput] | None = None
+    taxonomy: list[NcbiTaxonomyInput] | None = None
 
 
 @strawberry.input
-class ENCODEBiosampleExtraInput:
+class EnrichedEncodeBiosampleInput:
     biosample_type: list[str] | None = None
     biosample_treatments: list[str] | None = None
     biosample_treatments_amount: list[str] | None = None
@@ -69,7 +69,7 @@ class ENCODEBiosampleExtraInput:
 
 @strawberry.input
 class EnrichedBiosampleInput:
-    encode: list[ENCODEBiosampleExtraInput] | None = None
+    encode: list[EnrichedEncodeBiosampleInput] | None = None
 
 
 @strawberry.input
@@ -88,7 +88,7 @@ class BiosampleInput:
 
 
 @strawberry.input
-class FourDNCollectionExtraInput:
+class EnrichedFourdnCollectionInput:
     display_title: list[str] | None = None
     targeted_factor: list[str] | None = None
     digestion_enzyme: list[str] | None = None
@@ -111,7 +111,7 @@ class FourDNCollectionExtraInput:
 
 
 @strawberry.input
-class ENCODECollectionExtraInput:
+class EnrichedEncodeCollectionInput:
     experiment_target: list[str] | None = None
     project: list[str] | None = None
     platform: list[str] | None = None
@@ -120,7 +120,7 @@ class ENCODECollectionExtraInput:
 
 
 @strawberry.input
-class HuBMAPCollectionExtraInput:
+class EnrichedHubmapCollectionInput:
     dataset_type: list[str] | None = None
     pipeline: list[str] | None = None
     processing: list[str] | None = None
@@ -131,9 +131,9 @@ class HuBMAPCollectionExtraInput:
 
 @strawberry.input
 class EnrichedCollectionInput:
-    fourdn: list[FourDNCollectionExtraInput] | None = None
-    encode: list[ENCODECollectionExtraInput] | None = None
-    hubmap: list[HuBMAPCollectionExtraInput] | None = None
+    fourdn: list[EnrichedFourdnCollectionInput] | None = None
+    encode: list[EnrichedEncodeCollectionInput] | None = None
+    hubmap: list[EnrichedHubmapCollectionInput] | None = None
 
 
 @strawberry.input
@@ -163,7 +163,7 @@ class DataTypeInput:
 
 
 @strawberry.input
-class DCCInput:
+class DccInput:
     id: list[str] | None = None
     dcc_name: list[str] | None = None
     dcc_abbreviation: list[str] | None = None
@@ -183,7 +183,7 @@ class FileFormatInput:
 
 
 @strawberry.input
-class FourDNFileExtraInput:
+class EnrichedFourdnFileInput:
     enriched_file_format: list[str] | None = None
     genome_assembly: list[str] | None = None
     file_type: list[str] | None = None
@@ -196,7 +196,7 @@ class FourDNFileExtraInput:
 
 
 @strawberry.input
-class ENCODEFileExtraInput:
+class EnrichedEncodeFileInput:
     assembly: list[str] | None = None
     file_format_type: list[str] | None = None
     output_type: list[str] | None = None
@@ -219,7 +219,7 @@ class ENCODEFileExtraInput:
 
 
 @strawberry.input
-class HuBMAPFileExtraInput:
+class EnrichedHubmapFileInput:
     genome_assembly: list[str] | None = None
     rel_path: list[str] | None = None
     is_data_product: list[bool] | None = None
@@ -227,14 +227,14 @@ class HuBMAPFileExtraInput:
 
 @strawberry.input
 class EnrichedFileInput:
-    fourdn: list[FourDNFileExtraInput] | None = None
-    encode: list[ENCODEFileExtraInput] | None = None
-    hubmap: list[HuBMAPFileExtraInput] | None = None
+    fourdn: list[EnrichedFourdnFileInput] | None = None
+    encode: list[EnrichedEncodeFileInput] | None = None
+    hubmap: list[EnrichedHubmapFileInput] | None = None
 
 
 @strawberry.input
 class FileMetadataInput:
-    dcc: list[DCCInput] | None = None
+    dcc: list[DccInput] | None = None
     collections: list[CollectionInput] | None = None
     project: list[ProjectInput] | None = None
     id_namespace: list[str] | None = None

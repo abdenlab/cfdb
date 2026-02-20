@@ -138,7 +138,7 @@ One collection per unique experiment accession, embedded on `file.collections[]`
 
 #### Collection Extra (`extra.encode`)
 
-Experiment-level fields stored on `collection.extra.encode` (`ENCODECollectionExtra`):
+Experiment-level fields stored on `collection.extra.encode` (`EnrichedEncodeCollection`):
 
 | CFDB Field | ENCODE TSV Column |
 |------------|-------------------|
@@ -182,7 +182,7 @@ One subject per donor accession, nested inside collection and biosample:
 
 ## File Extra Fields
 
-All stored on `file.extra.encode` (`ENCODEFileExtra`). Every field is `Optional[str]`. Only file-scoped fields remain here — experiment-level and library-level fields have been moved to `collection.extra.encode` and `biosample.extra.encode` respectively.
+All stored on `file.extra.encode` (`EnrichedEncodeFile`). Every field is `Optional[str]`. Only file-scoped fields remain here — experiment-level and library-level fields have been moved to `collection.extra.encode` and `biosample.extra.encode` respectively.
 
 ### File Metadata
 

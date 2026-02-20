@@ -9,7 +9,7 @@ class ExtraFile(BaseModel):
     """
     An associated index or auxiliary file from 4DN.
 
-    Stored in FourDNFileExtra.extra_files for files that have companion index
+    Stored in EnrichedFourdnFile.extra_files for files that have companion index
     files (e.g., .px2, .bai).
 
     Attributes:
@@ -32,7 +32,7 @@ class ExtraFile(BaseModel):
     file_format: Optional[str] = None
 
 
-class FourDNFileExtra(BaseModel):
+class EnrichedFourdnFile(BaseModel):
     """4DN file-level metadata from the materializer and Search API."""
 
     enriched_file_format: Optional[str] = None
@@ -47,7 +47,7 @@ class FourDNFileExtra(BaseModel):
     extra_files: Optional[List[ExtraFile]] = None
 
 
-class ENCODEFileExtra(BaseModel):
+class EnrichedEncodeFile(BaseModel):
     """ENCODE file-level metadata from metadata TSV."""
 
     assembly: Optional[str] = None
@@ -73,7 +73,7 @@ class ENCODEFileExtra(BaseModel):
     audit_error: Optional[str] = None
 
 
-class HuBMAPFileExtra(BaseModel):
+class EnrichedHubmapFile(BaseModel):
     """HuBMAP file-level metadata from Search API."""
 
     genome_assembly: Optional[str] = None
@@ -88,12 +88,12 @@ class EnrichedFile(BaseModel):
     Each DCC's extra fields are namespaced under a dedicated submodel.
     """
 
-    fourdn: Optional[FourDNFileExtra] = None
-    encode: Optional[ENCODEFileExtra] = None
-    hubmap: Optional[HuBMAPFileExtra] = None
+    fourdn: Optional[EnrichedFourdnFile] = None
+    encode: Optional[EnrichedEncodeFile] = None
+    hubmap: Optional[EnrichedHubmapFile] = None
 
 
-class HuBMAPCollectionExtra(BaseModel):
+class EnrichedHubmapCollection(BaseModel):
     """HuBMAP dataset-level metadata from Search API."""
 
     pipeline: Optional[str] = None
@@ -104,7 +104,7 @@ class HuBMAPCollectionExtra(BaseModel):
     metadata: Optional[dict] = None
 
 
-class HuBMAPSubjectExtra(BaseModel):
+class EnrichedHubmapSubject(BaseModel):
     """HuBMAP donor demographics from Search API."""
 
     age_value: Optional[float] = None
@@ -127,10 +127,10 @@ class HuBMAPSubjectExtra(BaseModel):
 class EnrichedSubject(BaseModel):
     """DCC-specific subject-level metadata."""
 
-    hubmap: Optional[HuBMAPSubjectExtra] = None
+    hubmap: Optional[EnrichedHubmapSubject] = None
 
 
-class ENCODECollectionExtra(BaseModel):
+class EnrichedEncodeCollection(BaseModel):
     """ENCODE experiment-level metadata from metadata TSV."""
 
     project: Optional[str] = None
@@ -139,7 +139,7 @@ class ENCODECollectionExtra(BaseModel):
     rbns_protein_concentration: Optional[str] = None
 
 
-class FourDNCollectionExtra(BaseModel):
+class EnrichedFourdnCollection(BaseModel):
     """4DN experiment-level metadata from Search API."""
 
     display_title: Optional[str] = None
@@ -170,12 +170,12 @@ class EnrichedCollection(BaseModel):
     Each DCC's extra fields are namespaced under a dedicated submodel.
     """
 
-    fourdn: Optional[FourDNCollectionExtra] = None
-    hubmap: Optional[HuBMAPCollectionExtra] = None
-    encode: Optional[ENCODECollectionExtra] = None
+    fourdn: Optional[EnrichedFourdnCollection] = None
+    hubmap: Optional[EnrichedHubmapCollection] = None
+    encode: Optional[EnrichedEncodeCollection] = None
 
 
-class ENCODEBiosampleExtra(BaseModel):
+class EnrichedEncodeBiosample(BaseModel):
     """
     ENCODE biosample-level metadata from metadata TSV.
 
@@ -204,7 +204,7 @@ class EnrichedBiosample(BaseModel):
     Each DCC's extra fields are namespaced under a dedicated submodel.
     """
 
-    encode: Optional[ENCODEBiosampleExtra] = None
+    encode: Optional[EnrichedEncodeBiosample] = None
 
 
 class FileMetadataModel(BaseModel):
@@ -313,7 +313,7 @@ class FileMetadataModel(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-    dcc: DCC
+    dcc: Dcc
     collections: List[Collection]
     project: Optional[Project] = None
     id_namespace: str = str()
@@ -349,7 +349,7 @@ class FileMetadataModel(BaseModel):
     extra: Optional[EnrichedFile] = None
 
 
-class DCC(BaseModel):
+class Dcc(BaseModel):
     """
     A Common Fund program or Data Coordinating Center.
 
@@ -608,7 +608,7 @@ class Anatomy(BaseModel):
     description: Optional[str] = None
 
 
-class NCBITaxonomy(BaseModel):
+class NcbiTaxonomy(BaseModel):
     """
     An NCBI Taxonomy term for organism classification.
 
@@ -745,7 +745,7 @@ class Subject(BaseModel):
     age_at_enrollment: Optional[float] = None
     age_at_sampling: Optional[float] = None
     race: List[str] = []
-    taxonomy: Optional[NCBITaxonomy] = None
+    taxonomy: Optional[NcbiTaxonomy] = None
     extra: Optional[EnrichedSubject] = None
 
     @field_validator("age_at_enrollment", "age_at_sampling", mode="before")

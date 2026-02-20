@@ -65,7 +65,7 @@ For files with ambiguous container formats (HDF5, plain text) or missing `file_f
 
 ## Collection Enrichment (Pre-Materialization)
 
-Stored on `collection.extra.fourdn` (`FourDNCollectionExtra`), with `lab` promoted to `collection.lab`. Fetched from 4DN Search API by querying `ExperimentHiC`, `ExperimentSeq`, `ExperimentDamid`, and `ExperimentChiapet` types. Paginated at 1000 records/page with 100ms rate limiting.
+Stored on `collection.extra.fourdn` (`EnrichedFourdnCollection`), with `lab` promoted to `collection.lab`. Fetched from 4DN Search API by querying `ExperimentHiC`, `ExperimentSeq`, `ExperimentDamid`, and `ExperimentChiapet` types. Paginated at 1000 records/page with 100ms rate limiting.
 
 ### Direct Fields
 
@@ -115,7 +115,7 @@ All stored as `Optional[str]`:
 
 ## File Enrichment (Post-Materialization)
 
-Stored on `file.extra.fourdn` (`FourDNFileExtra`). Fetched from 4DN Search API by querying `FileProcessed` and `FileFastq` types. Paginated at 1000 records/page with 100ms rate limiting.
+Stored on `file.extra.fourdn` (`EnrichedFourdnFile`). Fetched from 4DN Search API by querying `FileProcessed` and `FileFastq` types. Paginated at 1000 records/page with 100ms rate limiting.
 
 ### Direct File Fields
 
@@ -176,7 +176,7 @@ C2M2 ZIP (download + extract)
   │     ├─ fetch_experiment_metadata_bulk()
   │     │    └─ Query ExperimentHiC, ExperimentSeq, ExperimentDamid, ExperimentChiapet
   │     └─ Match collection.persistent_id -> 4DNEX* accession
-  │        ├─ Write FourDNCollectionExtra -> collection.extra.fourdn
+  │        ├─ Write EnrichedFourdnCollection -> collection.extra.fourdn
   │        └─ Promote lab -> collection.lab
   │
   ├─> _materialize_files()                          [Rust materializer]

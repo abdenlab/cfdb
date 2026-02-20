@@ -270,7 +270,7 @@ A tissue sample or other physical specimen.
 
 #### Ontology Types
 
-Anatomy, FileFormat, DataType, and AssayType share an identical schema: `id` (string), `name` (string), `description` (string?). NCBITaxonomy adds an optional `clade` field.
+Anatomy, FileFormat, DataType, and AssayType share an identical schema: `id` (string), `name` (string), `description` (string?). NcbiTaxonomy adds an optional `clade` field.
 
 | Entity | Ontology Source |
 |--------|----------------|
@@ -278,7 +278,7 @@ Anatomy, FileFormat, DataType, and AssayType share an identical schema: `id` (st
 | FileFormat | EDAM CV `format:` terms |
 | DataType | EDAM CV `data:` terms |
 | AssayType | OBI (Ontology for Biomedical Investigations) |
-| NCBITaxonomy | NCBI Taxonomy Database |
+| NcbiTaxonomy | NCBI Taxonomy Database |
 
 #### Subject
 
@@ -292,7 +292,7 @@ A human or organism from which biosamples are derived.
 | `age_at_enrollment` | float? | Age in years when enrolled in primary project |
 | `age_at_sampling` | float? | Age in years when biosample was taken |
 | `race` | string[] | CFDE CV terms for self-identified race(s) |
-| `taxonomy` | NCBITaxonomy? | NCBI taxonomy for the subject's organism |
+| `taxonomy` | NcbiTaxonomy? | NCBI taxonomy for the subject's organism |
 
 #### Project
 
@@ -310,11 +310,11 @@ DCC-specific file-level metadata. Each DCC's fields are namespaced under a dedic
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `fourdn` | FourDNFileExtra? | 4DN file-level metadata |
-| `encode` | ENCODEFileExtra? | ENCODE file-level metadata |
-| `hubmap` | HuBMAPFileExtra? | HuBMAP file-level metadata |
+| `fourdn` | EnrichedFourdnFile? | 4DN file-level metadata |
+| `encode` | EnrichedEncodeFile? | ENCODE file-level metadata |
+| `hubmap` | EnrichedHubmapFile? | HuBMAP file-level metadata |
 
-**FourDNFileExtra** — 4DN file fields:
+**EnrichedFourdnFile** — 4DN file fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -331,7 +331,7 @@ DCC-specific file-level metadata. Each DCC's fields are namespaced under a dedic
 | `cell_line_tier` | string? | Cell line tier (Tier 1/Tier 2) |
 | `extra_files` | ExtraFile[]? | Associated index files |
 
-**ENCODEFileExtra** — ENCODE file fields:
+**EnrichedEncodeFile** — ENCODE file fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -357,7 +357,7 @@ DCC-specific file-level metadata. Each DCC's fields are namespaced under a dedic
 | `audit_not_compliant` | string? | ENCODE audit non-compliance |
 | `audit_error` | string? | ENCODE audit errors |
 
-**HuBMAPFileExtra** — HuBMAP file fields:
+**EnrichedHubmapFile** — HuBMAP file fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -382,11 +382,11 @@ DCC-specific collection-level metadata. Each DCC's fields are namespaced under a
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `fourdn` | FourDNCollectionExtra? | 4DN experiment metadata |
-| `encode` | ENCODECollectionExtra? | ENCODE experiment metadata |
-| `hubmap` | HuBMAPCollectionExtra? | HuBMAP dataset metadata |
+| `fourdn` | EnrichedFourdnCollection? | 4DN experiment metadata |
+| `encode` | EnrichedEncodeCollection? | ENCODE experiment metadata |
+| `hubmap` | EnrichedHubmapCollection? | HuBMAP dataset metadata |
 
-**FourDNCollectionExtra** — 4DN experiment fields:
+**EnrichedFourdnCollection** — 4DN experiment fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -397,7 +397,7 @@ DCC-specific collection-level metadata. Each DCC's fields are namespaced under a
 
 Additional protocol fields: `crosslinking_method`, `crosslinking_temperature`, `crosslinking_time`, `ligation_temperature`, `ligation_volume`, `ligation_time`, `digestion_temperature`, `digestion_time`, `tagging_method`, `fragmentation_method`, `biotin_removed`, `library_prep_kit`, `average_fragment_size`, `fragment_size_range`, `status`, `date_created`.
 
-**ENCODECollectionExtra** — ENCODE experiment fields:
+**EnrichedEncodeCollection** — ENCODE experiment fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -407,7 +407,7 @@ Additional protocol fields: `crosslinking_method`, `crosslinking_temperature`, `
 | `dbxrefs` | string? | Database cross-references |
 | `rbns_protein_concentration` | string? | RBNS protein concentration |
 
-**HuBMAPCollectionExtra** — HuBMAP dataset fields:
+**EnrichedHubmapCollection** — HuBMAP dataset fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -426,9 +426,9 @@ DCC-specific biosample-level metadata. Each DCC's fields are namespaced under a 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `encode` | ENCODEBiosampleExtra? | ENCODE biosample metadata |
+| `encode` | EnrichedEncodeBiosample? | ENCODE biosample metadata |
 
-**ENCODEBiosampleExtra** — ENCODE biosample fields:
+**EnrichedEncodeBiosample** — ENCODE biosample fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -450,7 +450,7 @@ DCC-specific biosample-level metadata. Each DCC's fields are namespaced under a 
 
 ```
 file
-├── dcc (DCC) ─────────────────── via submission field
+├── dcc (Dcc) ─────────────────── via submission field
 ├── project (Project) ─────────── via project FK
 ├── file_format (FileFormat) ──── via file_format ID
 ├── data_type (DataType) ──────── via data_type ID
@@ -458,11 +458,11 @@ file
 └── collections[] (Collection) ── via file_in_collection
     ├── anatomy[] (Anatomy) ───── via collection_anatomy
     ├── subjects[] (Subject) ──── via subject_in_collection
-    │   └── taxonomy (NCBITaxonomy) ── via subject_role_taxonomy
+    │   └── taxonomy (NcbiTaxonomy) ── via subject_role_taxonomy
     └── biosamples[] (Biosample) ─ via biosample_in_collection
         ├── anatomy (Anatomy) ──── via anatomy ID
         └── subjects[] (Subject) ─ via biosample_from_subject
-            └── taxonomy (NCBITaxonomy) ── via subject_role_taxonomy
+            └── taxonomy (NcbiTaxonomy) ── via subject_role_taxonomy
 ```
 
 ### GraphiQL IDE
