@@ -1,4 +1,81 @@
-"""4DN Search API client for bulk file metadata enrichment."""
+"""4DN Search API client for bulk file metadata enrichment.
+
+Fetches file, experiment, and biosource metadata from the 4DN Search API
+to enrich C2M2-materialized documents. Two enrichment passes run during
+sync: collection enrichment (pre-materialization) and file enrichment
+(post-materialization).
+
+API URLs
+--------
+File metadata:
+  https://data.4dnucleome.org/search/?type=FileProcessed
+  https://data.4dnucleome.org/search/?type=FileFastq
+Experiment metadata:
+  https://data.4dnucleome.org/search/?type=ExperimentHiC
+  https://data.4dnucleome.org/search/?type=ExperimentSeq
+  https://data.4dnucleome.org/search/?type=ExperimentDamid
+  https://data.4dnucleome.org/search/?type=ExperimentChiapet
+Biosource tiers:
+  https://data.4dnucleome.org/search/?type=Biosource&cell_line_tier=Tier+1
+  https://data.4dnucleome.org/search/?type=Biosource&cell_line_tier=Tier+2
+
+Entity Matching
+---------------
+File          persistent_id contains 4DNF[A-Z0-9]+ accession
+Collection    persistent_id contains 4DNE[A-Z][A-Z0-9]+ accession
+
+Field Mapping (4DN API → CFDB)
+-------------------------------
+
+File (post-materialization)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+genome_assembly                         → genome_assembly
+file_type                               → output_type
+file_type_detailed                      → output_type_detail
+track_and_facet_info.condition          → condition
+track_and_facet_info.assay_info         → assay_info
+track_and_facet_info.replicate_info     → biological_replicates (parsed),
+                                          technical_replicates (parsed)
+
+Enriched File
+~~~~~~~~~~~~~
+track_and_facet_info.replicate_info     → extra.replicate_info
+track_and_facet_info.biosource_name     → extra.fourdn.biosource_name
+track_and_facet_info.dataset            → extra.fourdn.dataset
+extra_files[]                           → extra.fourdn.extra_files
+  .href                                   .href
+  .md5sum                                 .md5sum
+  .file_size                              .file_size
+  .file_format                            .file_format
+Biosource.cell_line_tier (derived)      → extra.fourdn.cell_line_tier
+
+Collection (pre-materialization)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+lab.display_title                       → collections[].lab
+experiment_type.display_title           → collections[].experiment_type
+
+Enriched Collection
+~~~~~~~~~~~~~~~~~~~
+display_title                           → collections[].extra.fourdn.display_title
+digestion_enzyme.display_title          → collections[].extra.fourdn.digestion_enzyme
+targeted_factor[].display_title         → collections[].extra.fourdn.targeted_factor
+crosslinking_method                     → collections[].extra.fourdn.crosslinking_method
+crosslinking_temperature                → collections[].extra.fourdn.crosslinking_temperature
+crosslinking_time                       → collections[].extra.fourdn.crosslinking_time
+ligation_temperature                    → collections[].extra.fourdn.ligation_temperature
+ligation_volume                         → collections[].extra.fourdn.ligation_volume
+ligation_time                           → collections[].extra.fourdn.ligation_time
+digestion_temperature                   → collections[].extra.fourdn.digestion_temperature
+digestion_time                          → collections[].extra.fourdn.digestion_time
+tagging_method                          → collections[].extra.fourdn.tagging_method
+fragmentation_method                    → collections[].extra.fourdn.fragmentation_method
+biotin_removed                          → collections[].extra.fourdn.biotin_removed
+library_prep_kit                        → collections[].extra.fourdn.library_prep_kit
+average_fragment_size                   → collections[].extra.fourdn.average_fragment_size
+fragment_size_range                     → collections[].extra.fourdn.fragment_size_range
+status                                  → collections[].extra.fourdn.status
+date_created                            → collections[].extra.fourdn.date_created
+"""
 
 import asyncio
 import logging

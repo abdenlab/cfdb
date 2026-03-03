@@ -1,4 +1,102 @@
-"""ENCODE metadata TSV client and C2M2 transformation service."""
+"""ENCODE metadata TSV client and CFDB transformation service.
+
+Fetches the released-experiment metadata TSV from ENCODE and transforms
+each row into a CFDB file document.
+
+Metadata URL
+------------
+https://www.encodeproject.org/metadata/?type=Experiment&status=released
+
+Field Mapping (ENCODE TSV → CFDB)
+----------------------------------
+
+File
+~~~~
+File accession                  → local_id
+File download URL               → access_url, filename (derived)
+File format                     → file_format (EDAM-mapped)
+Output type                     → data_type (EDAM-mapped), output_type
+Assay                           → assay_type (OBI-mapped)
+Size                            → size_in_bytes
+md5sum                          → md5
+File Status                     → status
+Experiment date released        → creation_time
+File accession                  → persistent_id (derived URL)
+File assembly                   → genome_assembly
+Genome annotation               → genome_annotation
+File format type                → output_type_detail
+Biological replicate(s)         → biological_replicates
+Technical replicate(s)          → technical_replicates
+
+Enriched File
+~~~~~~~~~~~~~
+Read length                     → extra.encode.read_length
+Mapped read length              → extra.encode.mapped_read_length
+Run type                        → extra.encode.run_type
+Paired end                      → extra.encode.paired_end
+Paired with                     → extra.encode.paired_with
+Index of                        → extra.encode.index_of
+Derived from                    → extra.encode.derived_from
+Controlled by                   → extra.encode.controlled_by
+s3_uri                          → extra.encode.s3_uri
+Azure URL                       → extra.encode.azure_url
+File analysis title             → extra.encode.file_analysis_title
+File analysis status            → extra.encode.file_analysis_status
+Audit WARNING                   → extra.encode.audit_warning
+Audit NOT_COMPLIANT             → extra.encode.audit_not_compliant
+Audit ERROR                     → extra.encode.audit_error
+
+Collection
+~~~~~~~~~~
+Experiment accession            → collections[].local_id, name, persistent_id
+Lab                             → collections[].lab
+Assay                           → collections[].experiment_type
+Experiment target               → collections[].experiment_target
+Library made from               → collections[].analyte_class
+
+Enriched Collection
+~~~~~~~~~~~~~~~~~~~
+Project                         → collections[].extra.encode.project
+Platform                        → collections[].extra.encode.platform
+dbxrefs                         → collections[].extra.encode.dbxrefs
+RBNS protein concentration      → collections[].extra.encode.rbns_protein_concentration
+
+Biosample
+~~~~~~~~~
+Biosample term name             → collections[].biosamples[].local_id
+Biosample term id / term name   → collections[].biosamples[].anatomy
+
+Enriched Biosample
+~~~~~~~~~~~~~~~~~~
+Biosample type                  → …biosamples[].extra.encode.biosample_type
+Biosample treatments            → …biosamples[].extra.encode.biosample_treatments
+Biosample treatments amount     → …biosamples[].extra.encode.biosample_treatments_amount
+Biosample treatments duration   → …biosamples[].extra.encode.biosample_treatments_duration
+Biosample genetic mods (*)      → …biosamples[].extra.encode.biosample_genetic_modifications
+Library made from               → …biosamples[].extra.encode.library_made_from
+Library depleted in             → …biosamples[].extra.encode.library_depleted_in
+Library extraction method       → …biosamples[].extra.encode.library_extraction_method
+Library lysis method            → …biosamples[].extra.encode.library_lysis_method
+Library crosslinking method     → …biosamples[].extra.encode.library_crosslinking_method
+Library strand specific         → …biosamples[].extra.encode.library_strand_specific
+Library fragmentation method    → …biosamples[].extra.encode.library_fragmentation_method
+Library size range              → …biosamples[].extra.encode.library_size_range
+
+(*) Full TSV column: "Biosample genetic modifications methods/categories/
+    targets/gene targets/site coordinates/zygosity"
+
+Subject
+~~~~~~~
+Donor(s)                        → collections[].biosamples[].subjects[].local_id
+Biosample organism              → collections[].biosamples[].subjects[].taxonomy
+
+DCC
+~~~
+Static / config-derived:          dcc.id, dcc.dcc_name, dcc.dcc_abbreviation,
+                                  dcc.dcc_description, dcc.contact_email,
+                                  dcc.contact_name, dcc.dcc_url,
+                                  dcc.project_id_namespace, dcc.project_local_id
+"""
 
 import logging
 import re
