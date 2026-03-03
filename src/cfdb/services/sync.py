@@ -193,7 +193,12 @@ async def _sync_c2m2_zip(
         task.current_step = "enriching_collections"
         task.progress = "Enriching HuBMAP collections and subjects from Search API..."
         logger.info(task.progress)
-        await _enrich_hubmap_collections_and_subjects()
+        dataset_metadata = await _enrich_hubmap_collections_and_subjects()
+
+        task.current_step = "pruning"
+        task.progress = "Pruning non-public HuBMAP files..."
+        logger.info(task.progress)
+        await _prune_non_public_hubmap_raw_records(dataset_metadata)
 
     # Step 7: Materialize files collection for this DCC
     task.current_step = "materializing"
@@ -212,7 +217,7 @@ async def _sync_c2m2_zip(
         task.current_step = "enriching"
         task.progress = "Enriching HuBMAP files from Search API..."
         logger.info(task.progress)
-        await _enrich_hubmap_files()
+        await _enrich_hubmap_files(dataset_metadata)
 
 
 async def _enrich_4dn_api_metadata() -> None:
@@ -380,7 +385,7 @@ async def _enrich_4dn_collections() -> None:
     )
 
 
-async def _enrich_hubmap_collections_and_subjects() -> None:
+async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
     """Enrich HuBMAP collections and subjects with metadata from the Search API.
 
     Performs a single bulk fetch of all HuBMAP datasets, then:
@@ -463,7 +468,7 @@ async def _enrich_hubmap_collections_and_subjects() -> None:
 
     if not donor_lookup:
         logger.info("HuBMAP subject enrichment: no donor metadata available")
-        return
+        return dataset_metadata
 
     # Match subjects by local_id containing the donor UUID (HuBMAP C2M2 uses
     # donor UUID as part of the subject local_id)
@@ -533,31 +538,132 @@ async def _enrich_hubmap_collections_and_subjects() -> None:
     else:
         logger.warning("HuBMAP subject enrichment: no updates to apply")
 
+    return dataset_metadata
 
-async def _enrich_hubmap_files() -> None:
-    """Enrich materialized HuBMAP files with metadata from the Search API.
 
-    Sets top-level ``data_access_level`` and stores ``genome_assembly``,
-    ``is_data_product``, and ``rel_path`` on ``extra``.
+async def _prune_non_public_hubmap_raw_records(
+    dataset_metadata: dict[str, dict],
+) -> None:
+    """Remove non-public HuBMAP records from raw C2M2 tables before materialization.
+
+    Deletes ``file_in_collection`` links and orphaned ``file`` rows for any
+    dataset whose ``data_access_level`` is not ``"public"``.  Datasets with a
+    missing access level are treated as non-public (conservative default).
     """
-    from pymongo import UpdateOne
-
-    from cfdb.services.hubmap import fetch_dataset_metadata_bulk
-
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Bulk fetch (should be fast from API cache if collections step already ran)
-    dataset_metadata = await fetch_dataset_metadata_bulk()
+    # 1. Identify non-public DOIs
+    non_public_dois = [
+        doi
+        for doi, meta in dataset_metadata.items()
+        if meta.get("data_access_level") != "public"
+    ]
+
+    if not non_public_dois:
+        logger.info("HuBMAP pruning: all datasets are public, nothing to prune")
+        return
+
+    logger.info(
+        f"HuBMAP pruning: {len(non_public_dois)} non-public datasets identified"
+    )
+
+    # 2. Find matching raw collection records
+    collection_keys: list[dict] = []
+    cursor = api.db.collection.find(
+        {
+            "submission": "hubmap",
+            "persistent_id": {"$in": non_public_dois},
+        },
+        {"id_namespace": 1, "local_id": 1},
+    )
+    async for doc in cursor:
+        collection_keys.append(
+            {
+                "id_namespace": doc["id_namespace"],
+                "local_id": doc["local_id"],
+            }
+        )
+
+    if not collection_keys:
+        logger.info("HuBMAP pruning: no raw collection records match non-public DOIs")
+        return
+
+    # 3. Collect potentially-orphaned file keys from file_in_collection
+    or_filter = [
+        {
+            "collection_id_namespace": ck["id_namespace"],
+            "collection_local_id": ck["local_id"],
+        }
+        for ck in collection_keys
+    ]
+
+    candidate_file_keys: set[tuple[str, str]] = set()
+    cursor = api.db.file_in_collection.find(
+        {"$or": or_filter},
+        {"file_id_namespace": 1, "file_local_id": 1},
+    )
+    async for doc in cursor:
+        candidate_file_keys.add(
+            (doc["file_id_namespace"], doc["file_local_id"])
+        )
+
+    # 4. Delete non-public file_in_collection links
+    fic_result = await api.db.file_in_collection.delete_many({"$or": or_filter})
+    logger.info(
+        f"HuBMAP pruning: deleted {fic_result.deleted_count} file_in_collection links"
+    )
+
+    # 5. Find which candidate files still have links (shared with a public collection)
+    if candidate_file_keys:
+        still_linked: set[tuple[str, str]] = set()
+        file_or_filter = [
+            {"file_id_namespace": ns, "file_local_id": lid}
+            for ns, lid in candidate_file_keys
+        ]
+        cursor = api.db.file_in_collection.find(
+            {"$or": file_or_filter},
+            {"file_id_namespace": 1, "file_local_id": 1},
+        )
+        async for doc in cursor:
+            still_linked.add(
+                (doc["file_id_namespace"], doc["file_local_id"])
+            )
+
+        orphaned = candidate_file_keys - still_linked
+
+        # 6. Delete truly orphaned files
+        if orphaned:
+            orphan_filter = [
+                {"id_namespace": ns, "local_id": lid}
+                for ns, lid in orphaned
+            ]
+            file_result = await api.db.file.delete_many({"$or": orphan_filter})
+            logger.info(
+                f"HuBMAP pruning: deleted {file_result.deleted_count} orphaned file records"
+            )
+        else:
+            logger.info("HuBMAP pruning: no orphaned file records to delete")
+    else:
+        logger.info("HuBMAP pruning: no file_in_collection links found for non-public collections")
+
+
+async def _enrich_hubmap_files(dataset_metadata: dict[str, dict]) -> None:
+    """Enrich materialized HuBMAP files with metadata from the Search API.
+
+    Stores ``genome_assembly``, ``is_data_product``, and ``rel_path`` on
+    ``extra``, then stamps all HuBMAP files as ``data_access_level = "public"``
+    (non-public records were already pruned before materialization).
+    """
+    from pymongo import UpdateOne
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
 
     # Build DOI -> file-level lookup
     doi_file_info: dict[str, dict] = {}
     for doi_url, meta in dataset_metadata.items():
         info: dict = {}
-
-        access_level = meta.get("data_access_level")
-        if access_level:
-            info["data_access_level"] = access_level
 
         genome_assembly = meta.get("genome_assembly")
         if genome_assembly:
@@ -584,6 +690,11 @@ async def _enrich_hubmap_files() -> None:
 
     if not doi_file_info:
         logger.warning("HuBMAP file enrichment: no dataset metadata available")
+        # Still stamp all HuBMAP files as public
+        await api.db.files.update_many(
+            {"submission": "hubmap"},
+            {"$set": {"data_access_level": "public"}},
+        )
         return
 
     # Get DOI URLs for all HuBMAP collections (to map files to datasets)
@@ -628,11 +739,6 @@ async def _enrich_hubmap_files() -> None:
 
         update: dict = {}
 
-        # Top-level field
-        access_level = matched_info.get("data_access_level")
-        if access_level:
-            update["data_access_level"] = access_level
-
         # Promoted field
         genome_assembly = matched_info.get("genome_assembly")
         if genome_assembly:
@@ -655,6 +761,11 @@ async def _enrich_hubmap_files() -> None:
 
     if not operations:
         logger.warning("HuBMAP file enrichment: no updates to apply")
+        # Still stamp all HuBMAP files as public
+        await api.db.files.update_many(
+            {"submission": "hubmap"},
+            {"$set": {"data_access_level": "public"}},
+        )
         return
 
     total_modified = 0
@@ -664,6 +775,12 @@ async def _enrich_hubmap_files() -> None:
         total_modified += result.modified_count
 
     logger.info(f"HuBMAP file enrichment: updated {total_modified} files")
+
+    # All surviving HuBMAP files are public (non-public pruned before materialization)
+    await api.db.files.update_many(
+        {"submission": "hubmap"},
+        {"$set": {"data_access_level": "public"}},
+    )
 
 
 async def _sync_encode(task: SyncTask) -> None:
