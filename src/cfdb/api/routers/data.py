@@ -9,10 +9,6 @@ from fastapi.responses import Response, StreamingResponse
 from cfdb import api
 from cfdb.models import FileMetadataModel
 from cfdb.services import drs, locks
-from cfdb.services.hubmap import (
-    extract_uuid_from_persistent_id,
-    fetch_access_metadata,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +151,19 @@ async def stream_file(
                 file_doc, file_metadata, request, range
             )
 
-        # 5. Fetch DRS object metadata
+        # 5. Defence-in-depth: reject any non-public HuBMAP file that
+        #    somehow survived pruning.
+        if normalized_dcc == "hubmap":
+            data_access_level = file_doc.get("data_access_level")
+            if data_access_level and data_access_level != "public":
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"This file requires {data_access_level} access and is not available through this API. "
+                    "This API only serves publicly accessible files. "
+                    "For access to HuBMAP data, please use the HuBMAP Portal at https://portal.hubmapconsortium.org/",
+                )
+
+        # 6. Fetch DRS object metadata
         try:
             drs_object = await drs.fetch_drs_object(file_metadata.access_url)
         except ValueError as e:
@@ -179,75 +187,6 @@ async def stream_file(
                 raise HTTPException(
                     status_code=502, detail="Failed to fetch file metadata"
                 )
-
-        # 6. Check HuBMAP access level and enforce access control
-        if normalized_dcc == "hubmap":
-            data_access_level = file_doc.get("data_access_level")
-
-            # If access level not cached, fetch from Search API and cache it
-            if data_access_level is None:
-                logger.info(
-                    f"Access level not cached for {local_id}, querying HuBMAP Search API"
-                )
-
-                # Extract UUID from persistent_id
-                persistent_id = file_doc.get("persistent_id")
-                if persistent_id:
-                    uuid = extract_uuid_from_persistent_id(persistent_id)
-
-                    if uuid:
-                        # Fetch access metadata from Search API
-                        metadata = await fetch_access_metadata(uuid)
-
-                        if metadata and metadata.data_access_level:
-                            # Cache in MongoDB for future requests
-                            logger.debug(
-                                f"Caching access level '{metadata.data_access_level}' for {local_id}"
-                            )
-
-                            await api.db.file.update_one(
-                                {"id_namespace": id_namespace, "local_id": local_id},
-                                {
-                                    "$set": {
-                                        "status": metadata.status,
-                                        "data_access_level": metadata.data_access_level,
-                                    }
-                                },
-                            )
-
-                            data_access_level = metadata.data_access_level
-                        else:
-                            logger.warning(
-                                f"Could not fetch access level for {local_id} (UUID: {uuid})"
-                            )
-                    else:
-                        logger.warning(
-                            f"Could not extract UUID from persistent_id: {persistent_id}"
-                        )
-
-            # If still unknown after fetch attempt, allow request to proceed
-            # Let downstream Globus/DRS handle access control
-            if data_access_level is None:
-                logger.info(
-                    f"HuBMAP file {local_id} has unknown access level. "
-                    "Allowing request to proceed - downstream access control will enforce permissions."
-                )
-                # Don't block the request - continue to streaming logic
-
-            # Enforce access control based on data_access_level
-            elif data_access_level in ["consortium", "protected"]:
-                # This API only supports public files
-                logger.info(
-                    f"Blocked {data_access_level} file {local_id} - API only supports public files"
-                )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"This file requires {data_access_level} access and is not available through this API. "
-                    "This API only serves publicly accessible files. "
-                    "For access to HuBMAP data, please use the HuBMAP Portal at https://portal.hubmapconsortium.org/",
-                )
-
-            # Public files - continue normally (no auth required)
 
         # 7. Determine access method (HTTPS or Globus)
         has_globus = any(m.type == "globus" for m in drs_object.access_methods)
