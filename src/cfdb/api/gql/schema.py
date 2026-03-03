@@ -1,4 +1,3 @@
-import asyncio
 import pprint
 from typing import List, Optional
 
@@ -16,7 +15,6 @@ from cfdb.api.gql.types import (
 )
 from cfdb.models import FileMetadataModel
 from cfdb.services import locks
-from cfdb.services.hubmap import fetch_access_metadata_batch
 
 
 def from_pydantic(gql_type, obj):
@@ -39,57 +37,6 @@ def from_pydantic(gql_type, obj):
     return gql_type(**obj)
 
 
-async def check_and_cache_access_levels(files: list[dict]) -> list[dict]:
-    """
-    Check and cache access levels for HuBMAP files with null data_access_level.
-    Uses batch querying for efficiency.
-    """
-    # Find HuBMAP files needing access level check
-    unchecked = [
-        f
-        for f in files
-        if f.get("submission") == "hubmap" and f.get("data_access_level") is None
-    ]
-
-    if not unchecked:
-        return files
-
-    # Extract DOI URLs from persistent_ids
-    # HuBMAP files share DOI with their parent dataset
-    doi_to_files: dict[str, list[dict]] = {}
-    for f in unchecked:
-        doi = f.get("persistent_id")
-        if doi:
-            doi_to_files.setdefault(doi, []).append(f)
-
-    if not doi_to_files:
-        return files
-
-    # Batch fetch access levels from HuBMAP Search API
-    access_levels = await fetch_access_metadata_batch(list(doi_to_files.keys()))
-
-    # Update files in memory and collect MongoDB update tasks
-    assert api.db is not None
-    update_tasks = []
-    for doi, level in access_levels.items():
-        if doi in doi_to_files:
-            for f in doi_to_files[doi]:
-                f["data_access_level"] = level
-            # Cache in MongoDB (one update per DOI, not per file)
-            update_tasks.append(
-                api.db.file.update_many(
-                    {"persistent_id": doi, "submission": "hubmap"},
-                    {"$set": {"data_access_level": level}},
-                )
-            )
-
-    # Run all MongoDB updates concurrently
-    if update_tasks:
-        await asyncio.gather(*update_tasks, return_exceptions=True)
-
-    return files
-
-
 @strawberry.type
 class Query:
     @strawberry.field
@@ -107,65 +54,17 @@ class Query:
         query = to_query(to_dict(input)) if input else {}
         print(pprint.pformat(query))
 
-        # Add default access level filter for HuBMAP files
-        # Exclude consortium/protected, allow public and null (to be checked)
-        hubmap_access_filter = {
-            "$or": [
-                {"submission": {"$ne": "hubmap"}},  # Non-HuBMAP files pass through
-                {"data_access_level": "public"},  # Public HuBMAP files
-                {"data_access_level": None},  # Unchecked files (will verify)
-                {"data_access_level": {"$exists": False}},  # Missing field
-            ]
-        }
-
-        # Merge with user query
-        if query:
-            query = {"$and": [query, hubmap_access_filter]}
-        else:
-            query = hubmap_access_filter
-
-        # Over-fetch to fill page after filtering non-public files
-        # Start with 2x requested size, fetch more if needed
-        public_files: list[dict] = []
         skip = page * page_size
-        fetch_multiplier = 2
-        max_iterations = 5  # Prevent infinite loops
-
-        for _ in range(max_iterations):
-            fetch_size = page_size * fetch_multiplier
-            files = (
-                await api.db.files.find(query)
-                .skip(skip)
-                .limit(fetch_size)
-                .to_list(length=None)
-            )
-
-            if not files:
-                break  # No more files to fetch
-
-            # Check and cache access levels for HuBMAP files with null access level
-            checked_files = await check_and_cache_access_levels(files)
-
-            # Filter to only public files
-            for f in checked_files:
-                if (
-                    f.get("submission") != "hubmap"
-                    or f.get("data_access_level") == "public"
-                ):
-                    public_files.append(f)
-                    if len(public_files) >= page_size:
-                        break
-
-            if len(public_files) >= page_size:
-                break
-
-            # Need more files - continue from where we left off
-            skip += fetch_size
-            fetch_multiplier = 1  # Subsequent fetches are page_size at a time
+        files = (
+            await api.db.files.find(query)
+            .skip(skip)
+            .limit(page_size)
+            .to_list(length=None)
+        )
 
         return [
             from_pydantic(FileMetadataType, FileMetadataModel(**file).model_dump())
-            for file in public_files[:page_size]
+            for file in files
         ]
 
     @strawberry.field
