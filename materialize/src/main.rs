@@ -838,10 +838,6 @@ fn index_keys() -> Vec<Document> {
         doc! { "id_namespace": 1, "local_id": 1 },
         doc! { "persistent_id": 1 },
         doc! { "filename": 1 },
-        doc! { "size_in_bytes": 1 },
-        doc! { "sha256": 1 },
-        doc! { "md5": 1 },
-        doc! { "mime_type": 1 },
         doc! { "dcc.id": 1 },
         doc! { "dcc.dcc_name": 1 },
         doc! { "dcc.dcc_abbreviation": 1 },
@@ -905,4 +901,70 @@ fn create_indexes(coll: &Collection<Document>) -> Result<()> {
     coll.create_indexes(models).run()?;
     println!("  Created {} indexes", index_count);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_keys_returns_expected_set() {
+        // GIVEN the index_keys function
+        // WHEN called
+        // THEN it returns exactly 47 index key documents matching the expected fields
+        let keys = index_keys();
+        assert_eq!(keys.len(), 47);
+        assert_eq!(
+            keys,
+            vec![
+                doc! { "id_namespace": 1 },
+                doc! { "local_id": 1 },
+                doc! { "id_namespace": 1, "local_id": 1 },
+                doc! { "persistent_id": 1 },
+                doc! { "filename": 1 },
+                doc! { "dcc.id": 1 },
+                doc! { "dcc.dcc_name": 1 },
+                doc! { "dcc.dcc_abbreviation": 1 },
+                doc! { "file_format.id": 1 },
+                doc! { "file_format.name": 1 },
+                doc! { "data_type.id": 1 },
+                doc! { "data_type.name": 1 },
+                doc! { "assay_type.id": 1 },
+                doc! { "assay_type.name": 1 },
+                doc! { "collections.id_namespace": 1 },
+                doc! { "collections.local_id": 1 },
+                doc! { "collections.name": 1 },
+                doc! { "collections.anatomy.id": 1 },
+                doc! { "collections.anatomy.name": 1 },
+                doc! { "collections.subjects.id_namespace": 1 },
+                doc! { "collections.subjects.local_id": 1 },
+                doc! { "collections.subjects.granularity": 1 },
+                doc! { "collections.subjects.sex": 1 },
+                doc! { "collections.subjects.ethnicity": 1 },
+                doc! { "collections.subjects.race": 1 },
+                doc! { "collections.biosamples.id_namespace": 1 },
+                doc! { "collections.biosamples.local_id": 1 },
+                doc! { "collections.biosamples.anatomy.id": 1 },
+                doc! { "collections.biosamples.anatomy.name": 1 },
+                doc! { "collections.biosamples.subjects.id_namespace": 1 },
+                doc! { "collections.biosamples.subjects.local_id": 1 },
+                doc! { "collections.biosamples.subjects.granularity": 1 },
+                doc! { "collections.biosamples.subjects.sex": 1 },
+                doc! { "collections.biosamples.subjects.ethnicity": 1 },
+                doc! { "collections.biosamples.subjects.age_at_enrollment": 1 },
+                doc! { "collections.biosamples.subjects.age_at_sampling": 1 },
+                doc! { "collections.biosamples.subjects.race": 1 },
+                doc! { "collections.biosamples.subjects.taxonomy.id": 1 },
+                doc! { "collections.biosamples.subjects.taxonomy.name": 1 },
+                doc! { "collections.subjects.taxonomy.id": 1 },
+                doc! { "collections.subjects.taxonomy.name": 1 },
+                doc! { "project.id_namespace": 1 },
+                doc! { "project.local_id": 1 },
+                doc! { "project.name": 1 },
+                doc! { "project.abbreviation": 1 },
+                doc! { "data_access_level": 1 },
+                doc! { "submission": 1 },
+            ]
+        );
+    }
 }
