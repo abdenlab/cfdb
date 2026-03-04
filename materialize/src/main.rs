@@ -831,10 +831,8 @@ fn load_subject_in_collection(coll: &Collection<Document>, submission: &Option<S
     map
 }
 
-fn create_indexes(coll: &Collection<Document>) -> Result<()> {
-    use mongodb::IndexModel;
-
-    let indexes = vec![
+fn index_keys() -> Vec<Document> {
+    vec![
         doc! { "id_namespace": 1 },
         doc! { "local_id": 1 },
         doc! { "id_namespace": 1, "local_id": 1 },
@@ -891,8 +889,13 @@ fn create_indexes(coll: &Collection<Document>) -> Result<()> {
         doc! { "project.abbreviation": 1 },
         doc! { "data_access_level": 1 },
         doc! { "submission": 1 },
-    ];
+    ]
+}
 
+fn create_indexes(coll: &Collection<Document>) -> Result<()> {
+    use mongodb::IndexModel;
+
+    let indexes = index_keys();
     let index_count = indexes.len();
     let models: Vec<IndexModel> = indexes
         .into_iter()
