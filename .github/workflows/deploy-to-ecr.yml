@@ -6,21 +6,17 @@ on:
       - master
 
 jobs:
-  build:
+  build-and-deploy:
     if: github.repository == 'abdenlab/cfdb'
-    # Available versions:
-    # https://docs.github.com/en/free-pro-team@latest/actions/reference/workflow-syntax-for-github-actions#jobsjob_idruns-on
     runs-on: ubuntu-24.04
     permissions:
         id-token: write
         contents: read
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        if: ${{ github.event_name == 'push' && github.ref  == 'refs/heads/master' }}
         uses: aws-actions/configure-aws-credentials@v3
         with:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE }}
@@ -30,11 +26,24 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Push to ECR
+      - name: Build and push to ECR
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: cfdb
-          IMAGE_TAG: latest
         run: |
-            docker build --file Dockerfile.api -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
-            docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+          SHA_TAG=${GITHUB_SHA::8}
+          docker build --file Dockerfile.api \
+            -t $REGISTRY/$REPOSITORY:latest \
+            -t $REGISTRY/$REPOSITORY:$SHA_TAG .
+          docker push $REGISTRY/$REPOSITORY:latest
+          docker push $REGISTRY/$REPOSITORY:$SHA_TAG
+
+      - name: Deploy to ECS
+        env:
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment

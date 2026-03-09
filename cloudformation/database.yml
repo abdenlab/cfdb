@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CFDB DocumentDB cluster with Secrets Manager for credential and
+  connection URL management.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Description: Name of the network stack (for cross-stack imports)
+  DBMasterUsername:
+    Type: String
+    Description: Master username for the DocumentDB cluster
+    NoEcho: true
+  InstanceClass:
+    Type: String
+    Default: db.t3.medium
+    Description: DocumentDB instance class
+  InstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 1
+    Description: Number of DocumentDB instances
+
+Resources:
+  # ---------- Master credentials ----------
+  DBMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-master-credentials"
+      Description: DocumentDB master credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # ---------- DocumentDB cluster ----------
+  DBClusterParameterGroup:
+    Type: AWS::DocDB::DBClusterParameterGroup
+    Properties:
+      Description: CFDB DocumentDB 5.0 parameters
+      Family: docdb5.0
+      Parameters:
+        tls: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-params"
+
+  DBCluster:
+    Type: AWS::DocDB::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${AWS::StackName}-cluster"
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub "${NetworkStackName}-DocumentDBSubnetGroupName"
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-DocumentDBSecurityGroupId"
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      EngineVersion: "5.0.0"
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DBMasterSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password}}"
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-cluster"
+
+  DBInstance1:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: !Ref InstanceClass
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance-1"
+
+  DBInstance2:
+    Type: AWS::DocDB::DBInstance
+    Condition: MultiInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: !Ref InstanceClass
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance-2"
+
+  DBInstance3:
+    Type: AWS::DocDB::DBInstance
+    Condition: ThreeInstances
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: !Ref InstanceClass
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance-3"
+
+  # ---------- Connection URL secret ----------
+  ConnectionURLSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: DBCluster
+    Properties:
+      Name: !Sub "${AWS::StackName}-connection-url"
+      Description: Full DATABASE_URL for the CFDB API
+      SecretString: !Sub
+        - "mongodb://{{resolve:secretsmanager:${Secret}:SecretString:username}}:{{resolve:secretsmanager:${Secret}:SecretString:password}}@${Endpoint}:${Port}/cfdb?tls=true&tlsCAFile=/etc/cfdb/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
+        - Secret: !Ref DBMasterSecret
+          Endpoint: !GetAtt DBCluster.Endpoint
+          Port: !GetAtt DBCluster.Port
+
+Conditions:
+  MultiInstance: !Not [!Equals [!Ref InstanceCount, 1]]
+  ThreeInstances: !Equals [!Ref InstanceCount, 3]
+
+Outputs:
+  ClusterEndpoint:
+    Value: !GetAtt DBCluster.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterEndpoint"
+  ConnectionURLSecretArn:
+    Value: !Ref ConnectionURLSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-ConnectionURLSecretArn"
