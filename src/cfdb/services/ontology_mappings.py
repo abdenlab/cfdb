@@ -13,11 +13,11 @@ FILE_FORMAT_TO_EDAM = {
     # Genomic interval formats
     "bed": {"id": "format:3003", "name": "BED"},
     "bedpe": {"id": "format:3003", "name": "BED"},  # BED paired-end
-    "broadPeak": {"id": "format:3614", "name": "BroadPeak"},
-    "narrowPeak": {"id": "format:3613", "name": "NarrowPeak"},
-    "gappedPeak": {"id": "format:3003", "name": "BED"},  # gappedPeak is BED variant
-    "bed narrowPeak": {"id": "format:3613", "name": "NarrowPeak"},
-    "bed broadPeak": {"id": "format:3614", "name": "BroadPeak"},
+    "broadpeak": {"id": "format:3614", "name": "BroadPeak"},
+    "narrowpeak": {"id": "format:3613", "name": "NarrowPeak"},
+    "gappedpeak": {"id": "format:3003", "name": "BED"},  # gappedPeak is BED variant
+    "bed narrowpeak": {"id": "format:3613", "name": "NarrowPeak"},
+    "bed broadpeak": {"id": "format:3614", "name": "BroadPeak"},
     # Variant formats
     "vcf": {"id": "format:3016", "name": "VCF"},
     # Annotation formats
@@ -25,10 +25,10 @@ FILE_FORMAT_TO_EDAM = {
     "gff": {"id": "format:1975", "name": "GFF"},
     "gff3": {"id": "format:1975", "name": "GFF3"},
     # Signal/coverage formats
-    "bigWig": {"id": "format:3006", "name": "bigWig"},
-    "bigBed": {"id": "format:3004", "name": "bigBed"},
+    "bigwig": {"id": "format:3006", "name": "bigWig"},
+    "bigbed": {"id": "format:3004", "name": "bigBed"},
     "wig": {"id": "format:3005", "name": "WIG"},
-    "bedGraph": {"id": "format:3583", "name": "bedGraph"},
+    "bedgraph": {"id": "format:3583", "name": "bedGraph"},
     # Tabular formats
     "tsv": {"id": "format:3475", "name": "TSV"},
     "csv": {"id": "format:3752", "name": "CSV"},
@@ -46,10 +46,16 @@ FILE_FORMAT_TO_EDAM = {
     "cool": {"id": "format:3590", "name": "HDF5"},  # cooler format is HDF5-based
     "mcool": {"id": "format:3590", "name": "HDF5"},  # multi-resolution cooler
     "idat": {"id": "format:2333", "name": "Binary format"},
-    "CEL": {"id": "format:1638", "name": "CEL"},
+    "cel": {"id": "format:1638", "name": "CEL"},
     "rcc": {"id": "format:2330", "name": "Plain text"},
     "sra": {"id": "format:3698", "name": "SRA format"},
     "database": {"id": "format:2330", "name": "Plain text"},
+    "starch": {"id": "format:3003", "name": "BED"},  # BEDOPS compressed BED archive
+    "tagalign": {"id": "format:3003", "name": "BED"},  # tagAlign is a BED variant
+    "biginteract": {"id": "format:3004", "name": "bigBed"},  # bigInteract is a bigBed variant
+    "csfasta": {"id": "format:1929", "name": "FASTA"},  # color-space FASTA (SOLiD)
+    "csqual": {"id": "format:2330", "name": "Plain text"},  # color-space quality scores
+    "h5ad": {"id": "format:3590", "name": "HDF5"},  # AnnData HDF5 format
 }
 
 # ENCODE output_type to EDAM data CV terms
@@ -235,7 +241,12 @@ def get_file_format(encode_format: str) -> dict | None:
     """
     if not encode_format:
         return None
-    return FILE_FORMAT_TO_EDAM.get(encode_format.lower())
+    key = encode_format.lower()
+    result = FILE_FORMAT_TO_EDAM.get(key)
+    if result:
+        return result
+    base = key.split()[0]
+    return FILE_FORMAT_TO_EDAM.get(base)
 
 
 def get_data_type(output_type: str) -> dict | None:
