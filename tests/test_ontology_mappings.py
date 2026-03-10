@@ -2,150 +2,206 @@
 
 from __future__ import annotations
 
+from hypothesis import given
+from hypothesis import strategies as st
+
 from cfdb.services.ontology_mappings import get_file_format
 
 
-class TestGetFileFormat:
-    def test_get_file_format_with_simple_format(self):
-        """
-        GIVEN a simple format string that exactly matches a dictionary key
-        WHEN get_file_format is called with "fastq"
-        THEN the EDAM FASTQ term is returned
-        """
-        # Act
-        result = get_file_format("fastq")
+def test_get_file_format_with_simple_format():
+    """Test simple format string lookup.
 
-        # Assert
-        assert result == {"id": "format:1930", "name": "FASTQ"}
+    Given:
+        A simple format string that exactly matches a dictionary key.
+    When:
+        get_file_format is called with "fastq".
+    Then:
+        It should return the EDAM FASTQ term.
+    """
+    result = get_file_format("fastq")
 
-    def test_get_file_format_with_compound_bigbed(self):
-        """
-        GIVEN a compound format string "bigBed narrowPeak" with no exact match
-        WHEN get_file_format is called
-        THEN the first token "bigBed" is used as a fallback lookup
-        """
-        # Act
-        result = get_file_format("bigBed narrowPeak")
+    assert result == {"id": "format:1930", "name": "FASTQ"}
 
-        # Assert
-        assert result == {"id": "format:3004", "name": "bigBed"}
 
-    def test_get_file_format_with_compound_bed(self):
-        """
-        GIVEN a compound format string "bed bed3+" with no exact match
-        WHEN get_file_format is called
-        THEN the first token "bed" is used as a fallback lookup
-        """
-        # Act
-        result = get_file_format("bed bed3+")
+def test_get_file_format_with_compound_bigbed():
+    """Test compound format string fallback to first token for bigBed.
 
-        # Assert
-        assert result == {"id": "format:3003", "name": "BED"}
+    Given:
+        A compound format string "bigBed narrowPeak" with no exact match.
+    When:
+        get_file_format is called.
+    Then:
+        It should use the first token "bigBed" as a fallback lookup.
+    """
+    result = get_file_format("bigBed narrowPeak")
 
-    def test_get_file_format_with_compound_bigwig(self):
-        """
-        GIVEN a compound format string "bigWig bed3+" with no exact match
-        WHEN get_file_format is called
-        THEN the first token "bigWig" is used as a fallback lookup
-        """
-        # Act
-        result = get_file_format("bigWig bed3+")
+    assert result == {"id": "format:3004", "name": "bigBed"}
 
-        # Assert
-        assert result == {"id": "format:3006", "name": "bigWig"}
 
-    def test_get_file_format_with_exact_compound_key(self):
-        """
-        GIVEN a compound format string "bed narrowPeak" that has an exact match
-        WHEN get_file_format is called
-        THEN the exact match (NarrowPeak) takes precedence over the first-token fallback (BED)
-        """
-        # Act
-        result = get_file_format("bed narrowPeak")
+def test_get_file_format_with_compound_bed():
+    """Test compound format string fallback to first token for bed.
 
-        # Assert
-        assert result == {"id": "format:3613", "name": "NarrowPeak"}
+    Given:
+        A compound format string "bed bed3+" with no exact match.
+    When:
+        get_file_format is called.
+    Then:
+        It should use the first token "bed" as a fallback lookup.
+    """
+    result = get_file_format("bed bed3+")
 
-    def test_get_file_format_with_starch(self):
-        """
-        GIVEN the format string "starch" (BEDOPS compressed BED archive)
-        WHEN get_file_format is called
-        THEN the EDAM BED term is returned
-        """
-        # Act
-        result = get_file_format("starch")
+    assert result == {"id": "format:3003", "name": "BED"}
 
-        # Assert
-        assert result == {"id": "format:3003", "name": "BED"}
 
-    def test_get_file_format_with_tagalign_case_insensitive(self):
-        """
-        GIVEN the format string "tagAlign" with mixed case
-        WHEN get_file_format is called
-        THEN the lookup is case-insensitive and returns the EDAM BED term
-        """
-        # Act
-        result = get_file_format("tagAlign")
+def test_get_file_format_with_compound_bigwig():
+    """Test compound format string fallback to first token for bigWig.
 
-        # Assert
-        assert result == {"id": "format:3003", "name": "BED"}
+    Given:
+        A compound format string "bigWig bed3+" with no exact match.
+    When:
+        get_file_format is called.
+    Then:
+        It should use the first token "bigWig" as a fallback lookup.
+    """
+    result = get_file_format("bigWig bed3+")
 
-    def test_get_file_format_with_biginteract(self):
-        """
-        GIVEN the format string "bigInteract" (a bigBed variant)
-        WHEN get_file_format is called
-        THEN the EDAM bigBed term is returned
-        """
-        # Act
-        result = get_file_format("bigInteract")
+    assert result == {"id": "format:3006", "name": "bigWig"}
 
-        # Assert
-        assert result == {"id": "format:3004", "name": "bigBed"}
 
-    def test_get_file_format_with_h5ad(self):
-        """
-        GIVEN the format string "h5ad" (AnnData HDF5 format)
-        WHEN get_file_format is called
-        THEN the EDAM HDF5 term is returned
-        """
-        # Act
-        result = get_file_format("h5ad")
+def test_get_file_format_with_exact_compound_key():
+    """Test exact compound key takes precedence over first-token fallback.
 
-        # Assert
-        assert result == {"id": "format:3590", "name": "HDF5"}
+    Given:
+        A compound format string "bed narrowPeak" that has an exact match.
+    When:
+        get_file_format is called.
+    Then:
+        It should return the exact match NarrowPeak instead of the first-token fallback BED.
+    """
+    result = get_file_format("bed narrowPeak")
 
-    def test_get_file_format_with_empty_string(self):
-        """
-        GIVEN an empty format string
-        WHEN get_file_format is called
-        THEN None is returned
-        """
-        # Act
-        result = get_file_format("")
+    assert result == {"id": "format:3613", "name": "NarrowPeak"}
 
-        # Assert
-        assert result is None
 
-    def test_get_file_format_with_unknown_format(self):
-        """
-        GIVEN an unrecognized format string "xyzzy"
-        WHEN get_file_format is called
-        THEN None is returned
-        """
-        # Act
-        result = get_file_format("xyzzy")
+def test_get_file_format_with_starch_format():
+    """Test starch format maps to BED.
 
-        # Assert
-        assert result is None
+    Given:
+        The format string "starch" (BEDOPS compressed BED archive).
+    When:
+        get_file_format is called.
+    Then:
+        It should return the EDAM BED term.
+    """
+    result = get_file_format("starch")
 
-    def test_get_file_format_with_unknown_compound(self):
-        """
-        GIVEN an unrecognized compound format string "xyzzy foo"
-        WHEN get_file_format is called
-        THEN None is returned (neither the full string nor the first token matches)
-        """
-        # Act
-        result = get_file_format("xyzzy foo")
+    assert result == {"id": "format:3003", "name": "BED"}
 
-        # Assert
-        assert result is None
+
+def test_get_file_format_with_tagalign_case_insensitive():
+    """Test case-insensitive tagAlign lookup.
+
+    Given:
+        The format string "tagAlign" with mixed case.
+    When:
+        get_file_format is called.
+    Then:
+        It should perform a case-insensitive lookup and return the EDAM BED term.
+    """
+    result = get_file_format("tagAlign")
+
+    assert result == {"id": "format:3003", "name": "BED"}
+
+
+def test_get_file_format_with_biginteract_format():
+    """Test bigInteract format maps to bigBed.
+
+    Given:
+        The format string "bigInteract" (a bigBed variant).
+    When:
+        get_file_format is called.
+    Then:
+        It should return the EDAM bigBed term.
+    """
+    result = get_file_format("bigInteract")
+
+    assert result == {"id": "format:3004", "name": "bigBed"}
+
+
+def test_get_file_format_with_h5ad_format():
+    """Test h5ad format maps to HDF5.
+
+    Given:
+        The format string "h5ad" (AnnData HDF5 format).
+    When:
+        get_file_format is called.
+    Then:
+        It should return the EDAM HDF5 term.
+    """
+    result = get_file_format("h5ad")
+
+    assert result == {"id": "format:3590", "name": "HDF5"}
+
+
+def test_get_file_format_with_empty_string():
+    """Test empty format string returns None.
+
+    Given:
+        An empty format string.
+    When:
+        get_file_format is called.
+    Then:
+        It should return None.
+    """
+    result = get_file_format("")
+
+    assert result is None
+
+
+def test_get_file_format_with_unknown_format():
+    """Test unrecognized format string returns None.
+
+    Given:
+        An unrecognized format string "xyzzy".
+    When:
+        get_file_format is called.
+    Then:
+        It should return None.
+    """
+    result = get_file_format("xyzzy")
+
+    assert result is None
+
+
+def test_get_file_format_with_unknown_compound():
+    """Test unrecognized compound format string returns None.
+
+    Given:
+        An unrecognized compound format string "xyzzy foo".
+    When:
+        get_file_format is called.
+    Then:
+        It should return None because neither the full string nor the first token matches.
+    """
+    result = get_file_format("xyzzy foo")
+
+    assert result is None
+
+
+@given(st.text())
+def test_get_file_format_return_type_invariant(format_string):
+    """Test return type is always None or a dict with id and name keys.
+
+    Given:
+        An arbitrary text input.
+    When:
+        get_file_format is called.
+    Then:
+        It should return None or a dict containing "id" and "name" keys.
+    """
+    result = get_file_format(format_string)
+
+    if result is not None:
+        assert isinstance(result, dict)
+        assert "id" in result
+        assert "name" in result
