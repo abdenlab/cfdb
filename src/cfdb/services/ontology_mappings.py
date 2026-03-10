@@ -239,7 +239,7 @@ def get_file_format(encode_format: str) -> dict | None:
     Returns:
         Dict with EDAM id and name, or None if not mapped
     """
-    if not encode_format:
+    if not encode_format or not encode_format.strip():
         return None
     key = encode_format.lower()
     result = FILE_FORMAT_TO_EDAM.get(key)
