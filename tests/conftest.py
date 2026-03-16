@@ -10,6 +10,17 @@ import pytest
 from cfdb import api
 
 
+def _resolve(doc: dict, key: str):
+    """Resolve a possibly dot-notated key against a nested dict."""
+    value = doc
+    for part in key.split("."):
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            return None
+    return value
+
+
 def _match(doc: dict, query: dict) -> bool:
     """Minimal MongoDB query matcher supporting a small operator subset."""
     for key, cond in query.items():
@@ -18,7 +29,7 @@ def _match(doc: dict, query: dict) -> bool:
         if key == "$or":
             return any(_match(doc, sub) for sub in cond)
 
-        value = doc.get(key)
+        value = _resolve(doc, key)
 
         if isinstance(cond, dict):
             for op, operand in cond.items():
@@ -181,6 +192,17 @@ class FakeCollection:
             self.docs.append(new_doc)
             return _UpdateResult(0, 0)
         return _UpdateResult(0, 0)
+
+    async def distinct(self, field: str, query: dict | None = None) -> list:
+        if query is None:
+            query = {}
+        matched = [d for d in self.docs if _match(d, query)]
+        seen: list = []
+        for doc in matched:
+            value = _resolve(doc, field)
+            if value is not None and value not in seen:
+                seen.append(value)
+        return seen
 
 
 class FakeDB:
