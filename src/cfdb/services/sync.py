@@ -4,6 +4,7 @@ import asyncio
 import csv
 import logging
 import os
+import pickle
 import re
 import shutil
 import subprocess
@@ -11,8 +12,11 @@ from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import Optional
+
+import wool
 
 from cfdb import api
 from cfdb.dcc_registry import (
@@ -30,6 +34,38 @@ BATCH_SIZE = 1000
 DATA_DIR = os.getenv("SYNC_DATA_DIR", ".data")
 MATERIALIZE_BIN = os.getenv("MATERIALIZE_BIN", "materialize")
 DATABASE_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+
+
+def write_shared(data: object) -> tuple[str, int]:
+    """Serialize *data* into a shared memory block and return (name, size)."""
+    blob = pickle.dumps(data)
+    shm = SharedMemory(create=True, size=len(blob))
+    shm.buf[: len(blob)] = blob
+    shm.close()
+    return shm.name, len(blob)
+
+
+def read_shared(shm_name: str, shm_size: int) -> object:
+    """Deserialize an object from the named shared memory block."""
+    shm = SharedMemory(name=shm_name, create=False)
+    data = pickle.loads(bytes(shm.buf[:shm_size]))
+    shm.close()
+    return data
+
+
+def cleanup_shared(shm_name: str) -> None:
+    """Close and unlink a shared memory block by name."""
+    shm = SharedMemory(name=shm_name, create=False)
+    shm.close()
+    shm.unlink()
+
+
+def _get_worker_db() -> tuple:
+    """Create an independent Motor client for use in a worker process."""
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    client = AsyncIOMotorClient(DATABASE_URL)
+    return client, client[api.DATABASE_NAME]
 
 
 class TaskStatus(str, Enum):
@@ -100,7 +136,8 @@ async def start_sync(task_id: str, dcc_names: list[str]) -> SyncTask:
 async def _run_sync(task: SyncTask) -> None:
     """Execute the sync task."""
     try:
-        await _sync_dccs(task)
+        async with wool.WorkerPool():
+            await _sync_dccs(task)
         task.status = TaskStatus.COMPLETED
         task.progress = "Sync completed successfully"
     except Exception as e:
@@ -125,27 +162,22 @@ async def _sync_dccs(task: SyncTask) -> None:
     downloads_path = data_path / "downloads"
     downloads_path.mkdir(exist_ok=True)
 
-    for dcc in task.dcc_names:
-        task.current_dcc = dcc
-        dcc_type = get_dcc_type(dcc)
-
-        # Branch on DCC type
-        if dcc_type == "rest_api" and dcc == "encode":
-            await _sync_encode(task)
-        else:
-            await _sync_c2m2_zip(task, data_path, downloads_path)
-
-        logger.info(f"{dcc.upper()} synced successfully")
+    async with asyncio.TaskGroup() as tg:
+        for dcc in task.dcc_names:
+            dcc_type = get_dcc_type(dcc)
+            if dcc_type == "rest_api" and dcc == "encode":
+                tg.create_task(_sync_encode(task))
+            else:
+                tg.create_task(_sync_c2m2_zip(task, data_path, downloads_path, dcc))
 
     task.progress = "All DCCs synced successfully"
     logger.info(task.progress)
 
 
 async def _sync_c2m2_zip(
-    task: SyncTask, data_path: Path, downloads_path: Path
+    task: SyncTask, data_path: Path, downloads_path: Path, dcc: str
 ) -> None:
     """Sync a DCC using C2M2 ZIP datapackage."""
-    dcc = task.current_dcc
     config = get_dcc_config(dcc)
 
     # Step 1: Download
@@ -219,11 +251,81 @@ async def _sync_c2m2_zip(
         logger.info(task.progress)
         await _enrich_hubmap_files(dataset_metadata)
 
+    logger.info(f"{dcc.upper()} synced successfully")
+
+
+@wool.routine
+async def _enrich_4dn_files_batch(
+    doc_batch: list[tuple[object, str]],
+    shm_name: str,
+    shm_size: int,
+) -> int:
+    """Worker routine: enrich a batch of 4DN files and bulk_write to MongoDB."""
+    import re
+
+    from pymongo import UpdateOne
+
+    shared = read_shared(shm_name, shm_size)
+    file_metadata: dict = shared["file_metadata"]
+    biosource_tiers: dict = shared["biosource_tiers"]
+
+    client, db = _get_worker_db()
+    try:
+        operations = []
+        for doc_id, accession in doc_batch:
+            meta = file_metadata.get(accession)
+            if not meta:
+                continue
+
+            update: dict = {}
+
+            top_level_map = {
+                "genome_assembly": "genome_assembly",
+                "file_type": "output_type",
+                "file_type_detailed": "output_type_detail",
+                "condition": "condition",
+                "assay_info": "assay_info",
+            }
+            for src_key, dest_key in top_level_map.items():
+                val = meta.get(src_key)
+                if val:
+                    update[dest_key] = val
+
+            replicate_info = meta.get("replicate_info")
+            if replicate_info:
+                update["extra.replicate_info"] = replicate_info
+                bio = re.search(r"Biorep\s+(\S+)", replicate_info)
+                tech = re.search(r"Techrep\s+(\S+)", replicate_info)
+                if bio:
+                    update["biological_replicates"] = bio.group(1)
+                if tech:
+                    update["technical_replicates"] = tech.group(1)
+
+            for key in ("biosource_name", "dataset", "extra_files"):
+                val = meta.get(key)
+                if val:
+                    update[f"extra.fourdn.{key}"] = val
+
+            biosource_name = meta.get("biosource_name")
+            if biosource_name and biosource_name in biosource_tiers:
+                update["extra.fourdn.cell_line_tier"] = biosource_tiers[biosource_name]
+
+            if not update:
+                continue
+
+            operations.append(UpdateOne({"_id": doc_id}, {"$set": update}))
+
+        if not operations:
+            return 0
+
+        result = await db.files.bulk_write(operations, ordered=False)
+        return result.modified_count
+    finally:
+        client.close()
+
 
 async def _enrich_4dn_api_metadata() -> None:
     """Enrich materialized 4DN files with metadata from the 4DN Search API."""
-    from pymongo import UpdateOne
-
     from cfdb.services.fourdn import (
         extract_accession,
         fetch_biosource_tiers,
@@ -233,7 +335,6 @@ async def _enrich_4dn_api_metadata() -> None:
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Fetch API data
     file_metadata = await fetch_file_metadata_bulk()
     biosource_tiers = await fetch_biosource_tiers()
 
@@ -242,8 +343,8 @@ async def _enrich_4dn_api_metadata() -> None:
         f"{len(biosource_tiers)} biosource tier entries"
     )
 
-    # Build accession -> _id lookup from existing files (avoids $regex per update)
-    accession_to_id: dict[str, object] = {}
+    # Build accession -> _id lookup
+    doc_pairs: list[tuple[object, str]] = []
     cursor = api.db.files.find(
         {"submission": "4dn"},
         {"_id": 1, "persistent_id": 1},
@@ -251,77 +352,76 @@ async def _enrich_4dn_api_metadata() -> None:
     async for doc in cursor:
         acc = extract_accession(doc.get("persistent_id", ""))
         if acc:
-            accession_to_id[acc] = doc["_id"]
+            doc_pairs.append((doc["_id"], acc))
 
-    logger.info(f"4DN enrichment: {len(accession_to_id)} files in DB mapped by accession")
+    logger.info(f"4DN enrichment: {len(doc_pairs)} files in DB mapped by accession")
 
-    # Build bulk update operations matched by _id
-    operations = []
-    for accession, meta in file_metadata.items():
-        doc_id = accession_to_id.get(accession)
-        if not doc_id:
-            continue
-
-        update: dict = {}
-
-        # Promoted to file top-level
-        top_level_map = {
-            "genome_assembly": "genome_assembly",
-            "file_type": "output_type",
-            "file_type_detailed": "output_type_detail",
-            "condition": "condition",
-            "assay_info": "assay_info",
-        }
-        for src_key, dest_key in top_level_map.items():
-            val = meta.get(src_key)
-            if val:
-                update[dest_key] = val
-
-        # Parse replicate_info into separate fields
-        replicate_info = meta.get("replicate_info")
-        if replicate_info:
-            update["extra.replicate_info"] = replicate_info
-            bio = re.search(r"Biorep\s+(\S+)", replicate_info)
-            tech = re.search(r"Techrep\s+(\S+)", replicate_info)
-            if bio:
-                update["biological_replicates"] = bio.group(1)
-            if tech:
-                update["technical_replicates"] = tech.group(1)
-
-        # Stay on extra (DCC-specific, no cross-DCC equivalent)
-        for key in ("biosource_name", "dataset", "extra_files"):
-            val = meta.get(key)
-            if val:
-                update[f"extra.fourdn.{key}"] = val
-
-        # Derive cell_line_tier from biosource_name
-        biosource_name = meta.get("biosource_name")
-        if biosource_name and biosource_name in biosource_tiers:
-            update["extra.fourdn.cell_line_tier"] = biosource_tiers[biosource_name]
-
-        if not update:
-            continue
-
-        operations.append(UpdateOne({"_id": doc_id}, {"$set": update}))
-
-    if not operations:
+    if not doc_pairs:
         logger.warning("4DN enrichment: no updates to apply")
         return
 
-    # Execute in batches
-    total_modified = 0
-    for i in range(0, len(operations), BATCH_SIZE):
-        batch = operations[i : i + BATCH_SIZE]
-        result = await api.db.files.bulk_write(batch, ordered=False)
-        total_modified += result.modified_count
+    shm_name, shm_size = write_shared(
+        {"file_metadata": file_metadata, "biosource_tiers": biosource_tiers}
+    )
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for i in range(0, len(doc_pairs), BATCH_SIZE):
+                batch = doc_pairs[i : i + BATCH_SIZE]
+                tg.create_task(
+                    _enrich_4dn_files_batch(batch, shm_name, shm_size)
+                )
+    finally:
+        cleanup_shared(shm_name)
 
-    logger.info(f"4DN enrichment: updated {total_modified} files")
+    logger.info("4DN enrichment: batch workers complete")
+
+
+@wool.routine
+async def _enrich_4dn_collections_batch(
+    doc_batch: list[tuple[object, str]],
+    shm_name: str,
+    shm_size: int,
+) -> int:
+    """Worker routine: enrich a batch of 4DN collections and bulk_write to MongoDB."""
+    from pymongo import UpdateOne
+
+    experiment_metadata: dict = read_shared(shm_name, shm_size)
+
+    client, db = _get_worker_db()
+    try:
+        operations = []
+        for doc_id, accession in doc_batch:
+            meta = experiment_metadata.get(accession)
+            if not meta:
+                continue
+
+            update: dict = {}
+
+            if meta.get("lab"):
+                update["lab"] = meta["lab"]
+            if meta.get("experiment_type"):
+                update["experiment_type"] = meta["experiment_type"]
+
+            remaining = {
+                k: v for k, v in meta.items() if k not in ("lab", "experiment_type")
+            }
+            if remaining:
+                update["extra.fourdn"] = remaining
+
+            if update:
+                operations.append(UpdateOne({"_id": doc_id}, {"$set": update}))
+
+        if not operations:
+            return 0
+
+        result = await db.collection.bulk_write(operations, ordered=False)
+        return result.modified_count
+    finally:
+        client.close()
 
 
 async def _enrich_4dn_collections() -> None:
     """Enrich 4DN collection documents with experiment metadata from the 4DN Search API."""
-    from pymongo import UpdateOne
-
     from cfdb.services.fourdn import (
         extract_experiment_accession,
         fetch_experiment_metadata_bulk,
@@ -330,59 +430,162 @@ async def _enrich_4dn_collections() -> None:
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Fetch experiment metadata from 4DN API
     experiment_metadata = await fetch_experiment_metadata_bulk()
 
     logger.info(f"4DN collection enrichment: {len(experiment_metadata)} experiment entries")
 
-    # Build bulk updates: match collection docs by experiment accession in persistent_id
-    operations = []
+    doc_pairs: list[tuple[object, str]] = []
     cursor = api.db.collection.find(
         {"submission": "4dn"},
         {"_id": 1, "persistent_id": 1},
     )
-    matched = 0
     async for doc in cursor:
         accession = extract_experiment_accession(doc.get("persistent_id", ""))
-        if not accession:
-            continue
+        if accession:
+            doc_pairs.append((doc["_id"], accession))
 
-        meta = experiment_metadata.get(accession)
-        if not meta:
-            continue
-
-        matched += 1
-        update: dict = {}
-
-        # Promote selected fields to Collection top-level
-        if meta.get("lab"):
-            update["lab"] = meta["lab"]
-        if meta.get("experiment_type"):
-            update["experiment_type"] = meta["experiment_type"]
-
-        # Nest remaining under extra.fourdn
-        remaining = {k: v for k, v in meta.items() if k not in ("lab", "experiment_type")}
-        if remaining:
-            update["extra.fourdn"] = remaining
-
-        if update:
-            operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
-
-    if not operations:
+    if not doc_pairs:
         logger.warning("4DN collection enrichment: no updates to apply")
         return
 
-    # Execute in batches
-    total_modified = 0
-    for i in range(0, len(operations), BATCH_SIZE):
-        batch = operations[i : i + BATCH_SIZE]
-        result = await api.db.collection.bulk_write(batch, ordered=False)
-        total_modified += result.modified_count
+    shm_name, shm_size = write_shared(experiment_metadata)
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for i in range(0, len(doc_pairs), BATCH_SIZE):
+                batch = doc_pairs[i : i + BATCH_SIZE]
+                tg.create_task(
+                    _enrich_4dn_collections_batch(batch, shm_name, shm_size)
+                )
+    finally:
+        cleanup_shared(shm_name)
 
-    logger.info(
-        f"4DN collection enrichment: matched {matched} collections, "
-        f"updated {total_modified}"
-    )
+    logger.info(f"4DN collection enrichment: {len(doc_pairs)} collections processed")
+
+
+@wool.routine
+async def _enrich_hubmap_collections_batch(
+    doc_batch: list[tuple[object, str]],
+    shm_name: str,
+    shm_size: int,
+) -> int:
+    """Worker routine: enrich a batch of HuBMAP collections and bulk_write to MongoDB."""
+    from pymongo import UpdateOne
+
+    dataset_metadata: dict = read_shared(shm_name, shm_size)
+
+    client, db = _get_worker_db()
+    try:
+        operations = []
+        for doc_id, persistent_id in doc_batch:
+            meta = dataset_metadata.get(persistent_id)
+            if not meta:
+                continue
+
+            update_set: dict = {}
+
+            dataset_type = meta.get("dataset_type")
+            if dataset_type is not None:
+                update_set["experiment_type"] = dataset_type
+            analyte_class = meta.get("analyte_class")
+            if analyte_class is not None:
+                update_set["analyte_class"] = analyte_class
+
+            hubmap_extra: dict = {}
+            for key in (
+                "pipeline",
+                "processing",
+                "group_name",
+                "visualization",
+                "vitessce_hints",
+                "metadata",
+            ):
+                val = meta.get(key)
+                if val is not None:
+                    hubmap_extra[key] = val
+
+            if hubmap_extra:
+                update_set["extra.hubmap"] = hubmap_extra
+
+            if update_set:
+                operations.append(UpdateOne({"_id": doc_id}, {"$set": update_set}))
+
+        if not operations:
+            return 0
+
+        result = await db.collection.bulk_write(operations, ordered=False)
+        return result.modified_count
+    finally:
+        client.close()
+
+
+@wool.routine
+async def _enrich_hubmap_subjects_batch(
+    doc_batch: list[tuple[object, str]],
+    shm_name: str,
+    shm_size: int,
+) -> int:
+    """Worker routine: enrich a batch of HuBMAP subjects and bulk_write to MongoDB."""
+    from pymongo import UpdateOne
+
+    donor_lookup: dict = read_shared(shm_name, shm_size)
+
+    client, db = _get_worker_db()
+    try:
+        operations = []
+        for doc_id, local_id in doc_batch:
+            matched_donor = None
+            for donor_uuid, donor_meta in donor_lookup.items():
+                if donor_uuid in local_id:
+                    matched_donor = donor_meta
+                    break
+
+            if not matched_donor:
+                continue
+
+            extra: dict = {}
+            for key in (
+                "age_value",
+                "age_unit",
+                "body_mass_index_value",
+                "body_mass_index_unit",
+                "cause_of_death",
+                "death_event",
+                "mechanism_of_injury",
+                "height_value",
+                "height_unit",
+                "weight_value",
+                "weight_unit",
+            ):
+                val = matched_donor.get(key)
+                if val is not None:
+                    if isinstance(val, list) and len(val) == 1:
+                        val = val[0]
+                    extra[key] = val
+
+            for key in ("sex", "race"):
+                val = matched_donor.get(key)
+                if val is not None:
+                    if isinstance(val, list) and len(val) == 1:
+                        val = val[0]
+                    extra[key] = val
+
+            for key in ("medical_history", "social_history"):
+                val = matched_donor.get(key)
+                if isinstance(val, list) and val:
+                    extra[key] = val
+
+            if extra:
+                operations.append(
+                    UpdateOne({"_id": doc_id}, {"$set": {"extra.hubmap": extra}})
+                )
+
+        if not operations:
+            return 0
+
+        result = await db.subject.bulk_write(operations, ordered=False)
+        return result.modified_count
+    finally:
+        client.close()
 
 
 async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
@@ -392,73 +595,43 @@ async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
     1. Stores dataset-level metadata on collection.extra.hubmap
     2. Stores donor demographics on subject.extra.hubmap
     """
-    from pymongo import UpdateOne
-
     from cfdb.services.hubmap import fetch_dataset_metadata_bulk
 
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Single bulk fetch for all datasets
     dataset_metadata = await fetch_dataset_metadata_bulk()
     logger.info(f"HuBMAP enrichment: {len(dataset_metadata)} dataset entries fetched")
 
     # --- Collection enrichment ---
-    collection_ops = []
+    coll_pairs: list[tuple[object, str]] = []
     cursor = api.db.collection.find(
         {"submission": "hubmap"},
         {"_id": 1, "persistent_id": 1},
     )
     async for doc in cursor:
         persistent_id = doc.get("persistent_id", "")
-        meta = dataset_metadata.get(persistent_id)
-        if not meta:
-            continue
+        if persistent_id:
+            coll_pairs.append((doc["_id"], persistent_id))
 
-        update_set: dict = {}
-
-        # Promoted to Collection top-level
-        dataset_type = meta.get("dataset_type")
-        if dataset_type is not None:
-            update_set["experiment_type"] = dataset_type
-        analyte_class = meta.get("analyte_class")
-        if analyte_class is not None:
-            update_set["analyte_class"] = analyte_class
-
-        # HuBMAP-specific fields stay nested on extra.hubmap
-        hubmap_extra: dict = {}
-        for key in (
-            "pipeline",
-            "processing",
-            "group_name",
-            "visualization",
-            "vitessce_hints",
-            "metadata",
-        ):
-            val = meta.get(key)
-            if val is not None:
-                hubmap_extra[key] = val
-
-        if hubmap_extra:
-            update_set["extra.hubmap"] = hubmap_extra
-
-        if update_set:
-            collection_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": update_set})
-            )
-
-    if collection_ops:
-        total_modified = 0
-        for i in range(0, len(collection_ops), BATCH_SIZE):
-            batch = collection_ops[i : i + BATCH_SIZE]
-            result = await api.db.collection.bulk_write(batch, ordered=False)
-            total_modified += result.modified_count
-        logger.info(f"HuBMAP collection enrichment: updated {total_modified} collections")
+    if coll_pairs:
+        shm_name, shm_size = write_shared(dataset_metadata)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for i in range(0, len(coll_pairs), BATCH_SIZE):
+                    batch = coll_pairs[i : i + BATCH_SIZE]
+                    tg.create_task(
+                        _enrich_hubmap_collections_batch(batch, shm_name, shm_size)
+                    )
+        finally:
+            cleanup_shared(shm_name)
+        logger.info(
+            f"HuBMAP collection enrichment: {len(coll_pairs)} collections processed"
+        )
     else:
         logger.warning("HuBMAP collection enrichment: no updates to apply")
 
     # --- Subject enrichment ---
-    # Build donor_uuid -> donor_metadata lookup from the bulk fetch
     donor_lookup: dict[str, dict] = {}
     for meta in dataset_metadata.values():
         donor_uuid = meta.get("donor_uuid")
@@ -470,71 +643,30 @@ async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
         logger.info("HuBMAP subject enrichment: no donor metadata available")
         return dataset_metadata
 
-    # Match subjects by local_id containing the donor UUID (HuBMAP C2M2 uses
-    # donor UUID as part of the subject local_id)
-    subject_ops = []
+    subj_pairs: list[tuple[object, str]] = []
     cursor = api.db.subject.find(
         {"submission": "hubmap"},
         {"_id": 1, "local_id": 1},
     )
     async for doc in cursor:
         local_id = doc.get("local_id", "")
-        # Try to match donor UUID in the subject local_id
-        matched_donor = None
-        for donor_uuid, donor_meta in donor_lookup.items():
-            if donor_uuid in local_id:
-                matched_donor = donor_meta
-                break
+        if local_id:
+            subj_pairs.append((doc["_id"], local_id))
 
-        if not matched_donor:
-            continue
-
-        extra: dict = {}
-        for key in (
-            "age_value",
-            "age_unit",
-            "body_mass_index_value",
-            "body_mass_index_unit",
-            "cause_of_death",
-            "death_event",
-            "mechanism_of_injury",
-            "height_value",
-            "height_unit",
-            "weight_value",
-            "weight_unit",
-        ):
-            val = matched_donor.get(key)
-            if val is not None:
-                # HuBMAP returns single-element lists for some fields
-                if isinstance(val, list) and len(val) == 1:
-                    val = val[0]
-                extra[key] = val
-
-        # String list fields
-        for key in ("sex", "race"):
-            val = matched_donor.get(key)
-            if val is not None:
-                if isinstance(val, list) and len(val) == 1:
-                    val = val[0]
-                extra[key] = val
-
-        for key in ("medical_history", "social_history"):
-            val = matched_donor.get(key)
-            if isinstance(val, list) and val:
-                extra[key] = val
-
-        if extra:
-            subject_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": {"extra.hubmap": extra}})
-            )
-
-    if subject_ops:
-        total_modified = 0
-        for i in range(0, len(subject_ops), BATCH_SIZE):
-            batch = subject_ops[i : i + BATCH_SIZE]
-            result = await api.db.subject.bulk_write(batch, ordered=False)
-            total_modified += result.modified_count
-        logger.info(f"HuBMAP subject enrichment: updated {total_modified} subjects")
+    if subj_pairs:
+        shm_name, shm_size = write_shared(donor_lookup)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for i in range(0, len(subj_pairs), BATCH_SIZE):
+                    batch = subj_pairs[i : i + BATCH_SIZE]
+                    tg.create_task(
+                        _enrich_hubmap_subjects_batch(batch, shm_name, shm_size)
+                    )
+        finally:
+            cleanup_shared(shm_name)
+        logger.info(
+            f"HuBMAP subject enrichment: {len(subj_pairs)} subjects processed"
+        )
     else:
         logger.warning("HuBMAP subject enrichment: no updates to apply")
 
@@ -783,6 +915,21 @@ async def _enrich_hubmap_files(dataset_metadata: dict[str, dict]) -> None:
     )
 
 
+@wool.routine
+async def _transform_encode_batch(rows: list[dict]) -> int:
+    """Worker routine: transform ENCODE rows to C2M2 and insert into MongoDB."""
+    from cfdb.services.encode import transform_to_c2m2
+
+    client, db = _get_worker_db()
+    try:
+        docs = [d for r in rows if (d := transform_to_c2m2(r)) is not None]
+        if docs:
+            await db.files.insert_many(docs)
+        return len(docs)
+    finally:
+        client.close()
+
+
 async def _sync_encode(task: SyncTask) -> None:
     """
     Sync ENCODE data from REST API.
@@ -793,7 +940,6 @@ async def _sync_encode(task: SyncTask) -> None:
     from cfdb.services.encode import (
         build_encode_dcc_record,
         fetch_encode_metadata,
-        transform_to_c2m2,
     )
 
     if api.db is None:
@@ -824,29 +970,21 @@ async def _sync_encode(task: SyncTask) -> None:
         task.progress = "Fetching files from ENCODE API..."
         logger.info(task.progress)
 
-        batch = []
+        batch: list[dict] = []
         count = 0
 
-        async for encode_file in fetch_encode_metadata():
-            # Transform to C2M2 format
-            doc = transform_to_c2m2(encode_file)
-            if doc is None:
-                continue
+        async with asyncio.TaskGroup() as tg:
+            async for encode_file in fetch_encode_metadata():
+                batch.append(encode_file)
+                count += 1
+                if len(batch) >= BATCH_SIZE:
+                    tg.create_task(_transform_encode_batch(list(batch)))
+                    task.progress = f"Dispatched {count} ENCODE files..."
+                    logger.info(task.progress)
+                    batch.clear()
 
-            batch.append(doc)
-            count += 1
-
-            # Insert in batches
-            if len(batch) >= BATCH_SIZE:
-                await api.db.files.insert_many(batch)
-                task.progress = f"Inserted {count} ENCODE files..."
-                logger.info(task.progress)
-                batch.clear()
-
-        # Insert remaining batch
-        if batch:
-            await api.db.files.insert_many(batch)
-            logger.info(f"Inserted final batch, total: {count} ENCODE files")
+            if batch:
+                tg.create_task(_transform_encode_batch(list(batch)))
 
     task.progress = f"ENCODE sync complete: {count} files"
     logger.info(task.progress)
@@ -890,24 +1028,50 @@ async def _clear_dcc_data_async(submission: str) -> None:
 
     collection_names = await api.db.list_collection_names()
 
-    for collection_name in collection_names:
+    async def _delete_from(name: str) -> None:
         try:
-            result = await api.db[collection_name].delete_many(
-                {"submission": submission}
-            )
+            result = await api.db[name].delete_many({"submission": submission})
             if result.deleted_count > 0:
-                logger.info(
-                    f"Deleted {result.deleted_count} records from {collection_name}"
-                )
+                logger.info(f"Deleted {result.deleted_count} records from {name}")
         except Exception as e:
-            logger.warning(f"Failed to delete from {collection_name}: {e}")
+            logger.warning(f"Failed to delete from {name}: {e}")
+
+    await asyncio.gather(*[_delete_from(n) for n in collection_names])
+
+
+@wool.routine
+async def _load_file(filepath_str: str, submission: str) -> tuple[str, int]:
+    """Parse a CSV/TSV file and insert records into MongoDB from a worker."""
+    import csv
+    from copy import copy
+    from pathlib import Path
+
+    filepath = Path(filepath_str)
+    client, db = _get_worker_db()
+    try:
+        delimiter = "," if filepath.suffix == ".csv" else "\t"
+        table = filepath.stem
+        batch: list[dict] = []
+        count = 0
+        with open(filepath, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f, delimiter=delimiter):
+                count += 1
+                record = {**row, "submission": submission, "table": table}
+                if submission == "4dn" and table == "file":
+                    record["data_access_level"] = "public"
+                batch.append(record)
+                if len(batch) >= BATCH_SIZE:
+                    await db[table].insert_many(copy(batch))
+                    batch.clear()
+            if batch:
+                await db[table].insert_many(copy(batch))
+        return table, count
+    finally:
+        client.close()
 
 
 async def _load_dataset_async(directory: Path, submission: str) -> None:
-    """Load CSV/TSV files into MongoDB using async Motor client."""
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
+    """Load CSV/TSV files into MongoDB using worker-pool fan-out."""
     # Handle nested directories from ZIP extraction
     # Look for CSV/TSV files, checking subdirectories if needed
     files_to_load = [f for f in directory.iterdir() if f.suffix in (".csv", ".tsv")]
@@ -923,31 +1087,6 @@ async def _load_dataset_async(directory: Path, submission: str) -> None:
                     break
     logger.info(f"Loading {len(files_to_load)} files into database")
 
-    for filepath in files_to_load:
-        delimiter = "," if filepath.suffix == ".csv" else "\t"
-        table = filepath.stem
-
-        batch = []
-        count = 0
-
-        with open(filepath, "r", encoding="utf-8") as file:
-            reader = csv.DictReader(file, delimiter=delimiter)
-
-            for row in reader:
-                count += 1
-                record = {**row, "submission": submission, "table": table}
-
-                # Mark 4DN files as public
-                if submission == "4dn" and table == "file":
-                    record["data_access_level"] = "public"
-
-                batch.append(record)
-
-                if len(batch) >= BATCH_SIZE:
-                    await api.db[table].insert_many(copy(batch))
-                    batch.clear()
-
-            if batch:
-                await api.db[table].insert_many(copy(batch))
-
-        logger.info(f"Loaded {count} records into {table}")
+    async with asyncio.TaskGroup() as tg:
+        for filepath in files_to_load:
+            tg.create_task(_load_file(str(filepath), submission))

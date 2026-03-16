@@ -207,3 +207,23 @@ def mock_db(monkeypatch):
     db = FakeDB()
     monkeypatch.setattr(api, "db", db)
     return db
+
+
+@pytest.fixture()
+def no_dispatch():
+    """Disable wool dispatch so routines run locally without a WorkerPool."""
+    from wool.runtime.routine.task import do_dispatch
+
+    with do_dispatch(False):
+        yield
+
+
+@pytest.fixture()
+def worker_db(mocker):
+    """Patch _get_worker_db to return a FakeDB instead of a real Motor client."""
+    db = FakeDB()
+    mocker.patch(
+        "cfdb.services.sync._get_worker_db",
+        return_value=(mocker.MagicMock(), db),
+    )
+    return db
