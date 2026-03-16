@@ -147,7 +147,7 @@ async def get_sync_task(task_id: str) -> Optional[dict]:
 
 async def acquire_cutover_lock(dcc: str) -> None:
     """
-    Acquire the cutover lock, blocking API requests.
+    Acquire a per-DCC cutover lock, blocking API requests.
 
     Args:
         dcc: The DCC being updated during cutover.
@@ -155,8 +155,9 @@ async def acquire_cutover_lock(dcc: str) -> None:
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
+    lock_id = f"cutover:{dcc}"
     await api.db[LOCKS_COLLECTION].update_one(
-        {"_id": CUTOVER_LOCK_ID},
+        {"_id": lock_id},
         {
             "$set": {
                 "active": True,
@@ -169,16 +170,17 @@ async def acquire_cutover_lock(dcc: str) -> None:
     logger.info(f"Acquired cutover lock for {dcc}")
 
 
-async def release_cutover_lock() -> None:
-    """Release the cutover lock, allowing API requests to proceed."""
+async def release_cutover_lock(dcc: str) -> None:
+    """Release the per-DCC cutover lock, allowing API requests to proceed."""
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
+    lock_id = f"cutover:{dcc}"
     await api.db[LOCKS_COLLECTION].update_one(
-        {"_id": CUTOVER_LOCK_ID},
+        {"_id": lock_id},
         {"$set": {"active": False, "completed_at": datetime.utcnow()}},
     )
-    logger.info("Released cutover lock")
+    logger.info(f"Released cutover lock for {dcc}")
 
 
 async def wait_for_cutover() -> None:
@@ -197,9 +199,11 @@ async def wait_for_cutover() -> None:
     start_time = asyncio.get_event_loop().time()
 
     while True:
-        lock = await api.db[LOCKS_COLLECTION].find_one({"_id": CUTOVER_LOCK_ID})
+        lock = await api.db[LOCKS_COLLECTION].find_one(
+            {"_id": {"$regex": "^cutover:"}, "active": True}
+        )
 
-        if not lock or not lock.get("active"):
+        if not lock:
             return
 
         elapsed = asyncio.get_event_loop().time() - start_time
@@ -212,7 +216,7 @@ async def wait_for_cutover() -> None:
 
 
 class CutoverLock:
-    """Async context manager for cutover lock."""
+    """Async context manager for per-DCC cutover lock."""
 
     def __init__(self, dcc: str):
         self.dcc = dcc
@@ -222,5 +226,5 @@ class CutoverLock:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await release_cutover_lock()
+        await release_cutover_lock(self.dcc)
         return False
