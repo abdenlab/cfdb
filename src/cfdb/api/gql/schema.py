@@ -1,4 +1,4 @@
-import pprint
+import asyncio
 from typing import List, Optional
 
 import strawberry
@@ -53,7 +53,6 @@ class Query:
 
         assert api.db is not None
         query = to_query(to_dict(input)) if input else {}
-        print(pprint.pformat(query))
 
         skip = page * page_size
         files = (
@@ -95,11 +94,13 @@ class Query:
         assert api.db is not None
         query = to_query(to_dict(input)) if input else {}
 
-        results = []
-        for field in fields:
-            values = await api.db.files.distinct(field, query)
-            results.append(DistinctFieldType(field=field, values=values))
-        return results
+        all_values = await asyncio.gather(
+            *(api.db.files.distinct(field, query) for field in fields)
+        )
+        return [
+            DistinctFieldType(field=field, values=values)
+            for field, values in zip(fields, all_values)
+        ]
 
 
 schema = strawberry.Schema(query=Query)
