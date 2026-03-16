@@ -18,6 +18,12 @@ class ObjectIdScalar:
     ...
 
 
+@strawberry.type
+class DistinctFieldType:
+    field: str
+    values: strawberry.scalars.JSON
+
+
 def _is_dict_type(t):
     """Check if a type is dict or a parameterized dict (dict[K, V])."""
     return t is dict or getattr(t, "__origin__", None) is dict

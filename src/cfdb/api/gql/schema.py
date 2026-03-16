@@ -10,6 +10,7 @@ from cfdb.api.gql.inputs import (
     to_query,
 )
 from cfdb.api.gql.types import (
+    DistinctFieldType,
     FileMetadataType,
     ObjectIdScalar,
 )
@@ -81,6 +82,24 @@ class Query:
                 FileMetadataType, FileMetadataModel(**file).model_dump()
             )
         return None
+
+    @strawberry.field
+    async def distinct_values(
+        self,
+        _: strawberry.Info,
+        fields: list[str],
+        input: list[FileMetadataInput] | None = None,
+    ) -> List[DistinctFieldType]:
+        await locks.wait_for_cutover()
+
+        assert api.db is not None
+        query = to_query(to_dict(input)) if input else {}
+
+        results = []
+        for field in fields:
+            values = await api.db.files.distinct(field, query)
+            results.append(DistinctFieldType(field=field, values=values))
+        return results
 
 
 schema = strawberry.Schema(query=Query)
