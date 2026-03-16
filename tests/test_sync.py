@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bson import ObjectId
 
 from cfdb.services.sync import (
     _clear_dcc_data_async,
@@ -87,6 +89,137 @@ class TestSharedMemoryExchange:
             assert r2 == data
         finally:
             cleanup_shared(name)
+
+
+# ---------------------------------------------------------------------------
+# Routine argument serialization (pickle round-trip)
+# ---------------------------------------------------------------------------
+
+
+def _roundtrip(*args):
+    """Pickle-serialize and deserialize each arg, return as tuple."""
+    return tuple(pickle.loads(pickle.dumps(a)) for a in args)
+
+
+class TestRoutineArgumentSerialization:
+    def test_load_file_args(self, tmp_path):
+        """
+        GIVEN realistic _load_file arguments (filepath string, submission)
+        WHEN pickled and unpickled
+        THEN they survive the round-trip unchanged
+        """
+        filepath_str = str(tmp_path / "file.csv")
+        submission = "4dn"
+        rt_path, rt_sub = _roundtrip(filepath_str, submission)
+        assert rt_path == filepath_str
+        assert rt_sub == submission
+
+    def test_enrich_4dn_files_batch_args(self):
+        """
+        GIVEN realistic _enrich_4dn_files_batch arguments (ObjectId doc batch,
+              shared memory name, size)
+        WHEN pickled and unpickled
+        THEN they survive the round-trip unchanged
+        """
+        doc_batch = [(ObjectId(), "4DNFI000001"), (ObjectId(), "4DNFI000002")]
+        shm_name = "psm_test123"
+        shm_size = 4096
+        rt_batch, rt_name, rt_size = _roundtrip(doc_batch, shm_name, shm_size)
+        assert rt_batch == doc_batch
+        assert rt_name == shm_name
+        assert rt_size == shm_size
+
+    def test_enrich_4dn_collections_batch_args(self):
+        """
+        GIVEN realistic _enrich_4dn_collections_batch arguments
+        WHEN pickled and unpickled
+        THEN they survive the round-trip unchanged
+        """
+        doc_batch = [(ObjectId(), "4DNES000001")]
+        shm_name = "psm_exp"
+        shm_size = 2048
+        rt_batch, rt_name, rt_size = _roundtrip(doc_batch, shm_name, shm_size)
+        assert rt_batch == doc_batch
+        assert rt_name == shm_name
+        assert rt_size == shm_size
+
+    def test_enrich_hubmap_collections_batch_args(self):
+        """
+        GIVEN realistic _enrich_hubmap_collections_batch arguments
+        WHEN pickled and unpickled
+        THEN they survive the round-trip unchanged
+        """
+        doc_batch = [(ObjectId(), "https://doi.org/10.35079/HBM123")]
+        shm_name = "psm_hubmap"
+        shm_size = 8192
+        rt_batch, rt_name, rt_size = _roundtrip(doc_batch, shm_name, shm_size)
+        assert rt_batch == doc_batch
+        assert rt_name == shm_name
+        assert rt_size == shm_size
+
+    def test_enrich_hubmap_subjects_batch_args(self):
+        """
+        GIVEN realistic _enrich_hubmap_subjects_batch arguments
+        WHEN pickled and unpickled
+        THEN they survive the round-trip unchanged
+        """
+        doc_batch = [(ObjectId(), "prefix-uuid-abc-suffix")]
+        shm_name = "psm_donor"
+        shm_size = 1024
+        rt_batch, rt_name, rt_size = _roundtrip(doc_batch, shm_name, shm_size)
+        assert rt_batch == doc_batch
+        assert rt_name == shm_name
+        assert rt_size == shm_size
+
+    def test_transform_encode_batch_args(self):
+        """
+        GIVEN realistic _transform_encode_batch arguments (list of ENCODE row dicts)
+        WHEN pickled and unpickled
+        THEN they survive the round-trip unchanged
+        """
+        rows = [
+            {"accession": "ENCFF001AAA", "assembly": "GRCh38", "file_type": "bam"},
+            {"accession": "ENCFF002BBB", "assembly": "GRCh38", "file_type": "bigWig"},
+        ]
+        (rt_rows,) = _roundtrip(rows)
+        assert rt_rows == rows
+
+    def test_shared_memory_payload_for_4dn_files(self):
+        """
+        GIVEN the shared memory payload structure used by _enrich_4dn_files_batch
+        WHEN pickled and unpickled
+        THEN it survives the round-trip unchanged
+        """
+        payload = {
+            "file_metadata": {
+                "4DNFI000001": {
+                    "genome_assembly": "GRCh38",
+                    "file_type": "bam",
+                    "biosource_name": "H1-hESC",
+                    "replicate_info": "Biorep 1 Techrep 1",
+                }
+            },
+            "biosource_tiers": {"H1-hESC": "Tier 1"},
+        }
+        (rt_payload,) = _roundtrip(payload)
+        assert rt_payload == payload
+
+    def test_shared_memory_payload_for_hubmap_donors(self):
+        """
+        GIVEN the donor_lookup payload structure used by _enrich_hubmap_subjects_batch
+        WHEN pickled and unpickled
+        THEN it survives the round-trip, including single-element lists
+        """
+        payload = {
+            "uuid-abc-123": {
+                "age_value": [55],
+                "sex": ["Male"],
+                "race": ["White"],
+                "medical_history": ["diabetes", "hypertension"],
+            }
+        }
+        (rt_payload,) = _roundtrip(payload)
+        assert rt_payload == payload
 
 
 # ---------------------------------------------------------------------------
