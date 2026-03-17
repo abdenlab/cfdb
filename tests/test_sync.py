@@ -20,7 +20,6 @@ from cfdb.services.sync import (
     _enrich_hubmap_files,
     _enrich_hubmap_subjects_batch,
     _load_dataset_async,
-    _load_file,
     _prune_non_public_hubmap_raw_records,
     _transform_encode_batch,
     cleanup_shared,
@@ -102,18 +101,6 @@ def _roundtrip(*args):
 
 
 class TestRoutineArgumentSerialization:
-    def test_load_file_args(self, tmp_path):
-        """
-        GIVEN realistic _load_file arguments (filepath string, submission)
-        WHEN pickled and unpickled
-        THEN they survive the round-trip unchanged
-        """
-        filepath_str = str(tmp_path / "file.csv")
-        submission = "4dn"
-        rt_path, rt_sub = _roundtrip(filepath_str, submission)
-        assert rt_path == filepath_str
-        assert rt_sub == submission
-
     def test_enrich_4dn_files_batch_args(self):
         """
         GIVEN realistic _enrich_4dn_files_batch arguments (ObjectId doc batch,
@@ -269,83 +256,59 @@ class TestClearDccDataAsync:
 
 
 # ---------------------------------------------------------------------------
-# _load_file
-# ---------------------------------------------------------------------------
-
-
-class TestLoadFile:
-    @pytest.mark.asyncio
-    async def test_load_file_with_csv(self, tmp_path, no_dispatch, worker_db):
-        """
-        GIVEN a 3-row CSV file
-        WHEN _load_file is called
-        THEN records are inserted with submission and table fields
-        """
-        csv_file = tmp_path / "sample.csv"
-        csv_file.write_text("col_a,col_b\n1,2\n3,4\n5,6\n")
-
-        table, count = await _load_file(str(csv_file), "test_dcc")
-
-        assert table == "sample"
-        assert count == 3
-        assert len(worker_db.sample.docs) == 3
-        assert worker_db.sample.docs[0]["submission"] == "test_dcc"
-        assert worker_db.sample.docs[0]["table"] == "sample"
-
-    @pytest.mark.asyncio
-    async def test_load_file_with_tsv(self, tmp_path, no_dispatch, worker_db):
-        """
-        GIVEN a TSV file
-        WHEN _load_file is called
-        THEN the tab delimiter is used correctly
-        """
-        tsv_file = tmp_path / "data.tsv"
-        tsv_file.write_text("x\ty\na\tb\n")
-
-        table, count = await _load_file(str(tsv_file), "dcc")
-
-        assert table == "data"
-        assert count == 1
-        assert worker_db.data.docs[0]["x"] == "a"
-        assert worker_db.data.docs[0]["y"] == "b"
-
-    @pytest.mark.asyncio
-    async def test_load_file_marks_4dn_files_as_public(self, tmp_path, no_dispatch, worker_db):
-        """
-        GIVEN a CSV named "file.csv" with submission "4dn"
-        WHEN _load_file is called
-        THEN records get data_access_level set to "public"
-        """
-        csv_file = tmp_path / "file.csv"
-        csv_file.write_text("id\n1\n")
-
-        await _load_file(str(csv_file), "4dn")
-
-        assert worker_db.file.docs[0]["data_access_level"] == "public"
-
-    @pytest.mark.asyncio
-    async def test_load_file_returns_table_and_count(self, tmp_path, no_dispatch, worker_db):
-        """
-        GIVEN a CSV file with 2 rows
-        WHEN _load_file is called
-        THEN it returns (table_name, row_count)
-        """
-        csv_file = tmp_path / "items.csv"
-        csv_file.write_text("name\nalpha\nbeta\n")
-
-        result = await _load_file(str(csv_file), "dcc")
-
-        assert result == ("items", 2)
-
-
-# ---------------------------------------------------------------------------
 # _load_dataset_async
 # ---------------------------------------------------------------------------
 
 
 class TestLoadDatasetAsync:
     @pytest.mark.asyncio
-    async def test_load_dataset_async_with_multiple_files(self, tmp_path, no_dispatch, worker_db):
+    async def test_load_dataset_async_with_csv(self, tmp_path, mock_db):
+        """
+        GIVEN a directory with a 3-row CSV file
+        WHEN _load_dataset_async is called
+        THEN records are inserted with submission and table fields
+        """
+        csv_file = tmp_path / "sample.csv"
+        csv_file.write_text("col_a,col_b\n1,2\n3,4\n5,6\n")
+
+        await _load_dataset_async(tmp_path, "test_dcc")
+
+        assert len(mock_db.sample.docs) == 3
+        assert mock_db.sample.docs[0]["submission"] == "test_dcc"
+        assert mock_db.sample.docs[0]["table"] == "sample"
+
+    @pytest.mark.asyncio
+    async def test_load_dataset_async_with_tsv(self, tmp_path, mock_db):
+        """
+        GIVEN a directory with a TSV file
+        WHEN _load_dataset_async is called
+        THEN the tab delimiter is used correctly
+        """
+        tsv_file = tmp_path / "data.tsv"
+        tsv_file.write_text("x\ty\na\tb\n")
+
+        await _load_dataset_async(tmp_path, "dcc")
+
+        assert len(mock_db.data.docs) == 1
+        assert mock_db.data.docs[0]["x"] == "a"
+        assert mock_db.data.docs[0]["y"] == "b"
+
+    @pytest.mark.asyncio
+    async def test_load_dataset_async_marks_4dn_files_as_public(self, tmp_path, mock_db):
+        """
+        GIVEN a CSV named "file.csv" with submission "4dn"
+        WHEN _load_dataset_async is called
+        THEN records get data_access_level set to "public"
+        """
+        csv_file = tmp_path / "file.csv"
+        csv_file.write_text("id\n1\n")
+
+        await _load_dataset_async(tmp_path, "4dn")
+
+        assert mock_db.file.docs[0]["data_access_level"] == "public"
+
+    @pytest.mark.asyncio
+    async def test_load_dataset_async_with_multiple_files(self, tmp_path, mock_db):
         """
         GIVEN a directory with multiple CSV files
         WHEN _load_dataset_async is called
@@ -356,11 +319,11 @@ class TestLoadDatasetAsync:
 
         await _load_dataset_async(tmp_path, "dcc")
 
-        assert len(worker_db.a.docs) == 1
-        assert len(worker_db.b.docs) == 1
+        assert len(mock_db.a.docs) == 1
+        assert len(mock_db.b.docs) == 1
 
     @pytest.mark.asyncio
-    async def test_load_dataset_async_with_nested_directory(self, tmp_path, no_dispatch, worker_db):
+    async def test_load_dataset_async_with_nested_directory(self, tmp_path, mock_db):
         """
         GIVEN a directory with CSV files in a subdirectory
         WHEN _load_dataset_async is called
@@ -372,7 +335,7 @@ class TestLoadDatasetAsync:
 
         await _load_dataset_async(tmp_path, "dcc")
 
-        assert len(worker_db.c.docs) == 1
+        assert len(mock_db.c.docs) == 1
 
 
 # ---------------------------------------------------------------------------
