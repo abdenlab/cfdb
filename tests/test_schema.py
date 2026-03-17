@@ -149,9 +149,9 @@ class TestDistinctValuesQuery:
         """Test distinct values for multiple fields in one call.
 
         Given:
-            Three files spanning two DCCs and two submissions
+            Three files spanning two DCCs and two abbreviations
         When:
-            The distinctValues query is executed with fields: ["dcc.dcc_name", "submission"]
+            The distinctValues query is executed with fields: ["dcc.dcc_name", "dcc.dcc_abbreviation"]
         Then:
             It should return two entries, each with the correct distinct values
         """
@@ -167,7 +167,7 @@ class TestDistinctValuesQuery:
         result = await schema.execute(
             """
             query {
-                distinctValues(fields: ["dcc.dcc_name", "submission"]) {
+                distinctValues(fields: ["dcc.dcc_name", "dcc.dcc_abbreviation"]) {
                     field
                     values
                 }
@@ -181,7 +181,7 @@ class TestDistinctValuesQuery:
         assert len(entries) == 2
         by_field = {e["field"]: e["values"] for e in entries}
         assert sorted(by_field["dcc.dcc_name"]) == ["4DN", "HuBMAP"]
-        assert sorted(by_field["submission"]) == ["4dn", "hubmap"]
+        assert sorted(by_field["dcc.dcc_abbreviation"]) == ["4dn", "hubmap"]
 
     @pytest.mark.asyncio
     async def test_distinct_values_applies_input_filter(self, mock_db, mocker):
@@ -190,9 +190,9 @@ class TestDistinctValuesQuery:
         Given:
             Three files, two from HuBMAP and one from 4DN
         When:
-            The distinctValues query is executed with a DCC filter for HuBMAP and fields: ["local_id"]
+            The distinctValues query is executed with a DCC filter for HuBMAP and fields: ["dcc.dcc_abbreviation"]
         Then:
-            It should return only the local IDs from HuBMAP files
+            It should return only the abbreviations from HuBMAP files
         """
         # Arrange
         mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
@@ -207,7 +207,7 @@ class TestDistinctValuesQuery:
             """
             query {
                 distinctValues(
-                    fields: ["local_id"]
+                    fields: ["dcc.dcc_abbreviation"]
                     input: [{ dcc: [{ dccName: ["HuBMAP"] }] }]
                 ) {
                     field
@@ -220,7 +220,7 @@ class TestDistinctValuesQuery:
         # Assert
         assert result.errors is None
         entry = result.data["distinctValues"][0]
-        assert sorted(entry["values"]) == ["h1", "h2"]
+        assert entry["values"] == ["hubmap"]
 
     @pytest.mark.asyncio
     async def test_distinct_values_returns_empty_list_for_missing_field(
@@ -229,9 +229,9 @@ class TestDistinctValuesQuery:
         """Test distinct values for a field absent from all documents.
 
         Given:
-            Three files, none with a persistent_id value
+            Three files, none with a compression_format value
         When:
-            The distinctValues query is executed with fields: ["persistent_id"]
+            The distinctValues query is executed with fields: ["compression_format"]
         Then:
             It should return one entry with an empty values list
         """
@@ -247,7 +247,7 @@ class TestDistinctValuesQuery:
         result = await schema.execute(
             """
             query {
-                distinctValues(fields: ["persistent_id"]) {
+                distinctValues(fields: ["compression_format"]) {
                     field
                     values
                 }
@@ -329,3 +329,33 @@ class TestDistinctValuesQuery:
         assert result.errors is None
         entry = result.data["distinctValues"][0]
         assert sorted(entry["values"]) == ["4DN", "HuBMAP"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_rejects_disallowed_field(self, mock_db, mocker):
+        """Test that fields outside the allowlist are rejected.
+
+        Given:
+            A request for a field not in ALLOWED_DISTINCT_FIELDS
+        When:
+            The distinctValues query is executed with fields: ["secret_field"]
+        Then:
+            It should return an error naming the disallowed field
+        """
+        # Arrange
+        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["secret_field"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert "secret_field" in result.errors[0].message

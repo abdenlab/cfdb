@@ -18,6 +18,25 @@ from cfdb.models import FileMetadataModel
 from cfdb.services import locks
 
 
+ALLOWED_DISTINCT_FIELDS: frozenset[str] = frozenset(
+    {
+        "dcc.dcc_name",
+        "dcc.dcc_abbreviation",
+        "data_type",
+        "assay_type",
+        "file_format",
+        "compression_format",
+        "mime_type",
+        "analysis_type",
+        "genome_assembly",
+        "genome_annotation",
+        "output_type",
+        "status",
+        "data_access_level",
+    }
+)
+
+
 def from_pydantic(gql_type, obj):
     if obj is None:
         return obj
@@ -89,6 +108,12 @@ class Query:
         fields: list[str],
         input: list[FileMetadataInput] | None = None,
     ) -> List[DistinctFieldType]:
+        disallowed = set(fields) - ALLOWED_DISTINCT_FIELDS
+        if disallowed:
+            raise ValueError(
+                f"Field(s) not queryable: {', '.join(sorted(disallowed))}"
+            )
+
         await locks.wait_for_cutover()
 
         assert api.db is not None
