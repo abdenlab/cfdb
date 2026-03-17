@@ -1,0 +1,542 @@
+input AnatomyInput {
+  id: [String!] = null
+  name: [String!] = null
+  description: [String!] = null
+}
+
+type AnatomyType {
+  id: String!
+  name: String!
+  description: String
+}
+
+input AssayTypeInput {
+  id: [String!] = null
+  name: [String!] = null
+  description: [String!] = null
+}
+
+type AssayTypeType {
+  id: String!
+  name: String!
+  description: String
+}
+
+input BiosampleInput {
+  idNamespace: [String!] = null
+  localId: [String!] = null
+  projectIdNamespace: [String!] = null
+  projectLocalId: [String!] = null
+  persistentId: [String!] = null
+  creationTime: [String!] = null
+  samplePrepMethod: [String!] = null
+  anatomy: [AnatomyInput!] = null
+  biofluid: [String!] = null
+  subjects: [SubjectInput!] = null
+  extra: [EnrichedBiosampleInput!] = null
+}
+
+type BiosampleType {
+  idNamespace: String!
+  localId: String!
+  projectIdNamespace: String!
+  projectLocalId: String!
+  persistentId: String
+  creationTime: String
+  samplePrepMethod: String
+  anatomy: AnatomyType
+  biofluid: String
+  subjects: [SubjectType!]!
+  extra: EnrichedBiosampleType
+}
+
+input CollectionInput {
+  biosamples: [BiosampleInput!] = null
+  idNamespace: [String!] = null
+  localId: [String!] = null
+  persistentId: [String!] = null
+  creationTime: [String!] = null
+  abbreviation: [String!] = null
+  name: [String!] = null
+  description: [String!] = null
+  lab: [String!] = null
+  experimentType: [String!] = null
+  experimentTarget: [String!] = null
+  analyteClass: [String!] = null
+  anatomy: [AnatomyInput!] = null
+  subjects: [SubjectInput!] = null
+  extra: [EnrichedCollectionInput!] = null
+}
+
+type CollectionType {
+  biosamples: [BiosampleType!]!
+  idNamespace: String!
+  localId: String!
+  persistentId: String
+  creationTime: String
+  abbreviation: String
+  name: String!
+  description: String
+  lab: String
+  experimentType: String
+  experimentTarget: String
+  analyteClass: String
+  anatomy: [AnatomyType!]!
+  subjects: [SubjectType!]!
+  extra: EnrichedCollectionType
+}
+
+input DataTypeInput {
+  id: [String!] = null
+  name: [String!] = null
+  description: [String!] = null
+}
+
+type DataTypeType {
+  id: String!
+  name: String!
+  description: String
+}
+
+input DccInput {
+  id: [String!] = null
+  dccName: [String!] = null
+  dccAbbreviation: [String!] = null
+  dccDescription: [String!] = null
+  contactEmail: [String!] = null
+  contactName: [String!] = null
+  dccUrl: [String!] = null
+  projectIdNamespace: [String!] = null
+  projectLocalId: [String!] = null
+}
+
+type DccType {
+  id: String!
+  dccName: String!
+  dccAbbreviation: String!
+  dccDescription: String
+  contactEmail: String!
+  contactName: String!
+  dccUrl: String!
+  projectIdNamespace: String!
+  projectLocalId: String!
+}
+
+type DistinctFieldType {
+  field: String!
+  values: JSON!
+}
+
+input EnrichedBiosampleInput {
+  encode: [EnrichedEncodeBiosampleInput!] = null
+}
+
+type EnrichedBiosampleType {
+  encode: EnrichedEncodeBiosampleType
+}
+
+input EnrichedCollectionInput {
+  fourdn: [EnrichedFourdnCollectionInput!] = null
+  encode: [EnrichedEncodeCollectionInput!] = null
+  hubmap: [EnrichedHubmapCollectionInput!] = null
+}
+
+type EnrichedCollectionType {
+  fourdn: EnrichedFourdnCollectionType
+  hubmap: EnrichedHubmapCollectionType
+  encode: EnrichedEncodeCollectionType
+}
+
+input EnrichedEncodeBiosampleInput {
+  biosampleType: [String!] = null
+  biosampleTreatments: [String!] = null
+  biosampleTreatmentsAmount: [String!] = null
+  biosampleTreatmentsDuration: [String!] = null
+  biosampleGeneticModifications: [String!] = null
+  libraryMadeFrom: [String!] = null
+  libraryDepletedIn: [String!] = null
+  libraryExtractionMethod: [String!] = null
+  libraryLysisMethod: [String!] = null
+  libraryCrosslinkingMethod: [String!] = null
+  libraryStrandSpecific: [String!] = null
+  libraryFragmentationMethod: [String!] = null
+  librarySizeRange: [String!] = null
+}
+
+type EnrichedEncodeBiosampleType {
+  biosampleType: String
+  biosampleTreatments: String
+  biosampleTreatmentsAmount: String
+  biosampleTreatmentsDuration: String
+  biosampleGeneticModifications: String
+  libraryMadeFrom: String
+  libraryDepletedIn: String
+  libraryExtractionMethod: String
+  libraryLysisMethod: String
+  libraryCrosslinkingMethod: String
+  libraryStrandSpecific: String
+  libraryFragmentationMethod: String
+  librarySizeRange: String
+}
+
+input EnrichedEncodeCollectionInput {
+  experimentTarget: [String!] = null
+  project: [String!] = null
+  platform: [String!] = null
+  dbxrefs: [String!] = null
+  rbnsProteinConcentration: [String!] = null
+}
+
+type EnrichedEncodeCollectionType {
+  project: String
+  platform: String
+  dbxrefs: String
+  rbnsProteinConcentration: String
+}
+
+input EnrichedEncodeFileInput {
+  assembly: [String!] = null
+  fileFormatType: [String!] = null
+  outputType: [String!] = null
+  genomeAnnotation: [String!] = null
+  controlledBy: [String!] = null
+  s3Uri: [String!] = null
+  azureUrl: [String!] = null
+  fileAnalysisTitle: [String!] = null
+  fileAnalysisStatus: [String!] = null
+  readLength: [String!] = null
+  mappedReadLength: [String!] = null
+  runType: [String!] = null
+  pairedEnd: [String!] = null
+  pairedWith: [String!] = null
+  indexOf: [String!] = null
+  derivedFrom: [String!] = null
+  auditWarning: [String!] = null
+  auditNotCompliant: [String!] = null
+  auditError: [String!] = null
+}
+
+type EnrichedEncodeFileType {
+  assembly: String
+  fileFormatType: String
+  outputType: String
+  genomeAnnotation: String
+  controlledBy: String
+  s3Uri: String
+  azureUrl: String
+  fileAnalysisTitle: String
+  fileAnalysisStatus: String
+  biologicalReplicates: String
+  technicalReplicates: String
+  readLength: String
+  mappedReadLength: String
+  runType: String
+  pairedEnd: String
+  pairedWith: String
+  indexOf: String
+  derivedFrom: String
+  auditWarning: String
+  auditNotCompliant: String
+  auditError: String
+}
+
+input EnrichedFileInput {
+  fourdn: [EnrichedFourdnFileInput!] = null
+  encode: [EnrichedEncodeFileInput!] = null
+  hubmap: [EnrichedHubmapFileInput!] = null
+}
+
+type EnrichedFileType {
+  fourdn: EnrichedFourdnFileType
+  encode: EnrichedEncodeFileType
+  hubmap: EnrichedHubmapFileType
+}
+
+input EnrichedFourdnCollectionInput {
+  displayTitle: [String!] = null
+  targetedFactor: [String!] = null
+  digestionEnzyme: [String!] = null
+  crosslinkingMethod: [String!] = null
+  crosslinkingTemperature: [String!] = null
+  crosslinkingTime: [String!] = null
+  ligationTemperature: [String!] = null
+  ligationVolume: [String!] = null
+  ligationTime: [String!] = null
+  digestionTemperature: [String!] = null
+  digestionTime: [String!] = null
+  taggingMethod: [String!] = null
+  fragmentationMethod: [String!] = null
+  biotinRemoved: [String!] = null
+  libraryPrepKit: [String!] = null
+  averageFragmentSize: [String!] = null
+  fragmentSizeRange: [String!] = null
+  status: [String!] = null
+  dateCreated: [String!] = null
+}
+
+type EnrichedFourdnCollectionType {
+  displayTitle: String
+  targetedFactor: [String!]
+  digestionEnzyme: String
+  crosslinkingMethod: String
+  crosslinkingTemperature: String
+  crosslinkingTime: String
+  ligationTemperature: String
+  ligationVolume: String
+  ligationTime: String
+  digestionTemperature: String
+  digestionTime: String
+  taggingMethod: String
+  fragmentationMethod: String
+  biotinRemoved: String
+  libraryPrepKit: String
+  averageFragmentSize: String
+  fragmentSizeRange: String
+  status: String
+  dateCreated: String
+}
+
+input EnrichedFourdnFileInput {
+  enrichedFileFormat: [String!] = null
+  genomeAssembly: [String!] = null
+  fileType: [String!] = null
+  fileTypeDetailed: [String!] = null
+  condition: [String!] = null
+  biosourceName: [String!] = null
+  dataset: [String!] = null
+  replicateInfo: [String!] = null
+  cellLineTier: [String!] = null
+}
+
+type EnrichedFourdnFileType {
+  enrichedFileFormat: String
+  genomeAssembly: String
+  fileType: String
+  fileTypeDetailed: String
+  condition: String
+  biosourceName: String
+  dataset: String
+  replicateInfo: String
+  cellLineTier: String
+  extraFiles: [ExtraFileType!]
+}
+
+input EnrichedHubmapCollectionInput {
+  datasetType: [String!] = null
+  pipeline: [String!] = null
+  processing: [String!] = null
+  groupName: [String!] = null
+  analyteClass: [String!] = null
+  visualization: [Boolean!] = null
+}
+
+type EnrichedHubmapCollectionType {
+  pipeline: String
+  processing: String
+  groupName: String
+  visualization: Boolean
+  vitessceHints: [String!]
+  metadata: JSON
+}
+
+input EnrichedHubmapFileInput {
+  genomeAssembly: [String!] = null
+  relPath: [String!] = null
+  isDataProduct: [Boolean!] = null
+}
+
+type EnrichedHubmapFileType {
+  genomeAssembly: String
+  relPath: String
+  isDataProduct: Boolean
+}
+
+type EnrichedHubmapSubjectType {
+  ageValue: Float
+  ageUnit: String
+  sex: String
+  race: String
+  bodyMassIndexValue: Float
+  bodyMassIndexUnit: String
+  causeOfDeath: String
+  deathEvent: String
+  mechanismOfInjury: String
+  medicalHistory: [String!]
+  socialHistory: [String!]
+  heightValue: Float
+  heightUnit: String
+  weightValue: Float
+  weightUnit: String
+}
+
+type EnrichedSubjectType {
+  hubmap: EnrichedHubmapSubjectType
+}
+
+type ExtraFileType {
+  href: String
+  md5sum: String
+  fileSize: Int
+  fileFormat: String
+}
+
+input FileFormatInput {
+  id: [String!] = null
+  name: [String!] = null
+  description: [String!] = null
+}
+
+type FileFormatType {
+  id: String!
+  name: String!
+  description: String
+}
+
+input FileMetadataInput {
+  dcc: [DccInput!] = null
+  collections: [CollectionInput!] = null
+  project: [ProjectInput!] = null
+  idNamespace: [String!] = null
+  localId: [String!] = null
+  projectIdNamespace: [String!] = null
+  projectLocalId: [String!] = null
+  persistentId: [String!] = null
+  creationTime: [String!] = null
+  sizeInBytes: [Int!] = null
+  sha256: [String!] = null
+  md5: [String!] = null
+  filename: [String!] = null
+  fileFormat: [FileFormatInput!] = null
+  compressionFormat: [String!] = null
+  dataType: [DataTypeInput!] = null
+  assayType: [AssayTypeInput!] = null
+  analysisType: [String!] = null
+  mimeType: [String!] = null
+  bundleCollectionIdNamespace: [String!] = null
+  bundleCollectionLocalId: [String!] = null
+  dbgapStudyId: [String!] = null
+  accessUrl: [String!] = null
+  dataAccessLevel: [String!] = null
+  genomeAssembly: [String!] = null
+  genomeAnnotation: [String!] = null
+  outputType: [String!] = null
+  outputTypeDetail: [String!] = null
+  biologicalReplicates: [String!] = null
+  technicalReplicates: [String!] = null
+  assayInfo: [String!] = null
+  condition: [String!] = null
+  extra: [EnrichedFileInput!] = null
+}
+
+type FileMetadataType {
+  dcc: DccType!
+  collections: [CollectionType!]!
+  project: ProjectType
+  idNamespace: String!
+  localId: String!
+  projectIdNamespace: String!
+  projectLocalId: String!
+  persistentId: String
+  creationTime: String
+  sizeInBytes: Int
+  sha256: String
+  md5: String
+  filename: String!
+  fileFormat: FileFormatType
+  compressionFormat: String
+  dataType: DataTypeType
+  assayType: AssayTypeType
+  analysisType: String
+  mimeType: String
+  bundleCollectionIdNamespace: String
+  bundleCollectionLocalId: String
+  dbgapStudyId: String
+  accessUrl: String
+  status: String
+  dataAccessLevel: String
+  genomeAssembly: String
+  genomeAnnotation: String
+  outputType: String
+  outputTypeDetail: String
+  biologicalReplicates: String
+  technicalReplicates: String
+  assayInfo: String
+  condition: String
+  extra: EnrichedFileType
+}
+
+"""
+The `JSON` scalar type represents JSON values as specified by [ECMA-404](https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf).
+"""
+scalar JSON @specifiedBy(url: "https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf")
+
+input NcbiTaxonomyInput {
+  id: [String!] = null
+  name: [String!] = null
+  clade: [String!] = null
+}
+
+type NcbiTaxonomyType {
+  id: String!
+  name: String!
+  clade: String
+  description: String
+}
+
+scalar ObjectIdScalar
+
+input ProjectInput {
+  idNamespace: [String!] = null
+  localId: [String!] = null
+  name: [String!] = null
+  abbreviation: [String!] = null
+  description: [String!] = null
+}
+
+type ProjectType {
+  idNamespace: String!
+  localId: String!
+  name: String!
+  abbreviation: String
+  description: String
+  persistentId: String
+}
+
+type Query {
+  files(input: [FileMetadataInput!] = null, page: Int! = 0, pageSize: Int! = 25): [FileMetadataType!]!
+  file(id: ObjectIdScalar!): FileMetadataType
+  distinctValues(fields: [String!]!, input: [FileMetadataInput!] = null): [DistinctFieldType!]!
+}
+
+input SubjectInput {
+  idNamespace: [String!] = null
+  localId: [String!] = null
+  projectIdNamespace: [String!] = null
+  projectLocalId: [String!] = null
+  persistentId: [String!] = null
+  creationTime: [String!] = null
+  granularity: [String!] = null
+  sex: [String!] = null
+  ethnicity: [String!] = null
+  ageAtEnrollment: [Float!] = null
+  ageAtSampling: [Float!] = null
+  race: [String!] = null
+  taxonomy: [NcbiTaxonomyInput!] = null
+}
+
+type SubjectType {
+  idNamespace: String!
+  localId: String!
+  projectIdNamespace: String!
+  projectLocalId: String!
+  persistentId: String
+  creationTime: String
+  granularity: String
+  sex: String
+  ethnicity: String
+  ageAtEnrollment: Float
+  ageAtSampling: Float
+  race: [String!]!
+  taxonomy: NcbiTaxonomyType
+  extra: EnrichedSubjectType
+}

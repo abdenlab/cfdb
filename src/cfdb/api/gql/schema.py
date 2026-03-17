@@ -1,4 +1,4 @@
-import pprint
+import asyncio
 from typing import List, Optional
 
 import strawberry
@@ -10,11 +10,31 @@ from cfdb.api.gql.inputs import (
     to_query,
 )
 from cfdb.api.gql.types import (
+    DistinctFieldType,
     FileMetadataType,
     ObjectIdScalar,
 )
 from cfdb.models import FileMetadataModel
 from cfdb.services import locks
+
+
+ALLOWED_DISTINCT_FIELDS: frozenset[str] = frozenset(
+    {
+        "dcc.dcc_name",
+        "dcc.dcc_abbreviation",
+        "data_type",
+        "assay_type",
+        "file_format",
+        "compression_format",
+        "mime_type",
+        "analysis_type",
+        "genome_assembly",
+        "genome_annotation",
+        "output_type",
+        "status",
+        "data_access_level",
+    }
+)
 
 
 def from_pydantic(gql_type, obj):
@@ -52,7 +72,6 @@ class Query:
 
         assert api.db is not None
         query = to_query(to_dict(input)) if input else {}
-        print(pprint.pformat(query))
 
         skip = page * page_size
         files = (
@@ -81,6 +100,32 @@ class Query:
                 FileMetadataType, FileMetadataModel(**file).model_dump()
             )
         return None
+
+    @strawberry.field
+    async def distinct_values(
+        self,
+        _: strawberry.Info,
+        fields: list[str],
+        input: list[FileMetadataInput] | None = None,
+    ) -> List[DistinctFieldType]:
+        disallowed = set(fields) - ALLOWED_DISTINCT_FIELDS
+        if disallowed:
+            raise ValueError(
+                f"Field(s) not queryable: {', '.join(sorted(disallowed))}"
+            )
+
+        await locks.wait_for_cutover()
+
+        assert api.db is not None
+        query = to_query(to_dict(input)) if input else {}
+
+        all_values = await asyncio.gather(
+            *(api.db.files.distinct(field, query) for field in fields)
+        )
+        return [
+            DistinctFieldType(field=field, values=values)
+            for field, values in zip(fields, all_values)
+        ]
 
 
 schema = strawberry.Schema(query=Query)
