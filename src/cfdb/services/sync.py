@@ -31,9 +31,40 @@ from cfdb.services import locks
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 1000
+WORKER_POOL_SIZE = int(os.getenv("WORKER_POOL_SIZE", "4"))
 DATA_DIR = os.getenv("SYNC_DATA_DIR", ".data")
 MATERIALIZE_BIN = os.getenv("MATERIALIZE_BIN", "materialize")
 DATABASE_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+
+
+async def _fan_out(coros: list, *, max_inflight: int = 0) -> None:
+    """Submit coroutines in a sliding window, leaking new work in as slots free.
+
+    Args:
+        coros: Coroutines to execute.
+        max_inflight: Maximum concurrent tasks. 0 means unlimited.
+    """
+    if not coros:
+        return
+    if max_inflight <= 0:
+        async with asyncio.TaskGroup() as tg:
+            for c in coros:
+                tg.create_task(c)
+        return
+
+    pending: set[asyncio.Task] = set()
+    for c in coros:
+        if len(pending) >= max_inflight:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in done:
+                t.result()  # propagate exceptions
+        pending.add(asyncio.create_task(c))
+    if pending:
+        done, _ = await asyncio.wait(pending)
+        for t in done:
+            t.result()
 
 
 def write_shared(data: object) -> tuple[str, int]:
@@ -136,7 +167,7 @@ async def start_sync(task_id: str, dcc_names: list[str]) -> SyncTask:
 async def _run_sync(task: SyncTask) -> None:
     """Execute the sync task."""
     try:
-        async with wool.WorkerPool():
+        async with wool.WorkerPool(size=WORKER_POOL_SIZE):
             await _sync_dccs(task)
         task.status = TaskStatus.COMPLETED
         task.progress = "Sync completed successfully"
@@ -364,12 +395,13 @@ async def _enrich_4dn_api_metadata() -> None:
         {"file_metadata": file_metadata, "biosource_tiers": biosource_tiers}
     )
     try:
-        async with asyncio.TaskGroup() as tg:
-            for i in range(0, len(doc_pairs), BATCH_SIZE):
-                batch = doc_pairs[i : i + BATCH_SIZE]
-                tg.create_task(
-                    _enrich_4dn_files_batch(batch, shm_name, shm_size)
-                )
+        await _fan_out(
+            [
+                _enrich_4dn_files_batch(doc_pairs[i : i + BATCH_SIZE], shm_name, shm_size)
+                for i in range(0, len(doc_pairs), BATCH_SIZE)
+            ],
+            max_inflight=WORKER_POOL_SIZE,
+        )
     finally:
         cleanup_shared(shm_name)
 
@@ -450,12 +482,13 @@ async def _enrich_4dn_collections() -> None:
 
     shm_name, shm_size = write_shared(experiment_metadata)
     try:
-        async with asyncio.TaskGroup() as tg:
-            for i in range(0, len(doc_pairs), BATCH_SIZE):
-                batch = doc_pairs[i : i + BATCH_SIZE]
-                tg.create_task(
-                    _enrich_4dn_collections_batch(batch, shm_name, shm_size)
-                )
+        await _fan_out(
+            [
+                _enrich_4dn_collections_batch(doc_pairs[i : i + BATCH_SIZE], shm_name, shm_size)
+                for i in range(0, len(doc_pairs), BATCH_SIZE)
+            ],
+            max_inflight=WORKER_POOL_SIZE,
+        )
     finally:
         cleanup_shared(shm_name)
 
@@ -617,12 +650,13 @@ async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
     if coll_pairs:
         shm_name, shm_size = write_shared(dataset_metadata)
         try:
-            async with asyncio.TaskGroup() as tg:
-                for i in range(0, len(coll_pairs), BATCH_SIZE):
-                    batch = coll_pairs[i : i + BATCH_SIZE]
-                    tg.create_task(
-                        _enrich_hubmap_collections_batch(batch, shm_name, shm_size)
-                    )
+            await _fan_out(
+                [
+                    _enrich_hubmap_collections_batch(coll_pairs[i : i + BATCH_SIZE], shm_name, shm_size)
+                    for i in range(0, len(coll_pairs), BATCH_SIZE)
+                ],
+                max_inflight=WORKER_POOL_SIZE,
+            )
         finally:
             cleanup_shared(shm_name)
         logger.info(
@@ -656,12 +690,13 @@ async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
     if subj_pairs:
         shm_name, shm_size = write_shared(donor_lookup)
         try:
-            async with asyncio.TaskGroup() as tg:
-                for i in range(0, len(subj_pairs), BATCH_SIZE):
-                    batch = subj_pairs[i : i + BATCH_SIZE]
-                    tg.create_task(
-                        _enrich_hubmap_subjects_batch(batch, shm_name, shm_size)
-                    )
+            await _fan_out(
+                [
+                    _enrich_hubmap_subjects_batch(subj_pairs[i : i + BATCH_SIZE], shm_name, shm_size)
+                    for i in range(0, len(subj_pairs), BATCH_SIZE)
+                ],
+                max_inflight=WORKER_POOL_SIZE,
+            )
         finally:
             cleanup_shared(shm_name)
         logger.info(
@@ -972,19 +1007,29 @@ async def _sync_encode(task: SyncTask) -> None:
 
         batch: list[dict] = []
         count = 0
+        pending: set[asyncio.Task] = set()
 
-        async with asyncio.TaskGroup() as tg:
-            async for encode_file in fetch_encode_metadata():
-                batch.append(encode_file)
-                count += 1
-                if len(batch) >= BATCH_SIZE:
-                    tg.create_task(_transform_encode_batch(list(batch)))
-                    task.progress = f"Dispatched {count} ENCODE files..."
-                    logger.info(task.progress)
-                    batch.clear()
+        async for encode_file in fetch_encode_metadata():
+            batch.append(encode_file)
+            count += 1
+            if len(batch) >= BATCH_SIZE:
+                if len(pending) >= WORKER_POOL_SIZE:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in done:
+                        t.result()
+                pending.add(asyncio.create_task(_transform_encode_batch(list(batch))))
+                task.progress = f"Dispatched {count} ENCODE files..."
+                logger.info(task.progress)
+                batch.clear()
 
-            if batch:
-                tg.create_task(_transform_encode_batch(list(batch)))
+        if batch:
+            pending.add(asyncio.create_task(_transform_encode_batch(list(batch))))
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            for t in done:
+                t.result()
 
     task.progress = f"ENCODE sync complete: {count} files"
     logger.info(task.progress)
@@ -1039,41 +1084,12 @@ async def _clear_dcc_data_async(submission: str) -> None:
     await asyncio.gather(*[_delete_from(n) for n in collection_names])
 
 
-@wool.routine
-async def _load_file(filepath_str: str, submission: str) -> tuple[str, int]:
-    """Parse a CSV/TSV file and insert records into MongoDB from a worker."""
-    import csv
-    from copy import copy
-    from pathlib import Path
-
-    filepath = Path(filepath_str)
-    client, db = _get_worker_db()
-    try:
-        delimiter = "," if filepath.suffix == ".csv" else "\t"
-        table = filepath.stem
-        batch: list[dict] = []
-        count = 0
-        with open(filepath, "r", encoding="utf-8") as f:
-            for row in csv.DictReader(f, delimiter=delimiter):
-                count += 1
-                record = {**row, "submission": submission, "table": table}
-                if submission == "4dn" and table == "file":
-                    record["data_access_level"] = "public"
-                batch.append(record)
-                if len(batch) >= BATCH_SIZE:
-                    await db[table].insert_many(copy(batch))
-                    batch.clear()
-            if batch:
-                await db[table].insert_many(copy(batch))
-        return table, count
-    finally:
-        client.close()
-
-
 async def _load_dataset_async(directory: Path, submission: str) -> None:
-    """Load CSV/TSV files into MongoDB using worker-pool fan-out."""
+    """Load CSV/TSV files into MongoDB using async Motor client."""
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
     # Handle nested directories from ZIP extraction
-    # Look for CSV/TSV files, checking subdirectories if needed
     files_to_load = [f for f in directory.iterdir() if f.suffix in (".csv", ".tsv")]
 
     # If no files found at top level, check first non-junk subdirectory
@@ -1087,6 +1103,30 @@ async def _load_dataset_async(directory: Path, submission: str) -> None:
                     break
     logger.info(f"Loading {len(files_to_load)} files into database")
 
-    async with asyncio.TaskGroup() as tg:
-        for filepath in files_to_load:
-            tg.create_task(_load_file(str(filepath), submission))
+    for filepath in files_to_load:
+        delimiter = "," if filepath.suffix == ".csv" else "\t"
+        table = filepath.stem
+
+        batch = []
+        count = 0
+
+        with open(filepath, "r", encoding="utf-8") as file:
+            reader = csv.DictReader(file, delimiter=delimiter)
+
+            for row in reader:
+                count += 1
+                record = {**row, "submission": submission, "table": table}
+
+                if submission == "4dn" and table == "file":
+                    record["data_access_level"] = "public"
+
+                batch.append(record)
+
+                if len(batch) >= BATCH_SIZE:
+                    await api.db[table].insert_many(copy(batch))
+                    batch.clear()
+
+            if batch:
+                await api.db[table].insert_many(copy(batch))
+
+        logger.info(f"Loaded {count} records into {table}")
