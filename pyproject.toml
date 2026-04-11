@@ -5,9 +5,9 @@ requires = ["setuptools>=64", "setuptools-scm>=8"]
 [project]
 authors = [{ name = "Conrad Bzura", email = "conradbzura@gmail.com" }]
 classifiers = [
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "aiohttp",
