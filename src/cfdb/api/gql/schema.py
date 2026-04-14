@@ -20,11 +20,15 @@ from cfdb.services import locks
 
 ALLOWED_DISTINCT_FIELDS: frozenset[str] = frozenset(
     {
+        "dcc.id",
         "dcc.dcc_name",
         "dcc.dcc_abbreviation",
-        "data_type",
-        "assay_type",
-        "file_format",
+        "data_type.id",
+        "data_type.name",
+        "assay_type.id",
+        "assay_type.name",
+        "file_format.id",
+        "file_format.name",
         "compression_format",
         "mime_type",
         "analysis_type",

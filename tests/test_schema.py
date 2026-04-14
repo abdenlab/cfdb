@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from cfdb.api.gql.schema import schema
+from cfdb.services import locks
 
 
 def _make_file_doc(local_id: str, submission: str = "hubmap") -> dict:
@@ -44,21 +45,30 @@ def _make_distinct_doc(local_id: str, dcc_name: str, submission: str = "hubmap")
 
 
 class TestFilesQuery:
-    @pytest.mark.asyncio
-    async def test_returns_files_via_simple_pagination(self, mock_db, mocker):
-        """
-        GIVEN 3 files in the database
-        WHEN the GraphQL files query is executed with page=0, page_size=2
-        THEN exactly 2 files are returned (no access-level over-fetch logic)
-        """
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
+    @pytest.fixture(autouse=True)
+    def _patch_cutover(self, mocker):
+        """No-op ``locks.wait_for_cutover`` for every test in this class."""
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
 
+    @pytest.mark.asyncio
+    async def test_returns_files_via_simple_pagination(self, mock_db):
+        """Test pagination cap is applied to the files query.
+
+        Given:
+            Three files in the database
+        When:
+            The GraphQL files query is executed with page=0, page_size=2
+        Then:
+            Exactly 2 files are returned (no access-level over-fetch logic)
+        """
+        # Arrange
         mock_db.files.docs = [
             _make_file_doc("f1"),
             _make_file_doc("f2"),
             _make_file_doc("f3"),
         ]
 
+        # Act
         result = await schema.execute(
             """
             query {
@@ -69,24 +79,29 @@ class TestFilesQuery:
             """
         )
 
+        # Assert
         assert result.errors is None
         assert len(result.data["files"]) == 2
 
     @pytest.mark.asyncio
-    async def test_returns_all_submissions_without_filtering(self, mock_db, mocker):
-        """
-        GIVEN files from multiple DCCs including HuBMAP
-        WHEN the GraphQL files query is executed with no input filter
-        THEN files from all DCCs are returned without access-level filtering
-        """
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
+    async def test_returns_all_submissions_without_filtering(self, mock_db):
+        """Test the files query returns all DCCs when no filter is supplied.
 
+        Given:
+            Files from multiple DCCs including HuBMAP
+        When:
+            The GraphQL files query is executed with no input filter
+        Then:
+            Files from all DCCs are returned without access-level filtering
+        """
+        # Arrange
         mock_db.files.docs = [
             _make_file_doc("h1", "hubmap"),
             _make_file_doc("f1", "4dn"),
             _make_file_doc("e1", "encode"),
         ]
 
+        # Act
         result = await schema.execute(
             """
             query {
@@ -97,14 +112,20 @@ class TestFilesQuery:
             """
         )
 
+        # Assert
         assert result.errors is None
         assert len(result.data["files"]) == 3
 
 
 class TestDistinctValuesQuery:
+    @pytest.fixture(autouse=True)
+    def _patch_cutover(self, mocker):
+        """No-op ``locks.wait_for_cutover`` for every test in this class."""
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
     @pytest.mark.asyncio
     async def test_distinct_values_returns_all_unique_values_for_single_field(
-        self, mock_db, mocker
+        self, mock_db
     ):
         """Test distinct values for a single nested field without filtering.
 
@@ -116,7 +137,6 @@ class TestDistinctValuesQuery:
             It should return one entry containing all three distinct DCC names
         """
         # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
         mock_db.files.docs = [
             _make_distinct_doc("f1", "HuBMAP", "hubmap"),
             _make_distinct_doc("f2", "4DN", "4dn"),
@@ -144,7 +164,7 @@ class TestDistinctValuesQuery:
 
     @pytest.mark.asyncio
     async def test_distinct_values_returns_entries_for_multiple_fields(
-        self, mock_db, mocker
+        self, mock_db
     ):
         """Test distinct values for multiple fields in one call.
 
@@ -156,7 +176,6 @@ class TestDistinctValuesQuery:
             It should return two entries, each with the correct distinct values
         """
         # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
         mock_db.files.docs = [
             _make_distinct_doc("f1", "HuBMAP", "hubmap"),
             _make_distinct_doc("f2", "HuBMAP", "hubmap"),
@@ -184,7 +203,7 @@ class TestDistinctValuesQuery:
         assert sorted(by_field["dcc.dcc_abbreviation"]) == ["4dn", "hubmap"]
 
     @pytest.mark.asyncio
-    async def test_distinct_values_applies_input_filter(self, mock_db, mocker):
+    async def test_distinct_values_applies_input_filter(self, mock_db):
         """Test distinct values with a DCC filter applied.
 
         Given:
@@ -195,7 +214,6 @@ class TestDistinctValuesQuery:
             It should return only the abbreviations from HuBMAP files
         """
         # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
         mock_db.files.docs = [
             _make_distinct_doc("h1", "HuBMAP", "hubmap"),
             _make_distinct_doc("h2", "HuBMAP", "hubmap"),
@@ -224,7 +242,7 @@ class TestDistinctValuesQuery:
 
     @pytest.mark.asyncio
     async def test_distinct_values_returns_empty_list_for_missing_field(
-        self, mock_db, mocker
+        self, mock_db
     ):
         """Test distinct values for a field absent from all documents.
 
@@ -236,7 +254,6 @@ class TestDistinctValuesQuery:
             It should return one entry with an empty values list
         """
         # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
         mock_db.files.docs = [
             _make_distinct_doc("f1", "HuBMAP"),
             _make_distinct_doc("f2", "4DN"),
@@ -262,7 +279,7 @@ class TestDistinctValuesQuery:
 
     @pytest.mark.asyncio
     async def test_distinct_values_returns_empty_list_for_empty_database(
-        self, mock_db, mocker
+        self, mock_db
     ):
         """Test distinct values against an empty collection.
 
@@ -274,7 +291,6 @@ class TestDistinctValuesQuery:
             It should return one entry with an empty values list
         """
         # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
         mock_db.files.docs = []
 
         # Act
@@ -295,7 +311,7 @@ class TestDistinctValuesQuery:
         assert entry["values"] == []
 
     @pytest.mark.asyncio
-    async def test_distinct_values_deduplicates_values(self, mock_db, mocker):
+    async def test_distinct_values_deduplicates_values(self, mock_db):
         """Test that duplicate values are collapsed to unique entries.
 
         Given:
@@ -306,7 +322,6 @@ class TestDistinctValuesQuery:
             It should return only the deduplicated values
         """
         # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
         mock_db.files.docs = [
             _make_distinct_doc("f1", "HuBMAP", "hubmap"),
             _make_distinct_doc("f2", "HuBMAP", "hubmap"),
@@ -331,7 +346,7 @@ class TestDistinctValuesQuery:
         assert sorted(entry["values"]) == ["4DN", "HuBMAP"]
 
     @pytest.mark.asyncio
-    async def test_distinct_values_rejects_disallowed_field(self, mock_db, mocker):
+    async def test_distinct_values_rejects_disallowed_field(self, mock_db):
         """Test that fields outside the allowlist are rejected.
 
         Given:
@@ -341,9 +356,6 @@ class TestDistinctValuesQuery:
         Then:
             It should return an error naming the disallowed field
         """
-        # Arrange
-        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
-
         # Act
         result = await schema.execute(
             """
@@ -359,3 +371,73 @@ class TestDistinctValuesQuery:
         # Assert
         assert result.errors is not None
         assert "secret_field" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_returns_unique_subdoc_names(self, mock_db):
+        """Test distinct values for an EDAM subdocument sub-path.
+
+        Given:
+            Three files whose file_format subdocuments carry two distinct names
+        When:
+            The distinctValues query is executed with fields: ["file_format.name"]
+        Then:
+            It should return one entry containing the two distinct format names
+        """
+        # Arrange
+        def doc_with_format(local_id: str, fmt_id: str, fmt_name: str) -> dict:
+            doc = _make_distinct_doc(local_id, "ENCODE", "encode")
+            doc["file_format"] = {"id": fmt_id, "name": fmt_name}
+            return doc
+
+        mock_db.files.docs = [
+            doc_with_format("f1", "format:3003", "BED"),
+            doc_with_format("f2", "format:3003", "BED"),
+            doc_with_format("f3", "format:3004", "bigBed"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["file_format.name"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        entry = result.data["distinctValues"][0]
+        assert entry["field"] == "file_format.name"
+        assert sorted(entry["values"]) == ["BED", "bigBed"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_rejects_bare_subdocument_field(self, mock_db):
+        """Test that the bare top-level subdocument name is no longer allowlisted.
+
+        Given:
+            The bare ``file_format`` field returned subdocuments rather than scalar
+            values, so it has been removed from ALLOWED_DISTINCT_FIELDS in favor of
+            the indexed ``file_format.id`` and ``file_format.name`` sub-paths.
+        When:
+            The distinctValues query is executed with fields: ["file_format"]
+        Then:
+            It should return an error naming the disallowed field
+        """
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["file_format"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert "file_format" in result.errors[0].message
