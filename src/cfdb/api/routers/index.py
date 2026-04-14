@@ -23,8 +23,9 @@ async def stream_index_file(
     """
     Stream an index file (e.g., .px2, .bai) associated with a DCC file.
 
-    Index files are discovered during 4DN API enrichment and stored in
-    extra.extra_files on the materialized file document.
+    Index files are discovered during DCC-specific enrichment and stored
+    under a DCC-namespaced key on the materialized file document. For 4DN
+    files, sidecar extras live under ``extra.fourdn.extra_files``.
 
     Path Parameters:
         dcc: DCC abbreviation (e.g., 4dn) - case insensitive
@@ -64,9 +65,15 @@ async def stream_index_file(
         if not file_doc:
             raise HTTPException(status_code=404, detail="File not found")
 
-        # Get extra_files from the extra field
-        extra = file_doc.get("extra", {})
-        extra_files = extra.get("extra_files", [])
+        # Get extra_files from the DCC-namespaced subdocument under ``extra``.
+        # Each DCC enrichment writes sidecar extras under its own key
+        # (e.g. 4DN → ``extra.fourdn.extra_files``) so we dispatch by DCC.
+        extra = file_doc.get("extra") or {}
+        if normalized_dcc == "4dn":
+            dcc_extra = extra.get("fourdn") or {}
+            extra_files = dcc_extra.get("extra_files") or []
+        else:
+            extra_files = []
 
         if not extra_files:
             raise HTTPException(
