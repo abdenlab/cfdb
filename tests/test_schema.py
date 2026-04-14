@@ -359,3 +359,82 @@ class TestDistinctValuesQuery:
         # Assert
         assert result.errors is not None
         assert "secret_field" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_returns_unique_subdoc_names(
+        self, mock_db, mocker
+    ):
+        """Test distinct values for an EDAM subdocument sub-path.
+
+        Given:
+            Three files whose file_format subdocuments carry two distinct names
+        When:
+            The distinctValues query is executed with fields: ["file_format.name"]
+        Then:
+            It should return one entry containing the two distinct format names
+        """
+        # Arrange
+        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
+
+        def doc_with_format(local_id: str, fmt_id: str, fmt_name: str) -> dict:
+            doc = _make_distinct_doc(local_id, "ENCODE", "encode")
+            doc["file_format"] = {"id": fmt_id, "name": fmt_name}
+            return doc
+
+        mock_db.files.docs = [
+            doc_with_format("f1", "format:3003", "BED"),
+            doc_with_format("f2", "format:3003", "BED"),
+            doc_with_format("f3", "format:3004", "bigBed"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["file_format.name"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        entry = result.data["distinctValues"][0]
+        assert entry["field"] == "file_format.name"
+        assert sorted(entry["values"]) == ["BED", "bigBed"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_rejects_bare_subdocument_field(
+        self, mock_db, mocker
+    ):
+        """Test that the bare top-level subdocument name is no longer allowlisted.
+
+        Given:
+            The bare ``file_format`` field returned subdocuments rather than scalar
+            values, so it has been removed from ALLOWED_DISTINCT_FIELDS in favor of
+            the indexed ``file_format.id`` and ``file_format.name`` sub-paths.
+        When:
+            The distinctValues query is executed with fields: ["file_format"]
+        Then:
+            It should return an error naming the disallowed field.
+        """
+        # Arrange
+        mocker.patch("cfdb.services.locks.wait_for_cutover", return_value=None)
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["file_format"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert "file_format" in result.errors[0].message
