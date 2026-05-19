@@ -10,19 +10,22 @@ CFDB is a Python package for querying and serving enriched C2M2 (Crosscut Metada
 pip install git+https://github.com/abdenlab/cfdb.git
 ```
 
-Requires Python 3.10 or later.
+Requires Python 3.11 or later.
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `SYNC_API_KEY` | API key for the sync endpoint. If unset, sync is unprotected (suitable for local dev). | - |
-| `SYNC_DATA_DIR` | Directory for downloaded sync data files | - |
+| `SYNC_DATA_DIR` | Root directory for downloaded sync data, the workflow cache (`$SYNC_DATA_DIR/cache`), and per-job workdirs (`$SYNC_DATA_DIR/jobs`). When unset the preprocessing/indexing workflow subsystem is disabled: `/data` falls through to direct upstream streaming, `/index` returns 503 for processable formats (BAM/VCF/etc.) and 404 for passthrough formats (CSV/TSV/bigWig). Both subdirectories must share a filesystem because `LocalFsCache.put` relies on `os.replace` atomicity. | - |
+| `WORKFLOW_WORKER_COUNT` | Number of wool workers to lease from the external worker pool. Must be >= 1. The API does NOT spawn workers in-process. | `2` |
+| `WORKFLOW_POOL_NAMESPACE` | wool LAN discovery namespace shared by the API and the worker-pool process. Both processes MUST set the same value or dispatch will hang on `NoWorkersAvailable`. | `cfdb-workers` |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
-| `DATABASE_URL` | MongoDB connection string | `mongodb://localhost:27017` |
+| `DATABASE_URL` | MongoDB connection string | `mongodb://127.0.0.1:27017` |
+| `DATABASE_NAME` | Name of the MongoDB database to use | `cfdb` |
 | `MONGODB_TLS_ENABLED` | Enable X.509 certificate authentication (production) | `false` |
-| `MONGODB_CERT_PATH` | Path to client certificate bundle | `/etc/cfdb/certs/client-bundle.pem` |
-| `MONGODB_CA_PATH` | Path to CA certificate | `/etc/cfdb/certs/ca.pem` |
+| `MONGODB_CA_PATH` | Path to CA certificate bundle used when `MONGODB_TLS_ENABLED=true` | `/etc/cfdb/certs/global-bundle.pem` |
+| `MONGODB_RETRY_WRITES` | Enable retryable writes on the MongoDB client | `false` |
 
 ### Docker Startup
 
@@ -487,12 +490,15 @@ Stream file contents from DCCs via HTTPS.
 | Code | Description |
 |------|-------------|
 | 200 | Full file content (GET) or file metadata (HEAD) |
+| 202 | Preprocessed artifact not yet cached — workflow dispatched. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. |
 | 206 | Partial content (Range request) |
-| 400 | Invalid DCC or Range header |
-| 403 | File requires authentication (consortium/protected access) |
-| 404 | File not found |
+| 400 | Invalid DCC, path-param shape, or Range header |
+| 403 | File requires authentication (consortium/protected access) or denied by upstream repository |
+| 404 | File not found, or HEAD probe of a not-yet-cached processed artifact (GET would dispatch) |
+| 416 | Range not satisfiable (out of bounds, or file size unknown so no range can be satisfied) |
 | 501 | No supported access method (e.g., Globus-only files) |
 | 502 | Upstream service error |
+| 503 | Workflow subsystem shutting down (`Retry-After`) |
 | 504 | Service timeout |
 
 ```bash
@@ -522,15 +528,80 @@ Stream index files (e.g., `.px2`, `.bai`) associated with DCC data files.
 | Code | Description |
 |------|-------------|
 | 200 | Full index file content (GET) or file metadata (HEAD) |
+| 202 | Index not yet cached — workflow dispatched. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. |
 | 206 | Partial content (Range request) |
-| 400 | Invalid DCC or Range header |
-| 404 | File not found or no index file available |
-| 502 | Upstream service error |
+| 400 | Invalid DCC, path-param shape, or Range header |
+| 403 | File requires consortium/protected access (HuBMAP) |
+| 404 | File not found, format has no index (CSV/TSV/bigWig), or HEAD probe of a not-yet-cached index |
+| 416 | Range not satisfiable |
+| 502 | Upstream service error or malformed sidecar |
+| 503 | Workflow subsystem disabled (set `SYNC_DATA_DIR`) for a processable format, or shutting down (`Retry-After`) |
 
 ```bash
 # Download an index file
 curl -O http://localhost:8000/index/4dn/4DNFIG5NX1EC
 ```
+
+### Preprocessing & indexing workflow
+
+Many upstream files are not directly consumable by Gosling Designer without preprocessing (e.g., sort+index for BAM, bgzip+tabix for VCF/GFF/BED). When `/data` or `/index` is called for a format that needs preprocessing and the processed artifact is not yet in cache, the API dispatches a workflow and returns `202 Accepted` with a `Location` header pointing to a job status endpoint. A subsequent call, after the workflow completes, streams the processed artifact from cache (with `Range` support). Both endpoints share a single workflow per source file via a Mongo-backed mutex.
+
+The preprocessed artifact is the default response. Clients that want the raw upstream file instead can pass `?raw=true`; on `/index`, `raw=true` serves only an upstream sidecar (e.g., 4DN's `extra_files`) and 404s when none exists. `HEAD` requests never dispatch preprocessing — on cache miss they return 404 so monitoring probes and prefetch tools cannot trigger workflows as a side-effect. Issue a `GET` when you actually want the artifact.
+
+| Format | Workflow | Cached artifacts |
+|--------|----------|------------------|
+| CSV, TSV, bigWig | passthrough — served directly | — |
+| BAM | header check (must be pre-sorted upstream) + index | BAI |
+| SAM | SAM→BAM convert + sort + index | sorted BAM + BAI |
+| VCF, GFF, GFF3, BED, BroadPeak, NarrowPeak | decompress + sort + bgzip + tabix | bgzipped text + TBI |
+| GTF | GTF→GFF3 + sort + bgzip + tabix | bgzipped GFF3 + TBI |
+| bigBed | bigBedToBed + sort + bgzip + tabix | bgzipped BED + TBI |
+
+Cache keys are content-addressed using each file's upstream `md5`, so a byte change upstream (with the sync pipeline refreshing `md5`) invalidates the cache automatically.
+
+`/index` continues to serve upstream sidecars first when present (the 218 BED→beddb and 4 BED→tbi 4DN cases that publish under `extra.extra_files` or `extra.fourdn.extra_files`); the workflow path is dispatched only when no sidecar exists. Set `?raw=true` to bypass the workflow path entirely and return only the upstream sidecar (404 when none exists).
+
+Required environment variables:
+
+- `SYNC_DATA_DIR` — directory under which the workflow cache and per-job workdirs live. Both subdirectories (`$SYNC_DATA_DIR/cache` and `$SYNC_DATA_DIR/jobs`) must share a filesystem because `LocalFsCache.put` relies on `os.replace` atomicity; the API asserts this at startup and fails fast if they live on different volumes. When unset, the workflow subsystem is disabled, `/data` falls through to direct upstream streaming, `/index` returns 404 for passthrough formats (CSV/TSV/bigWig — there is no index in any state of the world), and `/index` returns 503 for processable formats that would otherwise dispatch a workflow (sidecar-served files still work).
+- `WORKFLOW_WORKER_COUNT` — number of wool workers to **lease** from the surrounding worker pool (default `2`). The API does *not* spawn workers in-process; workers must be externally provisioned (e.g., as a separate ECS service or via the local-dev launch below) and discoverable via the wool LAN discovery namespace.
+- `WORKFLOW_POOL_NAMESPACE` — wool discovery namespace shared by the API and the external worker pool (default `cfdb-workers`). Both processes must agree on this value or dispatch will hang waiting for workers.
+
+Optional tunables (with defaults):
+
+- `CFDB_WORKFLOW_DURATION_CAP_S` — per-workflow wall-clock cap (default `1200`).
+- `CFDB_WORKFLOW_DISPATCH_WAIT_S` — how long `ensure_workflow` waits for a free worker before giving up (default `60`).
+- `CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S` — cadence at which the wool routine emits heartbeat events during quiet stages so the API can refresh `JobRecord.updated_at` (default `300`). The stale-reclaim threshold below is sized as `2 × heartbeat + safety_margin`; lowering this knob without also lowering the threshold widens the false-reclaim window.
+- `CFDB_WORKFLOW_STALE_THRESHOLD_S` — `updated_at` age beyond which an active row is reclaimable (default `900`; sized as `2 × heartbeat_interval + safety_margin` so a single missed heartbeat does not falsely reclaim a healthy worker).
+- `CFDB_SAMTOOLS_THREADS` (default `1`), `CFDB_SORT_PARALLEL` (default `2`) — CPU/thread caps for `samtools sort/index` and GNU `sort` respectively.
+- `CFDB_SAMTOOLS_MEMORY_CAP_PER_THREAD` (default `256M`), `CFDB_SORT_MEMORY_CAP` (default `256M`) — memory caps passed to the same tools. **`CFDB_SAMTOOLS_MEMORY_CAP_PER_THREAD` is per-thread**: total samtools RSS is bounded by `CFDB_SAMTOOLS_THREADS × CFDB_SAMTOOLS_MEMORY_CAP_PER_THREAD`. (The previous name `CFDB_SAMTOOLS_MEMORY_CAP` is rejected at import to surface deployments that haven't migrated; rename the env var.)
+
+Required tools on `PATH` for the **worker pool** (not the API): `samtools`, `bgzip`, `tabix`, `bcftools`, `gffread`, `bigBedToBed`. The `api` Docker image already installs all of these — the simplest local-dev / single-host deployment is to reuse `Dockerfile.api` as the worker image and override the `CMD` (or run the wool worker entrypoint via `python -m wool`). On the worker host, set `WORKFLOW_POOL_NAMESPACE` to match the API's value.
+
+#### Running a local worker pool
+
+For single-host development, start a wool worker pool in a separate process before launching the API, with `WORKFLOW_POOL_NAMESPACE` matching what the API uses. The API connects via LAN discovery (zeroconf/mDNS) and dispatches workflows to whatever workers are publishing under that namespace. With no worker pool running, `/data` and `/index` requests for processable formats will hang on the dispatch retry budget (60s by default) before failing with `NoWorkersAvailable`.
+
+**URL:** `GET /jobs/{job_id}`
+
+Poll the status of a dispatched workflow:
+
+```json
+{
+  "job_id": "abc-123",
+  "status": "running",
+  "stages_done": ["data"],
+  "artifacts": {"data": "encode/ENCFF123/data/abc-v1"},
+  "progress": null,
+  "error": null,
+  "superseded_by": null
+}
+```
+
+| Code | Description |
+|------|-------------|
+| 200 | Job status returned |
+| 404 | Job not found |
 
 ### Sync
 
