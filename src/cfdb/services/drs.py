@@ -19,6 +19,45 @@ class RangeNotSatisfiableError(Exception):
         super().__init__(f"Range not satisfiable for file of size {file_size}")
 
 
+class DRSError(Exception):
+    """Base class for DRS resolution / streaming failures.
+
+    Subclasses are mapped to HTTP status codes by the router catch
+    block; callers should prefer ``except`` chains over inspecting the
+    message string. Replaces the older "match the substring of
+    ``str(exc).lower()``" pattern in ``routers/data.py`` which silently
+    drifted on upstream wording changes.
+    """
+
+
+class DRSNotFound(DRSError):
+    """Upstream returned a 404 or otherwise indicated the object does not exist."""
+
+
+class DRSForbidden(DRSError):
+    """Upstream rejected the request as unauthenticated/forbidden."""
+
+
+class DRSTimeout(DRSError):
+    """Connection or read timeout while streaming from upstream."""
+
+
+class DRSUpstreamError(DRSError):
+    """Any other upstream failure (HTTP 5xx, malformed response, network error)."""
+
+
+class DRSRedirectBlocked(DRSError):
+    """A 30x redirect pointed at a URL outside the allowlist."""
+
+
+#: Bound on the number of redirect hops ``stream_from_url`` will follow
+#: before failing. Each hop's ``Location`` must pass
+#: ``validate_outbound_url``. Standard browsers default to 20 hops; we
+#: pick a tighter bound since DRS resolvers should redirect at most
+#: once (signed URL) or twice (CDN edge).
+_MAX_REDIRECTS = 5
+
+
 class DRSAccessMethod(BaseModel):
     """GA4GH DRS access method for retrieving object bytes."""
 
@@ -167,14 +206,27 @@ async def fetch_drs_object(drs_uri: str, auth_token: Optional[str] = None) -> DR
         DRSObject with metadata and access methods
 
     Raises:
-        ValueError: If DRS URI is invalid
-        aiohttp.ClientError: On network errors
-        Exception: On DRS API errors or timeouts
+        ValueError: If DRS URI is invalid.
+        DRSNotFound: Upstream returned 404 for the DRS object.
+        DRSForbidden: Upstream returned 401 or 403.
+        DRSTimeout: Network timeout while fetching DRS metadata.
+        DRSUpstreamError: Any other upstream failure (5xx, network error,
+            redirect attempt, malformed response).
     """
+    from cfdb.workflows.urlsafe import validate_outbound_url
+
     hostname, object_id = await parse_drs_uri(drs_uri)
 
-    # Construct GA4GH DRS API endpoint
+    # Construct GA4GH DRS API endpoint and gate it through the SSRF
+    # allowlist before issuing the request. The hostname comes from a
+    # DB-sourced ``access_url`` and is therefore untrusted by default.
     drs_api_url = f"https://{hostname}/ga4gh/drs/v1/objects/{object_id}"
+    try:
+        validate_outbound_url(drs_api_url)
+    except ValueError as exc:
+        raise DRSUpstreamError(
+            f"DRS metadata host rejected by allowlist: {exc}"
+        ) from exc
 
     logger.debug(f"Fetching DRS metadata from {drs_api_url}")
 
@@ -184,8 +236,16 @@ async def fetch_drs_object(drs_uri: str, auth_token: Optional[str] = None) -> DR
             headers["Authorization"] = f"Bearer {auth_token}"
 
         try:
+            # ``allow_redirects=False`` matches ``stream_from_url`` —
+            # every 30x must be re-validated against the allowlist before
+            # being followed. DRS metadata endpoints should not redirect
+            # in normal operation, so we reject 3xx outright rather than
+            # reimplementing the redirect loop for an exceptional path.
             async with session.get(
-                drs_api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                drs_api_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+                allow_redirects=False,
             ) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -211,22 +271,32 @@ async def fetch_drs_object(drs_uri: str, auth_token: Optional[str] = None) -> DR
                         mime_type=data.get("mime_type"),
                     )
 
-                elif response.status == 404:
-                    raise Exception(f"DRS object not found: {object_id}")
+                if response.status == 404:
+                    raise DRSNotFound(f"DRS object not found: {object_id}")
 
-                elif response.status == 401:
-                    raise Exception("Authentication required for this DRS object")
+                if response.status in (401, 403):
+                    raise DRSForbidden(
+                        f"DRS object access denied ({response.status}): {object_id}"
+                    )
 
-                elif response.status == 403:
-                    raise Exception("Access forbidden for this DRS object")
+                if response.status in (301, 302, 303, 307, 308):
+                    raise DRSUpstreamError(
+                        f"DRS metadata endpoint redirected unexpectedly "
+                        f"(HTTP {response.status}); refusing to follow."
+                    )
 
-                else:
-                    raise Exception(f"DRS API error: HTTP {response.status}")
+                raise DRSUpstreamError(
+                    f"DRS API error: HTTP {response.status} for {object_id}"
+                )
 
-        except asyncio.TimeoutError:
-            raise Exception(f"DRS service timeout for {object_id}")
-        except aiohttp.ClientError as e:
-            raise Exception(f"Network error fetching DRS metadata: {e}")
+        except asyncio.TimeoutError as exc:
+            raise DRSTimeout(
+                f"DRS service timeout for {object_id}"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise DRSUpstreamError(
+                f"Network error fetching DRS metadata: {exc}"
+            ) from exc
 
 
 async def get_https_download_url(access_methods: List[DRSAccessMethod]) -> str:
@@ -268,29 +338,79 @@ async def stream_from_url(
     Raises:
         Exception: On download errors
     """
-    headers = {}
+    from cfdb.workflows.urlsafe import validate_outbound_url
 
-    # Add Range header if provided
+    # Validate the initial URL against the SSRF allowlist before the
+    # first GET. Callers in the router layer (data.py) pass URLs that
+    # came from MongoDB ``access_url`` or ``drs.get_https_download_url``
+    # without prior validation; covering this here closes the gap
+    # uniformly for every caller.
+    try:
+        validate_outbound_url(url)
+    except ValueError as exc:
+        raise DRSRedirectBlocked(
+            f"Source URL rejected by allowlist: {exc}"
+        ) from exc
+
+    headers = {}
     if range_header:
         headers["Range"] = range_header
 
+    # We disable aiohttp's automatic redirect-following because every
+    # 30x must be re-checked against the SSRF allowlist before issuing
+    # the follow-up GET. Otherwise an allowlisted host can 302 us to
+    # ``http://169.254.169.254/`` (or any RFC1918 address) and aiohttp
+    # would happily fetch it. We follow up to ``_MAX_REDIRECTS`` hops
+    # manually, validating each ``Location`` first.
+    current_url = url
+    redirects_followed = 0
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=60)
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=None, connect=30),
-            ) as response:
-                # Accept 200 (full file) or 206 (partial content)
-                if response.status not in (200, 206):
-                    raise Exception(f"Failed to download file: HTTP {response.status}")
-
-                # Stream chunks while response context is open
-                async for chunk in response.content.iter_chunked(8192):
-                    if chunk:
-                        yield chunk
-
-        except asyncio.TimeoutError:
-            raise Exception(f"Timeout downloading file from {url}")
-        except aiohttp.ClientError as e:
-            raise Exception(f"Network error downloading file: {e}")
+            while True:
+                async with session.get(
+                    current_url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
+                ) as response:
+                    if response.status in (301, 302, 303, 307, 308):
+                        if redirects_followed >= _MAX_REDIRECTS:
+                            raise DRSUpstreamError(
+                                f"Exceeded {_MAX_REDIRECTS} redirects starting at {url}"
+                            )
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise DRSUpstreamError(
+                                f"{response.status} from {current_url} with no Location header"
+                            )
+                        next_url = urllib.parse.urljoin(current_url, location)
+                        try:
+                            validate_outbound_url(next_url)
+                        except ValueError as exc:
+                            raise DRSRedirectBlocked(
+                                f"Redirect target rejected by allowlist: {exc}"
+                            ) from exc
+                        current_url = next_url
+                        redirects_followed += 1
+                        continue
+                    if response.status == 404:
+                        raise DRSNotFound(
+                            f"Upstream returned 404 for {current_url}"
+                        )
+                    if response.status in (401, 403):
+                        raise DRSForbidden(
+                            f"Upstream returned {response.status} for {current_url}"
+                        )
+                    if response.status not in (200, 206):
+                        raise DRSUpstreamError(
+                            f"Failed to download file: HTTP {response.status}"
+                        )
+                    async for chunk in response.content.iter_chunked(8192):
+                        if chunk:
+                            yield chunk
+                    return
+        except asyncio.TimeoutError as exc:
+            raise DRSTimeout(f"Timeout downloading file from {url}") from exc
+        except aiohttp.ClientError as exc:
+            raise DRSUpstreamError(f"Network error downloading file: {exc}") from exc

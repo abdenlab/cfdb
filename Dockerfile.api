@@ -1,28 +1,72 @@
+# Base image pins. Both stages use sha256 digests so a tip retag at
+# Docker Hub cannot silently swap the build base. Update the digests
+# during a maintenance window:
+#   docker pull rust:1.88-slim-bookworm
+#   docker inspect --format='{{index .RepoDigests 0}}' rust:1.88-slim-bookworm
+# (and equivalent for python:3.12-slim-bookworm), paste the resulting
+# sha256 below, and rebuild. Both digests MUST be present.
+ARG RUST_BASE_DIGEST=sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89
+ARG PYTHON_BASE_DIGEST=sha256:d193c6f51a7dbd10395d6328de3a7edb0516fb0608ca138036576f574c3e07d2
+
 # Build stage for the Rust materializer
-FROM rust:1.88 AS builder
+FROM rust:1.88-slim-bookworm@${RUST_BASE_DIGEST} AS builder
 WORKDIR /build
 COPY materialize/ .
 RUN cargo build --release
 
 # Runtime stage
-FROM python:3.12
+FROM python:3.12-slim-bookworm@${PYTHON_BASE_DIGEST}
 EXPOSE 8000
 ENV DATABASE_URL="mongodb://cvh-backend:27017"
 WORKDIR /app
 
-# Install curl (for ECS health checks) and download AWS DocumentDB CA bundle
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+# sha256 of the linux.x86_64 ``bigBedToBed`` binary UCSC currently
+# publishes. UCSC does not expose pre-built versioned binaries (only
+# source tarballs), so the rolling URL is bound by content hash. When
+# UCSC ships a new build the layer rebuilds with the new hash after
+# maintainers re-verify out-of-band. Updating: download the binary,
+# run ``sha256sum``, paste here.
+ARG UCSC_BIGBEDTOBED_SHA256=9d1ea2158f5aa958fd8820fb7a2e5fb0947a9da7b183b8f9237429b8fbacd386
+
+# sha256 of the AWS RDS combined CA bundle this image embeds. AWS
+# rotates ``global-bundle.pem`` periodically (next-public rotations are
+# announced in advance). When AWS publishes a new bundle, maintainers
+# re-verify out-of-band and update this hash. Without the pin a MITM at
+# build-time could swap the trust anchor used for prod DB TLS.
+ARG RDS_BUNDLE_SHA256=e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
+
+# Install curl (for ECS health checks) and the bioinformatics tools the
+# workflow subsystem shells out to for preprocessing and indexing.
+# samtools/tabix/bcftools/gffread ship in Debian main; UCSC kent tools
+# come from the upstream release URL over HTTPS with sha256 verification
+# against the hash pinned in the ARG above so a MITM or silent tip
+# change cannot substitute an unexpected binary that then executes on
+# attacker-supplied bigBed bytes via the workflow shell pipelines.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        samtools \
+        tabix \
+        bcftools \
+        gffread \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail -sSL -o /usr/local/bin/bigBedToBed \
+        https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/bigBedToBed \
+    && echo "${UCSC_BIGBEDTOBED_SHA256}  /usr/local/bin/bigBedToBed" | sha256sum -c - \
+    && chmod +x /usr/local/bin/bigBedToBed \
     && mkdir -p /etc/cfdb/certs \
     && curl --fail -sS -o /etc/cfdb/certs/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    && echo "${RDS_BUNDLE_SHA256}  /etc/cfdb/certs/global-bundle.pem" | sha256sum -c - \
     && chmod 644 /etc/cfdb/certs/global-bundle.pem
 
 # Install the materializer binary
 COPY --from=builder /build/target/release/materialize /usr/local/bin/materialize
 
-# Install Python dependencies
+# Install Python dependencies — non-editable, production extras only.
+# Dev dependencies (test frameworks, linters) are NOT shipped to the
+# runtime image; install them in CI via ``pip install '.[dev]'``.
 COPY . /app
-RUN pip install --no-cache-dir -e ".[dev]"
-RUN pip install uvicorn
+RUN pip install --no-cache-dir . uvicorn
 
 # Create non-root user
 RUN useradd app

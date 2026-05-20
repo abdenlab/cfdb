@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -54,6 +53,18 @@ def _match(doc: dict, query: dict) -> bool:
                         return False
                 elif op == "$options":
                     pass  # handled by $regex branch
+                elif op == "$lt":
+                    if value is None or not (value < operand):
+                        return False
+                elif op == "$lte":
+                    if value is None or not (value <= operand):
+                        return False
+                elif op == "$gt":
+                    if value is None or not (value > operand):
+                        return False
+                elif op == "$gte":
+                    if value is None or not (value >= operand):
+                        return False
                 else:
                     return False
         else:
@@ -115,11 +126,98 @@ class _UpdateResult:
         self.modified_count = modified
 
 
+class _InsertOneResult:
+    def __init__(self, inserted_id) -> None:
+        self.inserted_id = inserted_id
+
+
+def _set_nested(doc: dict, key: str, value: Any) -> None:
+    """Assign ``value`` at a dot-notated path within ``doc``."""
+    parts = key.split(".")
+    cursor: dict = doc
+    for part in parts[:-1]:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    cursor[parts[-1]] = value
+
+
+def _apply_update(doc: dict, update: dict, *, is_insert: bool = False) -> bool:
+    """Apply a MongoDB-style update to ``doc`` in place. Return True if changed."""
+    changed = False
+    for op, fields in update.items():
+        if op == "$set":
+            for k, v in fields.items():
+                current = doc
+                for part in k.split(".")[:-1]:
+                    current = current.get(part, {}) if isinstance(current, dict) else {}
+                existing = current.get(k.split(".")[-1]) if isinstance(current, dict) else None
+                if existing != v:
+                    _set_nested(doc, k, v)
+                    changed = True
+        elif op == "$setOnInsert":
+            if is_insert:
+                for k, v in fields.items():
+                    _set_nested(doc, k, v)
+                    changed = True
+        elif op == "$unset":
+            for k in fields:
+                if k in doc:
+                    doc.pop(k)
+                    changed = True
+        elif op == "$addToSet":
+            for k, v in fields.items():
+                existing = doc.setdefault(k, [])
+                if v not in existing:
+                    existing.append(v)
+                    changed = True
+        else:
+            raise NotImplementedError(f"FakeCollection update op: {op}")
+    return changed
+
+
 class FakeCollection:
     """In-memory MongoDB collection stub."""
 
     def __init__(self) -> None:
         self.docs: list[dict] = []
+        # Each entry: (key_spec: dict, opts: dict). Supports opts["unique"]
+        # and opts["partialFilterExpression"] to exercise Mongo's partial
+        # unique index behavior in tests.
+        self._indexes: list[tuple[dict, dict]] = []
+
+    def create_index(self, spec: dict, **opts) -> None:
+        self._indexes.append((spec, opts))
+
+    def with_options(self, **_kwargs):
+        """No-op shim mirroring Motor's ``Collection.with_options``.
+
+        Production code calls ``db[collection].with_options(write_concern=...)``
+        to pin a per-collection write concern (see ``cfdb.workflows.lock._jobs``).
+        Tests don't model write-concern semantics — this stub returns the
+        same FakeCollection so downstream operations land on the same
+        in-memory document set.
+        """
+        return self
+
+    def _violates_unique(self, new_doc: dict) -> bool:
+        for spec, opts in self._indexes:
+            if not opts.get("unique"):
+                continue
+            partial_filter = opts.get("partialFilterExpression")
+            if partial_filter and not _match(new_doc, partial_filter):
+                continue
+            key_fields = list(spec.keys())
+            new_tuple = tuple(new_doc.get(k) for k in key_fields)
+            for existing in self.docs:
+                if partial_filter and not _match(existing, partial_filter):
+                    continue
+                existing_tuple = tuple(existing.get(k) for k in key_fields)
+                if existing_tuple == new_tuple:
+                    return True
+        return False
 
     def find(self, query: dict | None = None, projection: dict | None = None) -> _FakeCursor:
         if query is None:
@@ -132,10 +230,15 @@ class FakeCollection:
             matched = [{k: d[k] for k in fields if k in d} for d in matched]
         return _FakeCursor(matched)
 
-    async def find_one(self, query: dict) -> dict | None:
+    async def find_one(self, query: dict, projection: dict | None = None) -> dict | None:
+        # ``projection`` is accepted for Motor signature parity but the
+        # in-memory store is small enough that we always return the full
+        # document — projecting fields would require modeling Mongo's
+        # inclusion-vs-exclusion rules and dotted-path semantics, which
+        # the tests don't actually exercise.
         for d in self.docs:
             if _match(d, query):
-                return d
+                return dict(d)
         return None
 
     async def delete_many(self, query: dict) -> _DeleteResult:
@@ -148,6 +251,44 @@ class FakeCollection:
 
     async def insert_many(self, docs: list[dict]) -> None:
         self.docs.extend(docs)
+
+    async def insert_one(self, doc: dict) -> _InsertOneResult:
+        from pymongo.errors import DuplicateKeyError
+
+        if self._violates_unique(doc):
+            raise DuplicateKeyError("fake unique-index violation")
+        self.docs.append(dict(doc))
+        return _InsertOneResult(inserted_id=doc.get("_id"))
+
+    async def find_one_and_update(
+        self,
+        query: dict,
+        update: dict,
+        *,
+        upsert: bool = False,
+        return_document=None,
+        **_kwargs,
+    ) -> dict | None:
+        for d in self.docs:
+            if _match(d, query):
+                _apply_update(d, update, is_insert=False)
+                return dict(d)
+        if upsert:
+            seed: dict = {}
+            for k, v in query.items():
+                if k.startswith("$"):
+                    continue
+                if isinstance(v, dict):
+                    continue
+                seed[k] = v
+            _apply_update(seed, update, is_insert=True)
+            if self._violates_unique(seed):
+                from pymongo.errors import DuplicateKeyError
+
+                raise DuplicateKeyError("fake unique-index violation on upsert")
+            self.docs.append(dict(seed))
+            return dict(seed)
+        return None
 
     async def bulk_write(self, operations: list, ordered: bool = True) -> _BulkWriteResult:
         count = 0
@@ -179,17 +320,16 @@ class FakeCollection:
     async def update_one(self, query: dict, update: dict, **kwargs) -> _UpdateResult:
         for d in self.docs:
             if _match(d, query):
-                modified = 0
-                for k, v in update.get("$set", {}).items():
-                    if d.get(k) != v:
-                        d[k] = v
-                        modified = 1
+                modified = 1 if _apply_update(d, update, is_insert=False) else 0
                 return _UpdateResult(1, modified)
         if kwargs.get("upsert"):
-            new_doc = {**query}
-            for k, v in update.get("$set", {}).items():
-                new_doc[k] = v
-            self.docs.append(new_doc)
+            seed: dict = {}
+            for k, v in query.items():
+                if k.startswith("$") or isinstance(v, dict):
+                    continue
+                seed[k] = v
+            _apply_update(seed, update, is_insert=True)
+            self.docs.append(seed)
             return _UpdateResult(0, 0)
         return _UpdateResult(0, 0)
 

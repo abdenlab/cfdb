@@ -1,6 +1,46 @@
 // Create indexes on all queryable fields for performance
 // Note: 'files' is a view, so indexes go on underlying collections
 
+// ensureIndex(coll, keys, opts) — idempotent on matching spec, drops
+// and recreates on differing options. Use this instead of bare
+// ``createIndex`` for any index whose options (uniqueness,
+// partialFilterExpression, TTL) might evolve over time. Without
+// drop-and-recreate logic, re-running this script after a predicate
+// change raises ``IndexOptionsConflict`` and aborts the rest of the
+// script, leaving the database half-indexed.
+//
+// ``opts.name`` is required so we can match an existing index by name
+// rather than guessing from the key shape (different option sets on
+// the same key shape would otherwise collide).
+function ensureIndex(coll, keys, opts) {
+    if (!opts || !opts.name) {
+        throw new Error("ensureIndex requires opts.name");
+    }
+    var name = opts.name;
+    var existing = coll.getIndexes();
+    var match = null;
+    for (var i = 0; i < existing.length; i++) {
+        if (existing[i].name === name) {
+            match = existing[i];
+            break;
+        }
+    }
+    // Quick path: same name, same options shape — no-op.
+    if (match) {
+        var sameUnique = !!match.unique === !!opts.unique;
+        var samePFE = JSON.stringify(match.partialFilterExpression || null)
+            === JSON.stringify(opts.partialFilterExpression || null);
+        var sameTTL = (match.expireAfterSeconds || null)
+            === (opts.expireAfterSeconds || null);
+        if (sameUnique && samePFE && sameTTL) {
+            return;
+        }
+        print("ensureIndex: dropping " + name + " (options changed)");
+        coll.dropIndex(name);
+    }
+    coll.createIndex(keys, opts);
+}
+
 print("Creating indexes on 'file' collection...");
 db.file.createIndex({ id_namespace: 1 });
 db.file.createIndex({ local_id: 1 });
@@ -141,6 +181,56 @@ db.subject_in_collection.createIndex({ submission: 1 });
 
 print("Creating indexes on 'locks' collection...");
 db.locks.createIndex({ active: 1 });
+
+print("Creating indexes on 'jobs' collection...");
+// Partial unique index on workflow_key enforces per-source mutex: only one
+// active job (pending|running) may exist per source file. Terminal jobs
+// fall outside the filter so fresh claims can succeed.
+//
+// IMPORTANT: the status values below MUST stay in sync with
+// cfdb.workflows.models.ACTIVE_STATUSES. Renaming either side without
+// updating both desyncs the partial index from the application's
+// active-status definition and breaks the mutex contract.
+//
+// Compatibility: requires MongoDB >= 3.2 (partial indexes) and a
+// DocumentDB engine version that supports partialFilterExpression.
+// Re-running with a changed predicate raises IndexOptionsConflict;
+// dropIndex first if the active-status set ever changes.
+ensureIndex(
+    db.jobs,
+    { workflow_key: 1 },
+    {
+        name: "workflow_key_active_unique",
+        unique: true,
+        partialFilterExpression: {
+            status: { $in: ["pending", "running"] }
+        }
+    }
+);
+ensureIndex(db.jobs, { job_id: 1 }, { name: "job_id_unique", unique: true });
+ensureIndex(
+    db.jobs,
+    { status: 1, updated_at: 1 },
+    { name: "status_updated_at" }
+);
+
+// TTL index on terminal job rows. Without this, every stale-reclaim
+// transition leaves a permanent ``failed`` document and the collection
+// grows unbounded for any frequently-touched workflow_key. The partial
+// filter excludes active rows so the TTL never reaps an in-flight job.
+// 7 days gives operators a window to investigate recent failures before
+// the row is reclaimed.
+ensureIndex(
+    db.jobs,
+    { updated_at: 1 },
+    {
+        name: "terminal_ttl",
+        expireAfterSeconds: 60 * 60 * 24 * 7,
+        partialFilterExpression: {
+            status: { $in: ["completed", "failed"] }
+        }
+    }
+);
 
 print("Creating indexes on 'ncbi_taxonomy' collection...");
 db.ncbi_taxonomy.createIndex({ id: 1 });
