@@ -11,16 +11,18 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp",
+    "boto3",
     "click",
     "debugpy",
     "fastapi",
+    "grpcio>=1.81.1",
     "motor",
     "pydantic>=2,<3",
     "pymongo",
     "requests",
     "strawberry-graphql",
     "uvicorn",
-    "wool>=0.9.0rc1,<0.10",
+    "wool==0.9.3",
 ]
 description = "A Python utility for parsing and normalizing various DCC datapackages."
 dynamic = ["version"]
@@ -30,7 +32,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
 
 [project.optional-dependencies]
-dev = ["allpairspy", "debugpy", "httpx", "hypothesis", "mongomock-motor", "pytest-asyncio", "pytest-mock", "ruff"]
+dev = ["allpairspy", "debugpy", "httpx", "hypothesis", "mongomock-motor", "moto[ecs,s3]", "pytest-asyncio", "pytest-mock", "ruff"]
 
 [project.scripts]
 cfdb = "cfdb.cli:cli"
