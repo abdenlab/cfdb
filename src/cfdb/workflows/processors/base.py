@@ -7,6 +7,9 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from cfdb.workflows import keys as key_utils
+from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.events import WorkflowEvent
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.tools import format_name
 
@@ -21,15 +24,15 @@ class Processor(ABC):
     retry, the processor consults the cache and skips any stage whose
     output is already present.
 
-    ``run`` is an async generator that yields a typed event stream:
+    ``run`` is an async generator that yields typed
+    :mod:`cfdb.workflows.events` objects:
 
-    - ``{"event": "stage_complete", "kind": ArtifactKind.<X>.value,
-       "key": <cache_key>}`` — emit after each ``cache.put`` for a stage
-       so the API process can persist ``stages_done`` /
-       ``artifact_cache_keys`` incrementally, not all at the end.
-    - ``{"event": "complete", "artifacts": {kind: key, ...}}`` — emit
-       once at the end with the full artifact map. Subclasses MUST emit
-       this as the last yield.
+    - :class:`~cfdb.workflows.events.StageComplete` — emit after each
+       ``cache.put`` for a stage so the API process can persist
+       ``stages_done`` / ``artifact_cache_keys`` incrementally, not all
+       at the end.
+    - :class:`~cfdb.workflows.events.Complete` — emit once at the end with
+       the full artifact map. Subclasses MUST emit this as the last yield.
 
     The wool routine wrapper composes a heartbeat loop around the
     processor's stream, so the processor itself never has to think
@@ -68,6 +71,31 @@ class Processor(ABC):
         """
         return self.artifact_kinds
 
+    def cache_key_for(
+        self, file_meta: dict[str, Any], artifact_kind: ArtifactKind
+    ) -> str:
+        """Return the cache key this processor writes ``artifact_kind`` under.
+
+        The single authority for cache-key derivation. The router probes
+        the cache with this key, the processor ``put``s under it, and the
+        :class:`~cfdb.workflows.events.StageComplete` event carries it — so
+        all three agree by construction rather than by three independent
+        re-derivations that must be kept in sync. ``processor_version`` is
+        baked in, so bumping it invalidates this processor's cached
+        artifacts without disturbing other processors'.
+
+        Raises ``ValueError`` (via :func:`extract_identity`) when
+        ``file_meta`` is missing dcc / local_id / md5.
+        """
+        dcc, local_id, md5 = key_utils.extract_identity(file_meta)
+        return key_utils.cache_key(
+            dcc=dcc,
+            local_id=local_id,
+            artifact_kind=artifact_kind,
+            md5=md5,
+            processor_version=self.processor_version,
+        )
+
     def needs_processing(self, file_meta: dict[str, Any]) -> bool:
         """Return True when this processor is applicable and has work to do.
 
@@ -86,8 +114,8 @@ class Processor(ABC):
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache_root: Path,
-    ) -> AsyncIterator[dict[str, Any]]:
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         """Execute the pipeline end-to-end as an event stream.
 
         Args:
@@ -95,14 +123,19 @@ class Processor(ABC):
                 (``FileMetadataModel.model_dump()``).
             workdir: A per-job scratch directory. The processor MAY create
                 files here freely; the caller cleans it up after the job.
-            cache_root: Root directory of the configured ``LocalFsCache``.
-                The processor writes its artifacts directly under keys
-                derived from ``file_meta``.
+            cache: The configured cache backend (``LocalFsCache`` or
+                ``S3Cache``), handed across the Wool boundary so artifacts
+                are persisted to the deployment's real backing store. The
+                processor materialises each artifact locally under
+                ``workdir`` and then ``cache.put``s it under a key derived
+                from ``file_meta``. Reusing the injected backend (rather
+                than constructing a ``LocalFsCache``) is what lets the
+                S3/ECS profile actually persist artifacts to S3.
 
         Yields:
-            ``{"event": "stage_complete", "kind": <str>, "key": <str>}``
-            after each stage's ``cache.put``; one final
-            ``{"event": "complete", "artifacts": {kind: key}}`` event.
-            Implementations MUST be ``async def`` functions that use
-            ``yield`` (i.e., async generators).
+            A :class:`~cfdb.workflows.events.StageComplete` after each
+            stage's ``cache.put``, then one final
+            :class:`~cfdb.workflows.events.Complete`. Implementations MUST
+            be ``async def`` functions that use ``yield`` (i.e., async
+            generators).
         """

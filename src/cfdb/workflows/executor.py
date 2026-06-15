@@ -53,6 +53,14 @@ from cfdb.workflows import (
     keys as key_utils,
 )
 from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.events import (
+    Complete,
+    Error,
+    Heartbeat,
+    Progress,
+    StageComplete,
+    WorkflowEvent,
+)
 from cfdb.workflows.lock import (
     claim_workflow,
     heartbeat_workflow,
@@ -61,9 +69,10 @@ from cfdb.workflows.lock import (
     release_workflow,
     update_progress,
 )
-from cfdb.workflows.models import ArtifactKind, JobRecord, JobStatus
+from cfdb.workflows.models import JobRecord, JobStatus
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.registry import ProcessorRegistry
+from cfdb.workflows.provisioner import EcsProvisioner, RetryableProvisionerError
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +81,29 @@ logger = logging.getLogger(__name__)
 #: change to the workflow orchestration itself).
 PIPELINE_VERSION = 1
 
-#: Default job-runtime cap. 20 minutes covers a sort+index on a multi-GB
-#: BAM comfortably; exceptional files that need longer should be
-#: addressed individually. Sourced from the env var so deployments can
-#: override without a code change.
-DEFAULT_WORKFLOW_DURATION_CAP_SECONDS = WORKFLOW_DURATION_CAP_S
+#: Job-runtime cap. 4 hours covers multi-hour preprocessing runs (e.g.,
+#: a ``samtools sort`` on a multi-GB BAM followed by ``samtools index``);
+#: exceptional files that need longer should be addressed individually.
+#: Sourced from ``CFDB_WORKFLOW_DURATION_CAP_S`` (default 14400 s = 4 h)
+#: so deployments can override without a code change. Module-level
+#: rather than a ctor kwarg because tests cap it via ``monkeypatch.setattr``
+#: alongside the other dispatch knobs (``_DISPATCH_WAIT_SECONDS``,
+#: ``_HEARTBEAT_INTERVAL_S``) and uniform module-state keeps fixture
+#: shape consistent.
+_WORKFLOW_DURATION_CAP_SECONDS = WORKFLOW_DURATION_CAP_S
+
+#: Persisted ``error`` prefix surfaced to clients when the dispatch
+#: budget is exhausted with no workers available. The prefix is part
+#: of the on-wire contract — clients parse it to decide whether to
+#: resubmit. Kept as a module constant so tests can import the same
+#: symbol the executor writes.
+_ERR_PREFIX_CAPACITY = "capacity:"
+
+#: Persisted ``error`` prefix surfaced to clients when the provisioner
+#: itself raises a non-retryable exception. Distinct from
+#: :data:`_ERR_PREFIX_CAPACITY` so clients can tell "retry me later,
+#: capacity issue" apart from "the provisioner crashed".
+_ERR_PREFIX_PROVISIONER = "provisioner:"
 
 #: Total wall-clock budget waiting for a leased worker to surface during
 #: dispatch. Sized for an ECS cold start (target ~30-90s on Fargate) so a
@@ -96,6 +123,19 @@ _DISPATCH_RETRY_INTERVAL_SECONDS = 1.0
 #: refreshes ``JobRecord.updated_at`` on each heartbeat so a healthy
 #: long-running stage doesn't get reclaimed as stale.
 _HEARTBEAT_INTERVAL_S = float(WORKFLOW_HEARTBEAT_INTERVAL_S)
+
+#: Grace given to ``_finalize`` tasks during ``drain``'s second phase
+#: after the primary ``_pending_tasks`` gather is done. A workflow that
+#: failed mid-write — Mongo connection blip, S3 cache cleanup blocked
+#: on a slow workdir rmtree — gets this long for its ``release_workflow``
+#: write and ``shutil.rmtree`` to land before the lifespan teardown
+#: closes the Motor client. ``release_workflow`` not completing within
+#: the grace is *recoverable*: the row stays at ``RUNNING`` and
+#: stale-reclamation on next service start releases it as FAILED.
+#: Tuning above ~3s would protect more cases but stretches the lifespan
+#: shutdown budget; operators that want tighter coupling should pair an
+#: increase here with a matching decrease in ``STALE_WORKFLOW_THRESHOLD``.
+_FINALIZE_DRAIN_GRACE_SECONDS = 3.0
 
 
 class WorkflowNotApplicable(ValueError):
@@ -143,27 +183,36 @@ async def _run_processor_routine(
     processor: Processor,
     file_meta: dict[str, Any],
     workdir_str: str,
-    cache_root_str: str,
-) -> AsyncIterator[dict[str, Any]]:
+    cache: CacheBackend,
+) -> AsyncIterator[WorkflowEvent]:
     """Wool routine body: stream processor events back to the dispatcher.
 
     The processor itself is an async generator that yields
-    ``stage_complete`` and ``complete`` events. We wrap its stream with a
-    heartbeat-aware iterator: while waiting on the next event from the
-    processor, every ``_HEARTBEAT_INTERVAL_S`` we inject a
-    ``{"event": "heartbeat"}`` so the API process can refresh
-    ``JobRecord.updated_at`` and signal liveness without requiring the
-    worker to touch Mongo. An exception from the processor is converted
-    to an ``{"event": "error", ...}`` event so the API consumer can
-    record a clean terminal state.
+    :class:`~cfdb.workflows.events.StageComplete` and
+    :class:`~cfdb.workflows.events.Complete` events. We wrap its stream
+    with a heartbeat-aware iterator: while waiting on the next event from
+    the processor, every ``_HEARTBEAT_INTERVAL_S`` we inject a
+    :class:`~cfdb.workflows.events.Heartbeat` so the API process can
+    refresh ``JobRecord.updated_at`` and signal liveness without requiring
+    the worker to touch Mongo. An exception from the processor is
+    converted to an :class:`~cfdb.workflows.events.Error` event so the API
+    consumer can record a clean terminal state.
 
     Arguments are cloudpickle-serializable: ``processor`` is a stateless
     class instance, ``file_meta`` is a plain dict (B1 strips Mongo's
-    ``_id``), and path arguments cross as strings.
+    ``_id``), ``workdir_str`` crosses as a string, and ``cache`` is the
+    configured :class:`CacheBackend` itself — ``LocalFsCache`` carries
+    only its root ``Path``; ``S3Cache`` drops its boto3 client in
+    ``__getstate__`` and rebuilds it on the worker in ``__setstate__``.
+    Handing the real backend across (rather than a bare cache-root path
+    the worker would wrap in a ``LocalFsCache``) is what lets the
+    S3/ECS profile persist artifacts to the shared S3 store the API
+    reads from; otherwise the worker writes to its own local disk and
+    the API's ``cache.head`` never finds the artifact.
     """
     workdir = Path(workdir_str)
     workdir.mkdir(parents=True, exist_ok=True)
-    inner = processor.run(file_meta, workdir, Path(cache_root_str)).__aiter__()
+    inner = processor.run(file_meta, workdir, cache).__aiter__()
     next_task: Optional[asyncio.Task] = None
     try:
         while True:
@@ -180,7 +229,7 @@ async def _run_processor_routine(
                     )
                     break
                 except asyncio.TimeoutError:
-                    yield {"event": "heartbeat"}
+                    yield Heartbeat()
                 except StopAsyncIteration:
                     # ``wait_for`` re-raises whatever the underlying
                     # task raised. Per PEP 479 a StopAsyncIteration
@@ -201,11 +250,7 @@ async def _run_processor_routine(
                 # API process records a clean FAILED status. Re-raising
                 # would interleave with wool's exception-streaming path
                 # and yields a less specific error string to /jobs/{id}.
-                yield {
-                    "event": "error",
-                    "type": type(exc).__name__,
-                    "error": str(exc),
-                }
+                yield Error(type=type(exc).__name__, error=str(exc))
                 return
             next_task = None
             yield event
@@ -223,27 +268,57 @@ async def _run_processor_routine(
 
 
 class WoolExecutor(JobExecutor):
-    """Executor backed by a ``wool.WorkerPool`` and a Mongo jobs collection."""
+    """Executor backed by a ``wool.WorkerPool`` and a Mongo jobs collection.
+
+    When configured with an :class:`EcsProvisioner`, the executor also
+    issues a ``RunTask`` on each fresh claim before opening the routine
+    stream, so a Fargate worker boots before the dispatch retry loop
+    begins polling for it. Without a provisioner (PoC dev profile) the
+    executor relies on workers already published into the discovery
+    namespace.
+
+    A :class:`RetryableProvisionerError` from the provisioner surfaces
+    as a terminal ``FAILED`` job with a ``capacity:``-prefixed error
+    string; any other provisioner failure surfaces with a
+    ``provisioner:`` prefix. Clients parse the prefix to decide
+    whether to resubmit.
+
+    Args:
+        db: Motor database handle holding the ``jobs`` collection.
+        cache: Cache backend for processor artifacts. The executor
+            hands this backend across the Wool boundary to the worker so
+            processors persist artifacts to the deployment's real store
+            (local FS or S3), not a worker-local filesystem.
+        registry: Processor registry mapping artifact kinds to runners.
+        workdir_root: Parent directory under which per-job workdirs land.
+        pipeline_version: Embedded in workflow keys; bump to invalidate
+            every in-flight workflow.
+        provisioner: Optional :class:`EcsProvisioner`. When ``None``
+            (PoC profile), no ``RunTask`` is issued and dispatch
+            relies on pre-existing workers.
+
+    The per-workflow wall-clock cap is module-level
+    (:data:`_WORKFLOW_DURATION_CAP_SECONDS`) so it monkey-patches the
+    same way as the other dispatch-tier knobs.
+    """
 
     def __init__(
         self,
         db,
         cache: CacheBackend,
-        cache_root: Path,
         registry: ProcessorRegistry,
         *,
         workdir_root: Path,
         pipeline_version: int = PIPELINE_VERSION,
-        workflow_duration_cap_seconds: int = DEFAULT_WORKFLOW_DURATION_CAP_SECONDS,
+        provisioner: Optional[EcsProvisioner] = None,
     ) -> None:
         self._db = db
         self._cache = cache
-        self._cache_root = Path(cache_root)
         self._registry = registry
         self._workdir_root = Path(workdir_root)
         self._workdir_root.mkdir(parents=True, exist_ok=True)
         self._pipeline_version = pipeline_version
-        self._workflow_duration_cap_seconds = workflow_duration_cap_seconds
+        self._provisioner = provisioner
         self._pending_tasks: set[asyncio.Task] = set()
         #: Finalize tasks (release_workflow + workdir cleanup) created by
         #: _run_workflow's `finally`. Tracked separately so drain() can
@@ -287,7 +362,9 @@ class WoolExecutor(JobExecutor):
         )
 
         if fresh:
-            task = asyncio.create_task(self._run_workflow(record, processor, file_meta))
+            task = asyncio.create_task(
+                self._run_workflow(record, processor, file_meta)
+            )
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
             task.add_done_callback(_log_unexpected_exception)
@@ -337,16 +414,17 @@ class WoolExecutor(JobExecutor):
                 await asyncio.gather(*pending, return_exceptions=True)
 
         # Second phase: await any finalize tasks that the cancellation
-        # path may have left running under their shield. Bounded by a
-        # short grace so a stuck Mongo write doesn't hold up shutdown
-        # indefinitely; tasks not done after this are abandoned, and
-        # their jobs will be reclaimed as stale on next service start.
+        # path may have left running under their shield. Bounded by
+        # ``_FINALIZE_DRAIN_GRACE_SECONDS`` so a stuck Mongo write
+        # doesn't hold up shutdown indefinitely; tasks not done after
+        # this are abandoned, and their jobs will be reclaimed as
+        # stale on next service start.
         finalize_pending = list(self._finalize_tasks)
         if finalize_pending:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(
                     asyncio.gather(*finalize_pending, return_exceptions=True),
-                    timeout=3.0,
+                    timeout=_FINALIZE_DRAIN_GRACE_SECONDS,
                 )
         return len(pending)
 
@@ -389,6 +467,56 @@ class WoolExecutor(JobExecutor):
                 final_error = f"mark_running failed: {exc}"
                 return
 
+            # Request a worker via the external provisioner (e.g. ECS
+            # ``RunTask``) before opening the routine stream. The
+            # provisioner dedup-keys on the workflow mutex so two
+            # concurrent fresh claims for the same source file
+            # share one ``RunTask`` and one worker.
+            #
+            # ``RetryableProvisionerError`` is treated as a best-effort
+            # scale-up failure, not a workflow-level failure: the Wool
+            # pool routes ``@wool.routine`` calls to *any* available
+            # worker via the discovery namespace, so an existing idle
+            # worker can still service this job. Log a warning and fall
+            # through to ``_open_stream_with_retry``; the
+            # ``capacity:``-prefixed terminal status is reserved for the
+            # case where dispatch *also* exhausts its budget with no
+            # workers available.
+            if self._provisioner is not None:
+                try:
+                    await self._provisioner.request(dedup_key=record.workflow_key)
+                except asyncio.CancelledError:
+                    final_error = "Workflow cancelled (worker shutdown)"
+                    raise
+                except RetryableProvisionerError as exc:
+                    logger.warning(
+                        "Provisioner reported retryable capacity error for %s; "
+                        "falling through to dispatch against existing workers: %s",
+                        record.job_id,
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Provisioner request failed for %s", record.job_id
+                    )
+                    final_error = f"{_ERR_PREFIX_PROVISIONER} {exc}"
+                    return
+                # Bound the stale-reclaim window across the provisioner
+                # round-trip: ``mark_running`` ran before
+                # ``provisioner.request`` and a Fargate cold start can
+                # plausibly exceed STALE_WORKFLOW_THRESHOLD. Heartbeat
+                # so the row stays fresh through the upcoming dispatch
+                # wait. A failed heartbeat is logged but does not
+                # abort the workflow — the next ``heartbeat`` event in
+                # the stream loop will retry.
+                try:
+                    await heartbeat_workflow(self._db, record.job_id)
+                except Exception:
+                    logger.exception(
+                        "Post-provisioner heartbeat failed for %s; continuing",
+                        record.job_id,
+                    )
+
             try:
                 stream = await self._open_stream_with_retry(
                     processor, file_meta, workdir
@@ -396,16 +524,28 @@ class WoolExecutor(JobExecutor):
             except asyncio.CancelledError:
                 final_error = "Workflow cancelled (worker shutdown)"
                 raise
+            except wool.NoWorkersAvailable as exc:
+                # Dispatch budget exhausted with no workers reachable.
+                # ``capacity:`` is the stable on-wire prefix clients
+                # parse to decide whether to resubmit the job — its
+                # origin shifted from the provisioner-failure branch
+                # (which now falls through) to here, but the wire
+                # contract is unchanged.
+                logger.warning(
+                    "Dispatch budget exhausted for %s with no workers available",
+                    record.job_id,
+                )
+                final_error = f"{_ERR_PREFIX_CAPACITY} {exc}"
+                return
             except Exception as exc:
                 logger.exception("Failed to open routine stream for %s", record.job_id)
                 final_error = str(exc)
                 return
 
             try:
-                async with asyncio.timeout(self._workflow_duration_cap_seconds):
+                async with asyncio.timeout(_WORKFLOW_DURATION_CAP_SECONDS):
                     async for event in stream:
-                        kind = event.get("event")
-                        if kind == "heartbeat":
+                        if isinstance(event, Heartbeat):
                             try:
                                 await heartbeat_workflow(self._db, record.job_id)
                             except Exception:
@@ -413,44 +553,28 @@ class WoolExecutor(JobExecutor):
                                     "Heartbeat failed for %s; continuing",
                                     record.job_id,
                                 )
-                        elif kind == "progress":
-                            value = event.get("value")
-                            if isinstance(value, str) and value:
+                        elif isinstance(event, Progress):
+                            if event.value:
                                 try:
                                     await update_progress(
-                                        self._db, record.job_id, value
+                                        self._db, record.job_id, event.value
                                     )
                                 except Exception:
                                     logger.exception(
                                         "update_progress failed for %s; continuing",
                                         record.job_id,
                                     )
-                        elif kind == "stage_complete":
-                            try:
-                                artifact_kind = ArtifactKind(event["kind"])
-                            except (KeyError, ValueError) as exc:
-                                raise RuntimeError(
-                                    f"Processor {processor.__class__.__name__} "
-                                    f"emitted malformed stage_complete event: "
-                                    f"{event!r}"
-                                ) from exc
-                            cache_key = event.get("key")
-                            if not cache_key:
-                                raise RuntimeError(
-                                    f"Processor {processor.__class__.__name__} "
-                                    f"emitted stage_complete with no key: "
-                                    f"{event!r}"
-                                )
+                        elif isinstance(event, StageComplete):
                             try:
                                 await record_stage_complete(
                                     self._db,
                                     record.job_id,
-                                    stage=artifact_kind.value,
-                                    artifact_kind=artifact_kind,
-                                    cache_key=cache_key,
+                                    stage=event.kind.value,
+                                    artifact_kind=event.kind,
+                                    cache_key=event.key,
                                 )
                             except Exception as exc:
-                                # The cache artifact is already on disk —
+                                # The cache artifact is already committed —
                                 # a retry will hit the cache via ``head()``
                                 # and skip this stage. Fail the workflow so
                                 # the next request re-dispatches cleanly
@@ -466,29 +590,36 @@ class WoolExecutor(JobExecutor):
                                     f"record_stage_complete failed: {exc}"
                                 )
                                 break
-                        elif kind == "complete":
+                        elif isinstance(event, Complete):
                             final_status = JobStatus.COMPLETED
                             final_error = None
                             break
-                        elif kind == "error":
-                            err_type = event.get("type", "Error")
-                            err_text = event.get("error", "")
+                        elif isinstance(event, Error):
                             final_status = JobStatus.FAILED
-                            final_error = f"{err_type}: {err_text}"
+                            final_error = f"{event.type}: {event.error}"
                             break
                         else:
                             logger.warning(
                                 "Unknown routine event %r for job %s",
-                                kind,
+                                event,
                                 record.job_id,
                             )
             except asyncio.TimeoutError:
                 final_error = (
-                    f"Workflow exceeded {self._workflow_duration_cap_seconds}s "
+                    f"Workflow exceeded {_WORKFLOW_DURATION_CAP_SECONDS}s "
                     "runtime cap"
                 )
             except asyncio.CancelledError:
-                final_error = "Workflow cancelled (worker shutdown)"
+                # Only overwrite the cancellation message when the
+                # stream hadn't already reached a terminal status. A
+                # ``complete`` event flips ``final_status`` to
+                # COMPLETED and ``break``s; a cancel delivered between
+                # the ``break`` and this except clause would otherwise
+                # overwrite ``final_error`` with the cancel reason and
+                # persist the contradictory (status=COMPLETED,
+                # error=cancelled) pair via ``release_workflow``.
+                if final_status == JobStatus.FAILED:
+                    final_error = "Workflow cancelled (worker shutdown)"
                 raise
             except Exception as exc:
                 logger.exception(
@@ -568,7 +699,7 @@ class WoolExecutor(JobExecutor):
         ``NoWorkersAvailable`` retries on each attempt to open the
         stream. ``_DISPATCH_WAIT_SECONDS`` caps the total wait so a
         stuck scale-up surfaces as a workflow failure rather than
-        hanging until the much-larger ``workflow_duration_cap_seconds``
+        hanging until the much-larger ``_WORKFLOW_DURATION_CAP_SECONDS``
         cap fires.
 
         Returns an async iterator that yields the first event followed
@@ -586,27 +717,40 @@ class WoolExecutor(JobExecutor):
                 processor,
                 file_meta,
                 str(workdir),
-                str(self._cache_root),
+                self._cache,
             )
+            # ``returning`` flips True only after we've handed the
+            # stream off to ``_prepend_first_event``. Any other exit
+            # from this iteration (NoWorkersAvailable, CancelledError
+            # from __anext__ or the inter-iteration sleep, unexpected
+            # exception) leaves the freshly-constructed stream
+            # unawaited; the finally aclose()s it so wool's pool can
+            # release the lease cleanly on drain.
+            returning = False
             try:
-                first_event = await stream.__anext__()
+                try:
+                    first_event = await stream.__anext__()
+                except wool.NoWorkersAvailable as exc:
+                    last_exc = exc
+                    attempt += 1
+                    if loop.time() >= deadline:
+                        break
+                    if attempt >= 2:
+                        logger.warning(
+                            "No workers available — retrying dispatch "
+                            "(attempt %d, %.1fs of %.1fs budget remaining)",
+                            attempt,
+                            deadline - loop.time(),
+                            _DISPATCH_WAIT_SECONDS,
+                        )
+                    await asyncio.sleep(_DISPATCH_RETRY_INTERVAL_SECONDS)
+                    continue
+                returning = True
                 return _prepend_first_event(first_event, stream)
-            except wool.NoWorkersAvailable as exc:
-                with contextlib.suppress(BaseException):
-                    await stream.aclose()
-                last_exc = exc
-                attempt += 1
-                if loop.time() >= deadline:
-                    break
-                if attempt >= 2:
-                    logger.warning(
-                        "No workers available — retrying dispatch "
-                        "(attempt %d, %.1fs of %.1fs budget remaining)",
-                        attempt,
-                        deadline - loop.time(),
-                        _DISPATCH_WAIT_SECONDS,
-                    )
-                await asyncio.sleep(_DISPATCH_RETRY_INTERVAL_SECONDS)
+            finally:
+                if not returning:
+                    with contextlib.suppress(BaseException):
+                        await stream.aclose()
         assert last_exc is not None
         raise last_exc
 

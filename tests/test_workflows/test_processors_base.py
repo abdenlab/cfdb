@@ -7,8 +7,11 @@ from typing import Any
 
 import pytest
 
+from cfdb.workflows import keys as key_utils
+from cfdb.workflows.events import Complete
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.base import Processor
+from tests.test_workflows import FIXTURE_MD5
 
 
 class _ConcreteProcessor(Processor):
@@ -119,14 +122,62 @@ class TestProcessor:
             supported_formats = frozenset({"BAM"})
             artifact_kinds = (ArtifactKind.INDEX,)
 
-            async def run(self, file_meta, workdir, cache_root):
-                yield {"event": "complete", "artifacts": {}}
+            async def run(self, file_meta, workdir, cache):
+                yield Complete(artifacts={})
 
         # Act
         kinds = _IndexOnly().artifact_kinds_produced(None)
 
         # Assert
         assert kinds == (ArtifactKind.INDEX,)
+
+    def test_cache_key_for_should_match_keys_module_with_processor_version(self):
+        """Test that cache_key_for is the canonical key the router probes.
+
+        Given:
+            A processor with processor_version 1 and a complete file_meta.
+        When:
+            cache_key_for is called for the DATA artifact.
+        Then:
+            It should equal the key keys.cache_key derives with the same
+            identity and the processor's version — so the router probe,
+            the processor put, and the StageComplete event all agree.
+        """
+        # Arrange
+        meta = {
+            "dcc": {"dcc_abbreviation": "ENCODE"},
+            "local_id": "ENCFF1",
+            "md5": FIXTURE_MD5,
+        }
+
+        # Act
+        key = _ConcreteProcessor().cache_key_for(meta, ArtifactKind.DATA)
+
+        # Assert
+        assert key == key_utils.cache_key(
+            dcc="ENCODE",
+            local_id="ENCFF1",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=1,
+        )
+
+    def test_cache_key_for_should_raise_when_file_meta_incomplete(self):
+        """Test that cache_key_for surfaces incomplete metadata loudly.
+
+        Given:
+            A file_meta missing local_id and md5.
+        When:
+            cache_key_for is called.
+        Then:
+            It should raise ValueError (via extract_identity) so the
+            router treats the file as workflow-not-applicable.
+        """
+        # Act & assert
+        with pytest.raises(ValueError):
+            _ConcreteProcessor().cache_key_for(
+                {"dcc": {"dcc_abbreviation": "ENCODE"}}, ArtifactKind.DATA
+            )
 
     def test_processor_should_be_abstract_and_reject_direct_instantiation(self):
         """Test that ``Processor`` cannot be instantiated directly.

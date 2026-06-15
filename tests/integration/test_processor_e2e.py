@@ -168,7 +168,7 @@ class TestProcessorE2E:
             assert final.stages_done == ["index"]
             assert "data" not in final.artifact_cache_keys
 
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bai = cache_root / final.artifact_cache_keys["index"]
             assert cached_bai.stat().st_size > 0
 
@@ -222,7 +222,7 @@ class TestProcessorE2E:
             # Assert
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bam = cache_root / final.artifact_cache_keys["data"]
             subprocess.run(
                 ["samtools", "quickcheck", str(cached_bam)],
@@ -275,7 +275,7 @@ class TestProcessorE2E:
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
 
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
             cached_tbi = cache_root / final.artifact_cache_keys["index"]
             assert cached_bgz.stat().st_size > 0
@@ -357,7 +357,7 @@ class TestProcessorE2E:
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
 
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
             cached_tbi = cache_root / final.artifact_cache_keys["index"]
             assert cached_bgz.stat().st_size > 0
@@ -412,7 +412,7 @@ class TestProcessorE2E:
             # Assert
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
             decoded = gzip.decompress(cached_bgz.read_bytes()).decode()
             data_lines = [
@@ -459,7 +459,7 @@ class TestProcessorE2E:
             # Assert
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
             cached_tbi = cache_root / final.artifact_cache_keys["index"]
             assert cached_bgz.stat().st_size > 0
@@ -505,7 +505,7 @@ class TestProcessorE2E:
             # Assert
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
             cached_tbi = cache_root / final.artifact_cache_keys["index"]
             assert cached_bgz.stat().st_size > 0
@@ -556,7 +556,7 @@ class TestProcessorE2E:
             assert (
                 first_final is not None and first_final.status == JobStatus.COMPLETED
             )
-            cache_root = integration_executor._cache_root
+            cache_root = integration_executor._cache.root
             first_data = (
                 cache_root / first_final.artifact_cache_keys["data"]
             ).read_bytes()

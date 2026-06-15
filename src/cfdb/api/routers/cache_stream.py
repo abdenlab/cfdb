@@ -18,10 +18,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from cfdb import api
 from cfdb.services import drs
-from cfdb.workflows import keys as key_utils
 from cfdb.workflows.cache import CacheBackend
 from cfdb.workflows.executor import ExecutorDraining, WorkflowNotApplicable
-from cfdb.workflows.keys import extract_identity
 from cfdb.workflows.models import ArtifactKind
 
 logger = logging.getLogger(__name__)
@@ -101,6 +99,96 @@ def stream_cache_entry(
     )
 
 
+def stream_upstream_url(
+    download_url: str,
+    file_size: Optional[int],
+    filename: str,
+    request: Request,
+    range_header: Optional[str],
+    *,
+    media_type: str = "application/octet-stream",
+):
+    """Return a Response streaming an upstream URL, honoring Range.
+
+    The upstream-URL twin of :func:`stream_cache_entry`: same parse-range
+    / 200-vs-206 / HEAD ritual, but the bytes come from ``download_url``
+    via :func:`drs.stream_from_url` instead of a ``CacheBackend``. The
+    DRS/HTTPS, ENCODE, and 4DN-sidecar paths all delegate here so the
+    range contract stays in one place.
+
+    Args:
+        download_url: Absolute URL to stream from (already allowlist-validated
+            by the caller where applicable).
+        file_size: Total size in bytes, or ``None`` when unknown. A range
+            request against an unknown size yields ``416`` per RFC 9110
+            §15.5.17 (not ``500``).
+        filename: Used for the ``Content-Disposition`` header.
+        request: FastAPI request — used to detect HEAD vs GET.
+        range_header: Raw value of the incoming ``Range`` header, if any.
+        media_type: Content-Type to return.
+
+    Raises:
+        HTTPException(416): size unknown on a range request, or the range
+            is valid but out of bounds.
+        HTTPException(400): Range header has invalid syntax.
+    """
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{filename or "file"}"',
+        "Accept-Ranges": "bytes",
+    }
+    status_code = status.HTTP_200_OK
+    range_to_send: Optional[str] = None
+
+    if range_header:
+        if not file_size:
+            # RFC 9110 §15.5.17: a range request the server cannot satisfy
+            # because the total size is unknown produces 416 with
+            # ``Content-Range: bytes */*`` so the client can fall back to a
+            # plain GET. (The 4DN sidecar path previously mis-signalled 500.)
+            raise HTTPException(
+                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                detail="File size unknown; range cannot be satisfied",
+                headers={"Content-Range": "bytes */*"},
+            )
+        try:
+            start, end, content_length = drs.parse_range_header(
+                range_header, file_size
+            )
+            range_to_send = range_header
+            status_code = status.HTTP_206_PARTIAL_CONTENT
+            response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            response_headers["Content-Length"] = str(content_length)
+        except drs.RangeNotSatisfiableError as e:
+            raise HTTPException(
+                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                headers={
+                    "Content-Range": f"bytes */{e.file_size}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid Range header: {str(e)}",
+            )
+    elif file_size:
+        response_headers["Content-Length"] = str(file_size)
+
+    if request.method == "HEAD":
+        return Response(
+            status_code=status_code,
+            media_type=media_type,
+            headers=response_headers,
+        )
+
+    return StreamingResponse(
+        drs.stream_from_url(download_url, range_to_send),
+        status_code=status_code,
+        media_type=media_type,
+        headers=response_headers,
+    )
+
+
 async def serve_workflow_artifact_or_dispatch(
     file_doc: dict[str, Any],
     artifact_kind: ArtifactKind,
@@ -150,7 +238,10 @@ async def serve_workflow_artifact_or_dispatch(
         return None
 
     try:
-        dcc, local_id, md5 = extract_identity(file_doc)
+        # Single cache-key authority: the processor derives the key it
+        # writes under; the router probes the same key here. Re-deriving
+        # the formula independently is what let producer/consumer drift.
+        cache_key = processor.cache_key_for(file_doc, artifact_kind)
     except ValueError as exc:
         # Treat incomplete file_meta as "workflow not applicable" so
         # the caller falls through. The DCC ingest contract guarantees
@@ -158,14 +249,6 @@ async def serve_workflow_artifact_or_dispatch(
         # stale or hand-edited document, not a request to 500 on.
         logger.warning(f"Cannot dispatch workflow — file_meta incomplete: {exc}")
         return None
-
-    cache_key = key_utils.cache_key(
-        dcc=dcc,
-        local_id=local_id,
-        artifact_kind=artifact_kind,
-        md5=md5,
-        processor_version=processor.processor_version,
-    )
 
     entry = await api.cache.head(cache_key)
     if entry is not None:

@@ -38,10 +38,9 @@ from pathlib import Path
 from typing import Any
 
 from cfdb.workflows import SORT_MEMORY_CAP, SORT_PARALLEL
-from cfdb.workflows import keys as key_utils
-from cfdb.workflows.cache import LocalFsCache
+from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.events import Complete, StageComplete, WorkflowEvent
 from cfdb.workflows.fetcher import download_source
-from cfdb.workflows.keys import extract_identity
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.tools import (
@@ -89,40 +88,22 @@ class TabixIntervalProcessor(Processor):
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache_root: Path,
-    ) -> AsyncIterator[dict[str, Any]]:
-        cache = LocalFsCache(cache_root)
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         workdir.mkdir(parents=True, exist_ok=True)
 
         fmt = format_name(file_meta) or ""
         preset = _TABIX_PRESET[fmt]
         sort_args = _SORT_ARGS[preset]
 
-        dcc, local_id, md5 = extract_identity(file_meta)
-        data_key = key_utils.cache_key(
-            dcc=dcc,
-            local_id=local_id,
-            artifact_kind=ArtifactKind.DATA,
-            md5=md5,
-            processor_version=self.processor_version,
-        )
-        index_key = key_utils.cache_key(
-            dcc=dcc,
-            local_id=local_id,
-            artifact_kind=ArtifactKind.INDEX,
-            md5=md5,
-            processor_version=self.processor_version,
-        )
+        data_key = self.cache_key_for(file_meta, ArtifactKind.DATA)
+        index_key = self.cache_key_for(file_meta, ArtifactKind.INDEX)
 
         # Stage 1 — produce the bgzipped sorted text artifact.
         if await cache.head(data_key) is None:
             bgz_path = await self._stage_prepare(file_meta, fmt, sort_args, workdir)
             await cache.put(data_key, bgz_path)
-        yield {
-            "event": "stage_complete",
-            "kind": ArtifactKind.DATA.value,
-            "key": data_key,
-        }
+        yield StageComplete(kind=ArtifactKind.DATA, key=data_key)
 
         # Stage 2 — produce the tabix index.
         if await cache.head(index_key) is None:
@@ -131,19 +112,14 @@ class TabixIntervalProcessor(Processor):
                 await copy_from_cache(cache, data_key, bgz_local)
             tbi_path = await self._stage_index(bgz_local, preset)
             await cache.put(index_key, tbi_path)
-        yield {
-            "event": "stage_complete",
-            "kind": ArtifactKind.INDEX.value,
-            "key": index_key,
-        }
+        yield StageComplete(kind=ArtifactKind.INDEX, key=index_key)
 
-        yield {
-            "event": "complete",
-            "artifacts": {
+        yield Complete(
+            artifacts={
                 ArtifactKind.DATA.value: data_key,
                 ArtifactKind.INDEX.value: index_key,
-            },
-        }
+            }
+        )
 
     async def _stage_prepare(
         self,

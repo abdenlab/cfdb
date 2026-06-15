@@ -40,20 +40,20 @@ def _make_executor(
     mock_db,
     tmp_path,
     processor: StubProcessor,
-    *,
-    workflow_duration_cap_seconds: int = 1200,
 ) -> WoolExecutor:
-    """Wire a WoolExecutor with a single StubProcessor registered."""
+    """Wire a WoolExecutor with a single StubProcessor registered.
+
+    The duration cap is module-level; tests that need to shrink it
+    monkeypatch ``executor._WORKFLOW_DURATION_CAP_SECONDS`` directly.
+    """
     cache = LocalFsCache(tmp_path / "cache")
     registry = ProcessorRegistry()
     registry.register(processor)
     return WoolExecutor(
         mock_db,
         cache,
-        cache.root,
         registry,
         workdir_root=tmp_path / "jobs",
-        workflow_duration_cap_seconds=workflow_duration_cap_seconds,
     )
 
 
@@ -140,7 +140,7 @@ class TestWoolExecutorPickleBoundary:
 
     @pytest.mark.asyncio
     async def test_ensure_workflow_should_record_failed_when_workflow_duration_cap_fires(
-        self, mock_db, tmp_path, wool_pool
+        self, mock_db, tmp_path, wool_pool, monkeypatch
     ):
         """Test that the runtime cap forces a clean FAILED termination.
 
@@ -165,9 +165,10 @@ class TestWoolExecutorPickleBoundary:
         # around the ``async for`` loop, so a pre-yield sleep does not
         # exercise the cap path. Between-yields blocking does.
         processor = StubProcessor(sleep_between_yields=5.0)
-        executor = _make_executor(
-            mock_db, tmp_path, processor, workflow_duration_cap_seconds=1
-        )
+        from cfdb.workflows import executor as executor_module
+
+        monkeypatch.setattr(executor_module, "_WORKFLOW_DURATION_CAP_SECONDS", 1)
+        executor = _make_executor(mock_db, tmp_path, processor)
 
         # Act
         try:
