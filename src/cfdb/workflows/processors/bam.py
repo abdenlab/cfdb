@@ -37,10 +37,9 @@ from pathlib import Path
 from typing import Any
 
 from cfdb.workflows import SAMTOOLS_MEMORY_CAP, SAMTOOLS_THREADS
-from cfdb.workflows import keys as key_utils
-from cfdb.workflows.cache import LocalFsCache
-from cfdb.workflows.fetcher import download_source
-from cfdb.workflows.keys import extract_identity
+from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.events import Complete, StageComplete, WorkflowEvent
+from cfdb.workflows.fetcher import download_source, peek_decompressed_prefix
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.tools import (
@@ -51,7 +50,42 @@ from cfdb.workflows.processors.tools import (
     shell_quote,
 )
 
-__all__ = ["BamIndexProcessor", "download_source", "read_bam_header"]
+__all__ = [
+    "BamIndexProcessor",
+    "download_source",
+    "read_bam_header",
+    "validate_sam_header",
+]
+
+#: SAM header records that always carry >= 2 TAB-separated fields. A
+#: ``@CO`` comment is free text and may legitimately hold no tab, so it
+#: is excluded from the delimiter check.
+_SAM_MULTIFIELD_RECORDS = ("@HD", "@SQ", "@RG", "@PG")
+
+
+def validate_sam_header(header_text: str) -> None:
+    """Reject space-delimited (legacy/corrupt) SAM headers up front.
+
+    samtools requires TAB-delimited header records. Legacy modENCODE-era
+    SAMs whose header tabs were expanded to spaces parse-fail deep inside
+    ``samtools view`` with an opaque ``[main_samview] fail to read the
+    header``. Detect the space-delimited shape here so the workflow fails
+    fast with an actionable message instead of after downloading and
+    half-running the convert+sort. ``@HD``/``@SQ``/``@RG``/``@PG`` records
+    always carry at least two fields, so one without a TAB is the tell.
+    No-op for well-formed headers and for headerless input (samtools
+    surfaces that case on its own).
+    """
+    for line in header_text.splitlines():
+        if line[:3] in _SAM_MULTIFIELD_RECORDS and "\t" not in line:
+            raise RuntimeError(
+                "SAM header is space-delimited, not TAB-delimited "
+                f"({line[:60]!r}). samtools cannot read it — this is a "
+                "legacy modENCODE-era file whose header tabs were expanded "
+                "to spaces. Re-publish with a TAB-delimited header (keeping "
+                "spaces inside tag values) or route it through a "
+                "header-repair step."
+            )
 
 
 async def read_bam_header(bam_path: Path) -> str:
@@ -124,9 +158,8 @@ class BamIndexProcessor(Processor):
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache_root: Path,
-    ) -> AsyncIterator[dict[str, Any]]:
-        cache = LocalFsCache(cache_root)
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         workdir.mkdir(parents=True, exist_ok=True)
 
         fmt = format_name(file_meta) or ""
@@ -141,8 +174,8 @@ class BamIndexProcessor(Processor):
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache: LocalFsCache,
-    ) -> AsyncIterator[dict[str, Any]]:
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         """Index a pre-sorted BAM, yielding stage_complete + complete events.
 
         Validates the source's ``@HD ... SO:coordinate`` line before
@@ -150,14 +183,7 @@ class BamIndexProcessor(Processor):
         clear failure when an unexpected unsorted BAM arrives, rather
         than silently producing a broken index.
         """
-        dcc, local_id, md5 = extract_identity(file_meta)
-        index_key = key_utils.cache_key(
-            dcc=dcc,
-            local_id=local_id,
-            artifact_kind=ArtifactKind.INDEX,
-            md5=md5,
-            processor_version=self.processor_version,
-        )
+        index_key = self.cache_key_for(file_meta, ArtifactKind.INDEX)
 
         if await cache.head(index_key) is None:
             source_path = workdir / "source.bam"
@@ -165,53 +191,29 @@ class BamIndexProcessor(Processor):
             await self._verify_sorted(source_path)
             bai_path = await self._stage_index(source_path)
             await cache.put(index_key, bai_path)
-        yield {
-            "event": "stage_complete",
-            "kind": ArtifactKind.INDEX.value,
-            "key": index_key,
-        }
-        yield {
-            "event": "complete",
-            "artifacts": {ArtifactKind.INDEX.value: index_key},
-        }
+        yield StageComplete(kind=ArtifactKind.INDEX, key=index_key)
+        yield Complete(artifacts={ArtifactKind.INDEX.value: index_key})
 
     async def _run_sam(
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache: LocalFsCache,
-    ) -> AsyncIterator[dict[str, Any]]:
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         """Convert + sort + index a SAM, yielding per-stage events.
 
         Caches both the sorted BAM and its BAI. Stage-2 (index) failure
         leaves the stage-1 sorted BAM in cache; on retry stage-1 is
         skipped and only the index is re-run.
         """
-        dcc, local_id, md5 = extract_identity(file_meta)
-        data_key = key_utils.cache_key(
-            dcc=dcc,
-            local_id=local_id,
-            artifact_kind=ArtifactKind.DATA,
-            md5=md5,
-            processor_version=self.processor_version,
-        )
-        index_key = key_utils.cache_key(
-            dcc=dcc,
-            local_id=local_id,
-            artifact_kind=ArtifactKind.INDEX,
-            md5=md5,
-            processor_version=self.processor_version,
-        )
+        data_key = self.cache_key_for(file_meta, ArtifactKind.DATA)
+        index_key = self.cache_key_for(file_meta, ArtifactKind.INDEX)
 
         # Stage 1 — convert + sort if not already cached.
         if await cache.head(data_key) is None:
             sorted_bam = await self._stage_convert_and_sort(file_meta, workdir)
             await cache.put(data_key, sorted_bam)
-        yield {
-            "event": "stage_complete",
-            "kind": ArtifactKind.DATA.value,
-            "key": data_key,
-        }
+        yield StageComplete(kind=ArtifactKind.DATA, key=data_key)
 
         # Stage 2 — produce the BAI from the sorted BAM.
         if await cache.head(index_key) is None:
@@ -220,24 +222,26 @@ class BamIndexProcessor(Processor):
                 await copy_from_cache(cache, data_key, sorted_bam_local)
             bai_path = await self._stage_index(sorted_bam_local)
             await cache.put(index_key, bai_path)
-        yield {
-            "event": "stage_complete",
-            "kind": ArtifactKind.INDEX.value,
-            "key": index_key,
-        }
+        yield StageComplete(kind=ArtifactKind.INDEX, key=index_key)
 
-        yield {
-            "event": "complete",
-            "artifacts": {
+        yield Complete(
+            artifacts={
                 ArtifactKind.DATA.value: data_key,
                 ArtifactKind.INDEX.value: index_key,
-            },
-        }
+            }
+        )
 
     async def _stage_convert_and_sort(
         self, file_meta: dict[str, Any], workdir: Path
     ) -> Path:
         """Convert SAM to BAM and coordinate-sort, in a single pipeline."""
+        # Fail fast on legacy space-delimited SAM headers: peek only the
+        # leading (header) bytes and reject before downloading and
+        # convert+sorting the whole file, turning samtools' opaque
+        # "fail to read the header" into an actionable error.
+        prefix = await peek_decompressed_prefix(file_meta)
+        validate_sam_header(prefix.decode("utf-8", errors="replace"))
+
         source_path = workdir / "source.sam"
         await download_source(file_meta, source_path)
         sorted_path = workdir / "sorted.bam"

@@ -10,10 +10,91 @@ import pytest
 
 from cfdb.workflows import SAMTOOLS_MEMORY_CAP, keys as key_utils
 from cfdb.workflows.cache import LocalFsCache
+from cfdb.workflows.events import Complete
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors import bam as bam_module
-from cfdb.workflows.processors.bam import BamIndexProcessor, read_bam_header
+from cfdb.workflows.processors.bam import (
+    BamIndexProcessor,
+    read_bam_header,
+    validate_sam_header,
+)
 from tests.test_workflows import FIXTURE_MD5
+
+
+async def _fake_peek_valid_header(file_meta, **kwargs):
+    """Stub peek_decompressed_prefix with a well-formed tab-delimited header."""
+    return b"@HD\tVN:1.0\n@SQ\tSN:chr1\tLN:1000\n"
+
+
+class TestValidateSamHeader:
+    def test_should_raise_on_space_delimited_sq_line(self):
+        """Test that a space-delimited @SQ header is rejected.
+
+        Given:
+            A SAM header whose @SQ record uses spaces (the legacy
+            modENCODE shape) instead of tabs between fields.
+        When:
+            validate_sam_header is called.
+        Then:
+            It should raise RuntimeError naming the space-delimited
+            line, so the workflow fails fast with an actionable error
+            rather than samtools' opaque "fail to read the header".
+        """
+        # Arrange — spaces between fields, a legitimate space inside AS
+        header = "@HD VN:1.0\n@SQ SN:chr2L AS:FlyBase r5 LN:23011544\n"
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="space-delimited"):
+            validate_sam_header(header)
+
+    def test_should_pass_well_formed_tab_delimited_header(self):
+        """Test that a tab-delimited header is accepted.
+
+        Given:
+            A SAM header whose records are TAB-delimited, with a space
+            preserved inside a tag value.
+        When:
+            validate_sam_header is called.
+        Then:
+            It should return None without raising.
+        """
+        # Arrange
+        header = "@HD\tVN:1.0\n@SQ\tSN:chr2L\tAS:FlyBase r5\tLN:23011544\n"
+
+        # Act & assert — no exception
+        assert validate_sam_header(header) is None
+
+    def test_should_ignore_comment_records_without_tabs(self):
+        """Test that a tab-less @CO comment does not trip the check.
+
+        Given:
+            A header with a valid tab-delimited @SQ and an @CO comment
+            line carrying free text with no tab.
+        When:
+            validate_sam_header is called.
+        Then:
+            It should not raise, since @CO is free text and excluded
+            from the delimiter check.
+        """
+        # Arrange
+        header = "@SQ\tSN:chr1\tLN:1000\n@CO free text comment with no tab\n"
+
+        # Act & assert — no exception
+        assert validate_sam_header(header) is None
+
+    def test_should_be_noop_for_headerless_input(self):
+        """Test that input with no header records is left to samtools.
+
+        Given:
+            Header text containing no @-prefixed multi-field records.
+        When:
+            validate_sam_header is called.
+        Then:
+            It should return None — the truly-headerless case is a
+            different failure surfaced by samtools itself.
+        """
+        # Act & assert
+        assert validate_sam_header("") is None
 
 
 def _file_meta(fmt: str = "BAM") -> dict[str, Any]:
@@ -37,15 +118,18 @@ async def _drain_run(proc, file_meta, workdir, cache_root):
     and surfaces the final ``complete`` event's artifact mapping under
     the same dict key callers used to assert on.
     """
-    return [event async for event in proc.run(file_meta, workdir, cache_root)]
+    return [
+        event
+        async for event in proc.run(file_meta, workdir, LocalFsCache(cache_root))
+    ]
 
 
-def _final_artifacts(events: list[dict]) -> dict[str, str]:
-    """Return the artifact mapping carried by the terminal ``complete`` event."""
+def _final_artifacts(events: list) -> dict[str, str]:
+    """Return the artifact mapping carried by the terminal ``Complete`` event."""
     for event in reversed(events):
-        if event.get("event") == "complete":
-            return dict(event.get("artifacts") or {})
-    raise AssertionError("processor did not emit a `complete` event")
+        if isinstance(event, Complete):
+            return dict(event.artifacts)
+    raise AssertionError("processor did not emit a `Complete` event")
 
 
 async def _async_false() -> bool:
@@ -238,7 +322,7 @@ class TestBamIndexProcessor:
         # Act & assert
         with pytest.raises(RuntimeError, match="not coordinate-sorted"):
             async for _event in BamIndexProcessor().run(
-                _file_meta("BAM"), workdir, cache_root
+                _file_meta("BAM"), workdir, LocalFsCache(cache_root)
             ):
                 pass
 
@@ -334,6 +418,9 @@ class TestBamIndexProcessor:
                 target = Path(argv[-1])
                 (target.parent / (target.name + ".bai")).write_bytes(b"bai")
 
+        mocker.patch.object(
+            bam_module, "peek_decompressed_prefix", _fake_peek_valid_header
+        )
         mocker.patch.object(bam_module, "download_source", fake_download)
         mocker.patch.object(bam_module, "run_shell", fake_shell)
         mocker.patch.object(bam_module, "run_argv", fake_run)
@@ -469,6 +556,9 @@ class TestBamIndexProcessor:
                 target = Path(argv[-1])
                 (target.parent / (target.name + ".bai")).write_bytes(b"bai")
 
+        mocker.patch.object(
+            bam_module, "peek_decompressed_prefix", _fake_peek_valid_header
+        )
         mocker.patch.object(bam_module, "download_source", fake_download)
         mocker.patch.object(bam_module, "run_argv", fake_run)
         mocker.patch.object(bam_module, "run_shell", fake_shell)
