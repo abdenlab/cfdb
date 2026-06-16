@@ -38,6 +38,24 @@ jobs:
           docker push $REGISTRY/$REPOSITORY:latest
           docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
+      # Build the wool worker image (Dockerfile.wool) and push to a
+      # separate ECR repository. Pinned to linux/amd64 because the image
+      # bundles UCSC's x86_64-only bigBedToBed. Workers are launched on
+      # demand via RunTask against the task definition's :latest image, so
+      # no service update is needed here. The cfdb-wool repository must
+      # exist in ECR (created out of band, like the cfdb repository).
+      - name: Build and push wool worker to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: cfdb-wool
+        run: |
+          SHA_TAG=${GITHUB_SHA::8}
+          docker build --platform linux/amd64 --file Dockerfile.wool \
+            -t $REGISTRY/$REPOSITORY:latest \
+            -t $REGISTRY/$REPOSITORY:$SHA_TAG .
+          docker push $REGISTRY/$REPOSITORY:latest
+          docker push $REGISTRY/$REPOSITORY:$SHA_TAG
+
       - name: Deploy to ECS
         env:
           ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
