@@ -398,6 +398,38 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-docdb-sg"
 
+  # Workers accept gRPC 50051 from the API tasks (dispatched to a worker's
+  # awsvpc IP). Egress is restricted to HTTPS (upstream file fetches and
+  # the S3 gateway endpoint) and DNS: workers only ever fetch https:// URLs
+  # (DRS resolves to HTTPS), so arbitrary-port egress is unnecessary.
+  # Responses to the inbound gRPC connection are allowed statefully.
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Wool workers - allow 50051 from ECS; egress HTTPS + DNS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 50051
+          ToPort: 50051
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-worker-sg"
+
   # ---------- DocumentDB subnet group ----------
   DocumentDBSubnetGroup:
     Type: AWS::DocDB::DBSubnetGroup
@@ -447,6 +479,10 @@ Outputs:
     Value: !GetAtt DocumentDBSecurityGroup.GroupId
     Export:
       Name: !Sub "${AWS::StackName}-DocumentDBSecurityGroupId"
+  WorkerSecurityGroupId:
+    Value: !GetAtt WorkerSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerSecurityGroupId"
   DocumentDBSubnetGroupName:
     Value: !Ref DocumentDBSubnetGroup
     Export:
