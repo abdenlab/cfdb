@@ -3,12 +3,31 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Header, HTTPException, Path, Request, status
 
 from cfdb import api
+from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
+from cfdb.api.routers.cache_stream import (
+    serve_workflow_artifact_or_dispatch,
+    stream_upstream_url,
+)
 from cfdb.models import FileMetadataModel
 from cfdb.services import drs, locks
+from cfdb.services.drs import (
+    DRSError,
+    DRSForbidden,
+    DRSNotFound,
+    DRSRedirectBlocked,
+    DRSTimeout,
+    DRSUpstreamError,
+)
+from cfdb.workflows.models import ArtifactKind
+
+#: Tight path-param constraint shared by /data and /index. DCC accessions
+#: across ENCODE / 4DN / HuBMAP are all subsets of ``[A-Za-z0-9._-]``;
+#: the length cap defends Mongo and log lines from unbounded input.
+_PATH_PARAM_PATTERN = r"^[A-Za-z0-9._-]+$"
+_PATH_PARAM_MAX_LEN = 256
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +37,24 @@ router = APIRouter(prefix="/data", tags=["data"])
 @router.head("/{dcc}/{local_id}")
 @router.get("/{dcc}/{local_id}")
 async def stream_file(
-    dcc: str, local_id: str, request: Request, range: Optional[str] = Header(None)
+    dcc: str = Path(
+        ..., max_length=_PATH_PARAM_MAX_LEN, pattern=_PATH_PARAM_PATTERN
+    ),
+    local_id: str = Path(
+        ..., max_length=_PATH_PARAM_MAX_LEN, pattern=_PATH_PARAM_PATTERN
+    ),
+    request: Request = None,  # type: ignore[assignment]  # injected by FastAPI
+    range: Optional[str] = Header(None),
+    raw: bool = False,
 ):
     """
     Stream file from DCC via HTTPS using file metadata from database.
+
+    When ``raw`` is False (the default), a request for a file whose
+    format requires preprocessing returns the cached processed artifact
+    (or ``202 Accepted`` with a ``Location`` header pointing to a
+    workflow job on cache miss). Passing ``raw=true`` bypasses the
+    workflow pipeline and streams the upstream file directly.
 
     For 4DN files: Streams file contents directly via HTTPS.
     For HuBMAP files: Streams public file contents via HTTPS (Globus/protected files not supported).
@@ -59,53 +92,32 @@ async def stream_file(
         if normalized_dcc not in valid_dccs:
             logger.warning(f"Invalid DCC requested: {dcc}")
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
             )
 
-        # 2. Look up DCC metadata to get id_namespace
+        # 2. Look up the file document via the shared helper so /data and
+        #    /index converge on the same record for any given
+        #    (normalized_dcc, local_id) pair. The helper uses
+        #    FILE_DOC_PROJECTION, which strips _id and limits the doc to
+        #    the fields routers + workflows actually read.
         if api.db is None:
             logger.error("Database not initialized")
-            raise HTTPException(status_code=500, detail="Database not available")
-
-        # Look up DCC by normalized abbreviation (case-insensitive)
-        dcc_doc = await api.db.dcc.find_one(
-            {"dcc_abbreviation": {"$regex": f"^{normalized_dcc}", "$options": "i"}}
-        )
-
-        if not dcc_doc:
-            logger.warning(f"DCC metadata not found: {dcc}")
             raise HTTPException(
-                status_code=500, detail=f"DCC configuration not found: {dcc}"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database not available",
             )
 
-        id_namespace = dcc_doc.get("project_id_namespace")
-
-        if not id_namespace:
-            logger.error(f"DCC missing project_id_namespace: {dcc}")
-            raise HTTPException(
-                status_code=500, detail=f"DCC configuration incomplete: {dcc}"
-            )
-
-        # 3. Look up file in MongoDB by composite key
         logger.info(
-            f"Looking up file: id_namespace={id_namespace}, local_id={local_id}"
+            f"Looking up file: submission={normalized_dcc}, local_id={local_id}"
         )
-
-        # ENCODE files are stored in the pre-materialized 'files' collection
-        # Other DCCs use the 'file' collection (raw C2M2 tables)
-        if normalized_dcc == "encode":
-            file_doc = await api.db.files.find_one(
-                {"id_namespace": id_namespace, "local_id": local_id}
-            )
-        else:
-            file_doc = await api.db.file.find_one(
-                {"id_namespace": id_namespace, "local_id": local_id}
-            )
+        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
 
         if not file_doc:
-            logger.warning(f"File not found: {id_namespace}/{local_id}")
-            raise HTTPException(status_code=404, detail="File not found")
+            logger.warning(f"File not found: {normalized_dcc}/{local_id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            )
 
         # 2. Parse file metadata
         try:
@@ -113,18 +125,19 @@ async def stream_file(
             file_data = {
                 k: v
                 for k, v in file_doc.items()
-                if k in FileMetadataModel.__fields__
+                if k in FileMetadataModel.model_fields
                 and k
                 not in ("dcc", "collections")  # Skip required fields not in database
             }
             file_metadata = FileMetadataModel(**file_data)
-        except Exception as e:
-            logger.error(f"Failed to parse file metadata: {str(e)}")
+        except Exception:
+            logger.exception("Failed to parse file metadata")
             # Try to extract just the access_url if full parsing fails
             access_url = file_doc.get("access_url")
             if not access_url:
                 raise HTTPException(
-                    status_code=500, detail="Invalid file metadata in database"
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Invalid file metadata in database",
                 )
             # Create a minimal metadata object with just access_url
             from dataclasses import dataclass
@@ -140,28 +153,39 @@ async def stream_file(
 
         # 3. Check if file has access_url
         if not file_metadata.access_url:
-            logger.warning(f"File has no access_url: {id_namespace}/{local_id}")
-            raise HTTPException(status_code=501, detail="File has no access URL")
+            logger.warning(f"File has no access_url: {normalized_dcc}/{local_id}")
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="File has no access URL",
+            )
+
+        # 4. Defence-in-depth: reject any non-public HuBMAP file that somehow
+        #    survived pruning. Placed before the workflow branch so protected
+        #    files never enter the preprocessing pipeline.
+        #
+        #    Log access_url AFTER the guard so signed/private URLs for
+        #    non-public HuBMAP files don't leak to logs before the 403.
+        enforce_hubmap_access(normalized_dcc, file_doc)
 
         logger.info(f"File access_url: {file_metadata.access_url}")
 
+        # 5. Workflow path: if the client wants the preprocessed artifact
+        #    (``raw=False``, the default) and a processor is registered
+        #    for this format, serve the cached artifact or dispatch a
+        #    workflow. When ``raw=True`` the workflow branch is skipped
+        #    entirely and the request falls through to direct streaming
+        #    from upstream. Passthrough formats (CSV/TSV/bigWig) return
+        #    None either way and fall through to the existing streaming
+        #    logic.
+        workflow_response = await _try_serve_workflow_artifact(
+            file_doc, request, range, artifact_kind=ArtifactKind.DATA, raw=raw
+        )
+        if workflow_response is not None:
+            return workflow_response
+
         # ENCODE files: Stream directly via HTTPS (bypass DRS)
         if normalized_dcc == "encode":
-            return await _stream_encode_file(
-                file_doc, file_metadata, request, range
-            )
-
-        # 5. Defence-in-depth: reject any non-public HuBMAP file that
-        #    somehow survived pruning.
-        if normalized_dcc == "hubmap":
-            data_access_level = file_doc.get("data_access_level")
-            if data_access_level and data_access_level != "public":
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"This file requires {data_access_level} access and is not available through this API. "
-                    "This API only serves publicly accessible files. "
-                    "For access to HuBMAP data, please use the HuBMAP Portal at https://portal.hubmapconsortium.org/",
-                )
+            return await _stream_encode_file(file_doc, file_metadata, request, range)
 
         # 6. Fetch DRS object metadata
         try:
@@ -169,24 +193,39 @@ async def stream_file(
         except ValueError as e:
             logger.warning(f"Invalid DRS URI: {file_metadata.access_url}")
             raise HTTPException(
-                status_code=400, detail=f"Invalid file access URL: {str(e)}"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file access URL: {str(e)}",
             )
-        except Exception as e:
-            logger.error(f"DRS metadata fetch failed: {str(e)}")
-            if "not found" in str(e).lower():
-                raise HTTPException(
-                    status_code=404, detail="File not found in repository"
-                )
-            elif "authentication" in str(e).lower() or "forbidden" in str(e).lower():
-                raise HTTPException(status_code=401, detail="Authentication required")
-            elif "timeout" in str(e).lower():
-                raise HTTPException(
-                    status_code=504, detail="Repository service timeout"
-                )
-            else:
-                raise HTTPException(
-                    status_code=502, detail="Failed to fetch file metadata"
-                )
+        except DRSNotFound:
+            logger.exception("DRS metadata fetch failed: not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found in repository",
+            )
+        except DRSForbidden:
+            logger.exception("DRS metadata fetch failed: forbidden")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied by upstream repository",
+            )
+        except DRSTimeout:
+            logger.exception("DRS metadata fetch failed: timeout")
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Repository service timeout",
+            )
+        except DRSRedirectBlocked:
+            logger.exception("DRS metadata fetch failed: redirect blocked by allowlist")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Upstream redirect not allowed",
+            )
+        except (DRSUpstreamError, DRSError):
+            logger.exception("DRS metadata fetch failed (upstream error)")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to fetch file metadata",
+            )
 
         # 7. Determine access method (HTTPS or Globus)
         has_globus = any(m.type == "globus" for m in drs_object.access_methods)
@@ -205,88 +244,13 @@ async def stream_file(
                 )
                 logger.info(f"Streaming HTTPS file: {drs_object.name}")
 
-                # Prepare response headers
-                response_headers = {
-                    "Content-Disposition": f'attachment; filename="{drs_object.name or "file"}"',
-                    "Accept-Ranges": "bytes",
-                }
-
-                status_code = 200
-                range_header_to_send = None
-
-                # Handle Range request if present
-                if range:
-                    # Validate that file size is available
-                    if not drs_object.size:
-                        logger.warning(
-                            f"Range request for file without size metadata: {local_id}"
-                        )
-                        raise HTTPException(
-                            status_code=500,
-                            detail="Cannot process range request: file size unavailable",
-                        )
-
-                    try:
-                        # Parse and validate the Range header
-                        start, end, content_length = drs.parse_range_header(
-                            range, drs_object.size
-                        )
-
-                        logger.debug(
-                            f"Range request: bytes {start}-{end}/{drs_object.size}"
-                        )
-
-                        # Set response for partial content
-                        range_header_to_send = range
-                        status_code = 206
-                        response_headers["Content-Range"] = (
-                            f"bytes {start}-{end}/{drs_object.size}"
-                        )
-                        response_headers["Content-Length"] = str(content_length)
-
-                    except drs.RangeNotSatisfiableError as e:
-                        # Range exceeds file bounds - return 416
-                        logger.warning(
-                            f"Range not satisfiable: {range} for file size {e.file_size}"
-                        )
-                        raise HTTPException(
-                            status_code=416,
-                            headers={
-                                "Content-Range": f"bytes */{e.file_size}",
-                                "Accept-Ranges": "bytes",
-                            },
-                        )
-
-                    except ValueError as e:
-                        # Invalid Range header syntax - return 400
-                        logger.warning(f"Invalid Range header syntax: {range}")
-                        raise HTTPException(
-                            status_code=400, detail=f"Invalid Range header: {str(e)}"
-                        )
-
-                # Set Content-Type from DRS metadata
-                media_type = drs_object.mime_type or "application/octet-stream"
-
-                # For full file requests, include Content-Length from DRS metadata if available
-                if not range and drs_object.size:
-                    response_headers["Content-Length"] = str(drs_object.size)
-
-                # HEAD request - return headers only, no body
-                if request.method == "HEAD":
-                    return Response(
-                        status_code=status_code,
-                        media_type=media_type,
-                        headers=response_headers,
-                    )
-
-                # Stream file (with or without range)
-                chunk_gen = drs.stream_from_url(download_url, range_header_to_send)
-
-                return StreamingResponse(
-                    chunk_gen,
-                    status_code=status_code,
-                    media_type=media_type,
-                    headers=response_headers,
+                return stream_upstream_url(
+                    download_url,
+                    drs_object.size,
+                    drs_object.name or "file",
+                    request,
+                    range,
+                    media_type=drs_object.mime_type or "application/octet-stream",
                 )
 
             except HTTPException:
@@ -316,9 +280,12 @@ async def stream_file(
     except HTTPException:
         # Re-raise HTTP exceptions as-is
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error in stream_file: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception:
+        logger.exception("Unexpected error in stream_file")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
 
 
 async def _stream_encode_file(
@@ -343,92 +310,63 @@ async def _stream_encode_file(
         StreamingResponse with file contents
     """
     download_url = file_metadata.access_url
-    filename = getattr(file_metadata, "filename", None) or file_doc.get("filename", "file")
+    filename = getattr(file_metadata, "filename", None) or file_doc.get(
+        "filename", "file"
+    )
     file_size = file_doc.get("size_in_bytes")
 
     logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
 
-    # Prepare response headers
-    response_headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Accept-Ranges": "bytes",
-    }
-
-    status_code = 200
-    range_to_send = None
-
-    # Handle Range request if present
-    if range_header:
-        if not file_size:
-            logger.warning("Range request for ENCODE file without size metadata")
-            raise HTTPException(
-                status_code=500,
-                detail="Cannot process range request: file size unavailable",
-            )
-
-        try:
-            start, end, content_length = drs.parse_range_header(range_header, file_size)
-
-            logger.debug(f"Range request: bytes {start}-{end}/{file_size}")
-
-            range_to_send = range_header
-            status_code = 206
-            response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            response_headers["Content-Length"] = str(content_length)
-
-        except drs.RangeNotSatisfiableError as e:
-            logger.warning(f"Range not satisfiable: {range_header} for file size {e.file_size}")
-            raise HTTPException(
-                status_code=416,
-                headers={
-                    "Content-Range": f"bytes */{e.file_size}",
-                    "Accept-Ranges": "bytes",
-                },
-            )
-
-        except ValueError as e:
-            logger.warning(f"Invalid Range header syntax: {range_header}")
-            raise HTTPException(status_code=400, detail=f"Invalid Range header: {str(e)}")
-
-    # Determine media type from filename or default to binary
+    # Determine media type from filename; default to binary. (Branches
+    # that resolve to the default are folded away.)
     media_type = "application/octet-stream"
     if filename:
         if filename.endswith(".gz"):
             media_type = "application/gzip"
-        elif filename.endswith(".bam"):
-            media_type = "application/octet-stream"
-        elif filename.endswith(".fastq") or filename.endswith(".fq"):
+        elif filename.endswith((".fastq", ".fq", ".bed")):
             media_type = "text/plain"
-        elif filename.endswith(".bed"):
-            media_type = "text/plain"
-        elif filename.endswith(".bigWig") or filename.endswith(".bw"):
-            media_type = "application/octet-stream"
-        elif filename.endswith(".bigBed") or filename.endswith(".bb"):
-            media_type = "application/octet-stream"
 
-    # For full file requests, include Content-Length if available
-    if not range_header and file_size:
-        response_headers["Content-Length"] = str(file_size)
-
-    # HEAD request - return headers only, no body
-    if request.method == "HEAD":
-        return Response(
-            status_code=status_code,
-            media_type=media_type,
-            headers=response_headers,
-        )
-
-    # Stream file content
     try:
-        chunk_gen = drs.stream_from_url(download_url, range_to_send)
-
-        return StreamingResponse(
-            chunk_gen,
-            status_code=status_code,
+        return stream_upstream_url(
+            download_url,
+            file_size,
+            filename,
+            request,
+            range_header,
             media_type=media_type,
-            headers=response_headers,
         )
-
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"ENCODE streaming error: {str(e)}")
         raise HTTPException(status_code=502, detail="Failed to stream ENCODE file")
+
+
+async def _try_serve_workflow_artifact(
+    file_doc: dict,
+    request: Request,
+    range_header: Optional[str],
+    artifact_kind: ArtifactKind,
+    raw: bool,
+):
+    """Serve a processed artifact from cache, or dispatch a workflow.
+
+    Thin wrapper over ``serve_workflow_artifact_or_dispatch`` that
+    short-circuits when the client explicitly asked for ``?raw=true``.
+    See the helper docstring for full behavior.
+    """
+    if raw:
+        # Client explicitly asked for the upstream bytes — skip the
+        # workflow branch and fall through to the direct-streaming path.
+        return None
+    return await serve_workflow_artifact_or_dispatch(
+        file_doc,
+        artifact_kind,
+        request,
+        range_header,
+        head_404_detail=(
+            "Processed artifact not yet available. Issue a GET to "
+            "trigger preprocessing, or add ?raw=true for the upstream "
+            "file."
+        ),
+    )

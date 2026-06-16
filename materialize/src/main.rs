@@ -579,15 +579,20 @@ fn enrich_file(mut file: Document, lookups: &LookupTables) -> Document {
                         let mut bio_copy = biosample.clone();
                         bio_copy.remove("_id");
 
-                        // Lookup anatomy for biosample
-                        if let Some(anatomy_id) = biosample.get_str("anatomy").ok() {
+                        // Lookup anatomy for biosample (replace raw ID string with document)
+                        let anatomy_id = biosample.get_str("anatomy").unwrap_or_default().to_string();
+                        if !anatomy_id.is_empty() {
                             if let Some(anatomy) =
-                                lookups.anatomies.get(&(submission.clone(), anatomy_id.to_string()))
+                                lookups.anatomies.get(&(submission.clone(), anatomy_id))
                             {
                                 let mut anatomy_copy = anatomy.clone();
                                 anatomy_copy.remove("_id");
                                 bio_copy.insert("anatomy", anatomy_copy);
+                            } else {
+                                bio_copy.remove("anatomy");
                             }
+                        } else {
+                            bio_copy.remove("anatomy");
                         }
 
                         // Lookup subjects for this biosample
@@ -906,6 +911,309 @@ fn create_indexes(coll: &Collection<Document>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a LookupTables with all empty maps.
+    fn empty_lookups() -> LookupTables {
+        LookupTables {
+            dccs: HashMap::new(),
+            file_formats: HashMap::new(),
+            data_types: HashMap::new(),
+            assay_types: HashMap::new(),
+            anatomies: HashMap::new(),
+            ncbi_taxonomies: HashMap::new(),
+            projects: HashMap::new(),
+            collections: HashMap::new(),
+            biosamples: HashMap::new(),
+            subjects: HashMap::new(),
+            file_in_collection: HashMap::new(),
+            biosample_in_collection: HashMap::new(),
+            biosample_from_subject: HashMap::new(),
+            subject_race: HashMap::new(),
+            subject_role_taxonomy: HashMap::new(),
+            collection_by_persistent_id: HashMap::new(),
+            collection_anatomy: HashMap::new(),
+            subject_in_collection: HashMap::new(),
+        }
+    }
+
+    /// Build the minimal file, collection, biosample, and junction table
+    /// entries needed to exercise the biosample anatomy lookup path in
+    /// enrich_file.
+    fn lookups_with_biosample(
+        biosample_doc: Document,
+        anatomies: LookupMap,
+    ) -> (Document, LookupTables) {
+        let submission = "4dn".to_string();
+        let file_ns = "4dn".to_string();
+        let file_id = "file-001".to_string();
+        let coll_ns = "4dn".to_string();
+        let coll_id = "coll-001".to_string();
+        let bio_ns = biosample_doc.get_str("id_namespace").unwrap_or("4dn").to_string();
+        let bio_id = biosample_doc.get_str("local_id").unwrap_or("bio-001").to_string();
+
+        let file = doc! {
+            "submission": &submission,
+            "id_namespace": &file_ns,
+            "local_id": &file_id,
+            "filename": "test.fastq",
+        };
+
+        let mut lookups = empty_lookups();
+        lookups.dccs.insert(
+            submission.clone(),
+            doc! { "id": "cfde_registry_dcc:4dn", "dcc_name": "4DN" },
+        );
+        lookups.collections.insert(
+            (coll_ns.clone(), coll_id.clone()),
+            doc! { "id_namespace": &coll_ns, "local_id": &coll_id, "name": "Test Collection" },
+        );
+        lookups.file_in_collection.insert(
+            (file_ns.clone(), file_id.clone()),
+            vec![doc! {
+                "collection_id_namespace": &coll_ns,
+                "collection_local_id": &coll_id,
+            }],
+        );
+        lookups.biosamples.insert(
+            (bio_ns.clone(), bio_id.clone()),
+            biosample_doc,
+        );
+        lookups.biosample_in_collection.insert(
+            (coll_ns, coll_id),
+            vec![doc! {
+                "biosample_id_namespace": &bio_ns,
+                "biosample_local_id": &bio_id,
+            }],
+        );
+        lookups.anatomies = anatomies;
+
+        (file, lookups)
+    }
+
+    /// Extract the first biosample from the enriched file's first collection.
+    fn first_biosample(result: &Document) -> &Document {
+        result
+            .get_array("collections").unwrap()
+            .first().unwrap()
+            .as_document().unwrap()
+            .get_array("biosamples").unwrap()
+            .first().unwrap()
+            .as_document().unwrap()
+    }
+
+    mod enrich_file_tests {
+        use super::*;
+
+        #[test]
+        /// Test biosample anatomy removal when the raw anatomy field is empty.
+        ///
+        /// Given:
+        ///     A biosample with anatomy set to an empty string.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should remove the anatomy field from the biosample.
+        fn test_enrich_file_with_empty_biosample_anatomy() {
+            // Arrange
+            let biosample = doc! {
+                "id_namespace": "4dn",
+                "local_id": "bio-001",
+                "anatomy": "",
+            };
+            let (file, lookups) = lookups_with_biosample(biosample, HashMap::new());
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            let bio = first_biosample(&result);
+            assert!(!bio.contains_key("anatomy"),
+                "anatomy field should be removed when raw value is empty string");
+        }
+
+        #[test]
+        /// Test biosample anatomy replacement when a matching anatomy document exists.
+        ///
+        /// Given:
+        ///     A biosample with a valid anatomy ID and a matching anatomy in the lookup table.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should replace the anatomy ID string with the full anatomy document.
+        fn test_enrich_file_with_valid_biosample_anatomy() {
+            // Arrange
+            let biosample = doc! {
+                "id_namespace": "4dn",
+                "local_id": "bio-001",
+                "anatomy": "UBERON:0002107",
+            };
+            let mut anatomies: LookupMap = HashMap::new();
+            anatomies.insert(
+                ("4dn".to_string(), "UBERON:0002107".to_string()),
+                doc! { "id": "UBERON:0002107", "name": "liver", "submission": "4dn" },
+            );
+            let (file, lookups) = lookups_with_biosample(biosample, anatomies);
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            let bio = first_biosample(&result);
+            let anatomy = bio.get_document("anatomy")
+                .expect("anatomy should be a document");
+            assert_eq!(anatomy.get_str("id").unwrap(), "UBERON:0002107");
+            assert_eq!(anatomy.get_str("name").unwrap(), "liver");
+        }
+
+        #[test]
+        /// Test biosample anatomy removal when the anatomy ID has no match in lookups.
+        ///
+        /// Given:
+        ///     A biosample with a non-empty anatomy ID that does not exist in the lookup table.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should remove the anatomy field rather than leaving the raw ID string.
+        fn test_enrich_file_with_unresolved_biosample_anatomy() {
+            // Arrange
+            let biosample = doc! {
+                "id_namespace": "4dn",
+                "local_id": "bio-001",
+                "anatomy": "UBERON:9999999",
+            };
+            let (file, lookups) = lookups_with_biosample(biosample, HashMap::new());
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            let bio = first_biosample(&result);
+            assert!(!bio.contains_key("anatomy"),
+                "anatomy field should be removed when lookup misses");
+        }
+
+        #[test]
+        /// Test biosample without an anatomy field at all.
+        ///
+        /// Given:
+        ///     A biosample with no anatomy field.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should not add an anatomy field to the biosample.
+        fn test_enrich_file_with_missing_biosample_anatomy() {
+            // Arrange
+            let biosample = doc! {
+                "id_namespace": "4dn",
+                "local_id": "bio-001",
+            };
+            let (file, lookups) = lookups_with_biosample(biosample, HashMap::new());
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            let bio = first_biosample(&result);
+            assert!(!bio.contains_key("anatomy"),
+                "anatomy field should not be added when it was never present");
+        }
+
+        #[test]
+        /// Test that file_format is removed when its raw value is an empty string.
+        ///
+        /// Given:
+        ///     A file document with file_format set to an empty string.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should remove the file_format field.
+        fn test_enrich_file_with_empty_file_format() {
+            // Arrange
+            let file = doc! {
+                "submission": "4dn",
+                "id_namespace": "4dn",
+                "local_id": "file-001",
+                "filename": "test.fastq",
+                "file_format": "",
+            };
+            let mut lookups = empty_lookups();
+            lookups.dccs.insert(
+                "4dn".to_string(),
+                doc! { "id": "cfde_registry_dcc:4dn", "dcc_name": "4DN" },
+            );
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            assert!(!result.contains_key("file_format"),
+                "file_format should be removed when raw value is empty string");
+        }
+
+        #[test]
+        /// Test that data_type is removed when its raw value is an empty string.
+        ///
+        /// Given:
+        ///     A file document with data_type set to an empty string.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should remove the data_type field.
+        fn test_enrich_file_with_empty_data_type() {
+            // Arrange
+            let file = doc! {
+                "submission": "4dn",
+                "id_namespace": "4dn",
+                "local_id": "file-001",
+                "filename": "test.fastq",
+                "data_type": "",
+            };
+            let mut lookups = empty_lookups();
+            lookups.dccs.insert(
+                "4dn".to_string(),
+                doc! { "id": "cfde_registry_dcc:4dn", "dcc_name": "4DN" },
+            );
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            assert!(!result.contains_key("data_type"),
+                "data_type should be removed when raw value is empty string");
+        }
+
+        #[test]
+        /// Test that assay_type is removed when its raw value is an empty string.
+        ///
+        /// Given:
+        ///     A file document with assay_type set to an empty string.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should remove the assay_type field.
+        fn test_enrich_file_with_empty_assay_type() {
+            // Arrange
+            let file = doc! {
+                "submission": "4dn",
+                "id_namespace": "4dn",
+                "local_id": "file-001",
+                "filename": "test.fastq",
+                "assay_type": "",
+            };
+            let mut lookups = empty_lookups();
+            lookups.dccs.insert(
+                "4dn".to_string(),
+                doc! { "id": "cfde_registry_dcc:4dn", "dcc_name": "4DN" },
+            );
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            assert!(!result.contains_key("assay_type"),
+                "assay_type should be removed when raw value is empty string");
+        }
+    }
 
     #[test]
     fn index_keys_returns_expected_set() {

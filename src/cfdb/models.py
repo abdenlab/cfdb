@@ -92,6 +92,13 @@ class EnrichedFile(BaseModel):
     encode: Optional[EnrichedEncodeFile] = None
     hubmap: Optional[EnrichedHubmapFile] = None
 
+    @field_validator("fourdn", "encode", "hubmap", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
+
 
 class EnrichedHubmapCollection(BaseModel):
     """HuBMAP dataset-level metadata from Search API."""
@@ -128,6 +135,13 @@ class EnrichedSubject(BaseModel):
     """DCC-specific subject-level metadata."""
 
     hubmap: Optional[EnrichedHubmapSubject] = None
+
+    @field_validator("hubmap", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
 
 
 class EnrichedEncodeCollection(BaseModel):
@@ -174,6 +188,13 @@ class EnrichedCollection(BaseModel):
     hubmap: Optional[EnrichedHubmapCollection] = None
     encode: Optional[EnrichedEncodeCollection] = None
 
+    @field_validator("fourdn", "hubmap", "encode", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
+
 
 class EnrichedEncodeBiosample(BaseModel):
     """
@@ -205,6 +226,13 @@ class EnrichedBiosample(BaseModel):
     """
 
     encode: Optional[EnrichedEncodeBiosample] = None
+
+    @field_validator("encode", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
 
 
 class FileMetadataModel(BaseModel):
@@ -347,6 +375,16 @@ class FileMetadataModel(BaseModel):
     assay_info: Optional[str] = None
     condition: Optional[str] = None
     extra: Optional[EnrichedFile] = None
+
+    @field_validator(
+        "file_format", "data_type", "assay_type", "project", "extra",
+        mode="before",
+    )
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
 
 
 class Dcc(BaseModel):
@@ -524,6 +562,13 @@ class Collection(BaseModel):
     subjects: List[Subject] = []
     extra: Optional[EnrichedCollection] = None
 
+    @field_validator("extra", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
+
 
 class Biosample(BaseModel):
     """
@@ -582,6 +627,13 @@ class Biosample(BaseModel):
     biofluid: Optional[str] = None
     subjects: List[Subject] = []
     extra: Optional[EnrichedBiosample] = None
+
+    @field_validator("anatomy", "extra", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v):
+        if v == "":
+            return None
+        return v
 
 
 class Anatomy(BaseModel):
@@ -748,7 +800,10 @@ class Subject(BaseModel):
     taxonomy: Optional[NcbiTaxonomy] = None
     extra: Optional[EnrichedSubject] = None
 
-    @field_validator("age_at_enrollment", "age_at_sampling", mode="before")
+    @field_validator(
+        "age_at_enrollment", "age_at_sampling", "taxonomy", "extra",
+        mode="before",
+    )
     @classmethod
     def empty_string_to_none(cls, v):
         if v == "":
