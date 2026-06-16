@@ -211,12 +211,18 @@ async def _try_serve_fourdn_sidecar(
     # back to the first entry to preserve legacy behavior for files
     # whose sidecar omits ``file_format``. Iterating defends against
     # future 4DN docs that publish multiple sidecar artifacts where
-    # the data file (not the index) happens to be first.
+    # the data file (not the index) happens to be first. 4DN
+    # materializes ``file_format`` as a CV object carrying the token
+    # under ``display_title``; pre-materialized docs use a bare string,
+    # so normalize both shapes before matching.
     index_entry: Optional[dict] = None
     for candidate in extra_files:
         if not isinstance(candidate, dict):
             continue
-        fmt = (candidate.get("file_format") or "").lower()
+        raw_fmt = candidate.get("file_format")
+        if isinstance(raw_fmt, dict):
+            raw_fmt = raw_fmt.get("display_title")
+        fmt = (raw_fmt or "").lower()
         if fmt in _SIDECAR_INDEX_FORMATS:
             index_entry = candidate
             break

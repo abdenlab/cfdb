@@ -96,6 +96,67 @@ class TestStreamIndexFileFourdnSidecar:
         assert captured_urls[0].endswith("/x/abc.tbi")
 
     @pytest.mark.asyncio
+    async def test_stream_index_file_should_select_dict_shaped_file_format_sidecar(
+        self, mock_db, mocker
+    ):
+        """Test (IX-007) that a 4DN dict-shaped file_format sidecar is read.
+
+        Given:
+            A 4DN file whose ``extra.fourdn.extra_files`` carries
+            ``file_format`` as the CV object the materializer emits
+            (``{"display_title": "beddb"}``) — a non-index ``pairs_px2``
+            entry first and the ``beddb`` index second.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            It should read the token from ``display_title``, prefer the
+            ``beddb`` entry, and stream it rather than crashing on the
+            dict (the #26 500).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"beddb-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"display_title": "pairs_px2"},
+                                "href": "/x/data.px2",
+                            },
+                            {
+                                "file_format": {"display_title": "beddb"},
+                                "href": "/x/abc.beddb",
+                                "file_size": 100,
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"beddb-bytes"
+        assert captured_urls[0].endswith("/x/abc.beddb")
+
+    @pytest.mark.asyncio
     async def test_stream_index_file_should_resolve_nested_fourdn_extra_files(
         self, mock_db, mocker
     ):
