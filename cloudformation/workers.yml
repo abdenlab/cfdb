@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CFDB workflow workers — the ephemeral wool worker ECS task definition
+  (run on demand by EcsProvisioner) and the S3 artifact cache the
+  preprocessing/indexing pipeline writes to. Deploy after the network
+  stack and before the backend stack: backend.yml imports the worker
+  task family, worker role ARNs, and cache bucket from here.
+
+Parameters:
+  WorkerImageURI:
+    Type: String
+    Description: ECR image URI for the cfdb wool worker (Dockerfile.wool)
+  WorkerCpu:
+    Type: String
+    Default: "2048"
+    Description: Fargate task CPU units for a worker (1024 = 1 vCPU)
+  WorkerMemory:
+    Type: String
+    Default: "4096"
+    Description: Fargate task memory (MiB) for a worker
+  WorkerEphemeralStorageGiB:
+    Type: Number
+    Default: 50
+    MinValue: 21
+    MaxValue: 200
+    Description: >
+      Fargate ephemeral storage (GiB) backing the per-job /tmp scratch
+      workdir. Sized above the 20 GiB default for multi-hour sorts of
+      large genomic files.
+  CacheArtifactExpirationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: >
+      Days after which cached artifacts expire. Cache keys are
+      content-addressed by upstream md5, so expiry is safe — a missing
+      artifact is simply re-materialized on the next request.
+  WorkerMaxLifetimeSeconds:
+    Type: String
+    Default: "18000"
+    AllowedPattern: "^[0-9]+$"
+    Description: >
+      Hard ceiling on worker uptime (CFDB_WORKER_MAX_LIFETIME_SECONDS);
+      one hour above the 4 h workflow duration cap so a worker started
+      shortly before a long sort can still outlive the job.
+  WorkerDrainGraceSeconds:
+    Type: String
+    Default: "120"
+    AllowedPattern: "^[0-9]+$"
+    Description: >
+      Seconds /health returns 503 after SIGTERM before the gRPC port is
+      torn down (CFDB_WORKER_DRAIN_GRACE_SECONDS).
+
+Resources:
+  # ---------- S3 artifact cache ----------
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-cached-artifacts
+            Status: Enabled
+            ExpirationInDays: !Ref CacheArtifactExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-cache"
+
+  # ---------- CloudWatch log group ----------
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-worker"
+      RetentionInDays: 30
+
+  # ---------- IAM: worker execution role ----------
+  # Pulls the image from ECR and writes container logs. The API task
+  # role passes this role to the worker task via iam:PassRole at RunTask.
+  WorkerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt WorkerLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-worker-execution-role"
+
+  # ---------- IAM: worker task role ----------
+  # The processing routine runs in the worker and writes processed
+  # artifacts to the cache (cache.head + cache.put), so the task role
+  # needs read+write on the bucket. No delete: nothing in the request
+  # path calls cache.delete.
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cache-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${CacheBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt CacheBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-worker-task-role"
+
+  # ---------- Worker task definition ----------
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-worker"
+      Cpu: !Ref WorkerCpu
+      Memory: !Ref WorkerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      # The worker image is pinned to linux/amd64 (Dockerfile.wool) because
+      # UCSC publishes bigBedToBed only as a linux.x86_64 binary. Pin the
+      # task to X86_64 Fargate capacity so samtools/bgzip/tabix and the
+      # interpreter run native rather than emulated on arm64 hosts.
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      EphemeralStorage:
+        SizeInGiB: !Ref WorkerEphemeralStorageGiB
+      ExecutionRoleArn: !GetAtt WorkerExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: cfdb-worker
+          Image: !Ref WorkerImageURI
+          Essential: true
+          PortMappings:
+            - ContainerPort: 50051
+              Protocol: tcp
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: CFDB_WORKER_GRPC_PORT
+              Value: "50051"
+            - Name: CFDB_WORKER_HEALTH_PORT
+              Value: "8080"
+            - Name: CFDB_WORKER_MAX_LIFETIME_SECONDS
+              Value: !Ref WorkerMaxLifetimeSeconds
+            - Name: CFDB_WORKER_DRAIN_GRACE_SECONDS
+              Value: !Ref WorkerDrainGraceSeconds
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          # Probes the aiohttp /health endpoint worker_main serves on the
+          # health port. ECS must see HEALTHY before EcsDiscovery advertises
+          # the task; without a healthCheck healthStatus stays UNKNOWN.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://127.0.0.1:8080/health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+
+Outputs:
+  WorkerTaskFamily:
+    Value: !Sub "${AWS::StackName}-worker"
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerTaskFamily"
+  WorkerTaskDefinitionArn:
+    Value: !Ref WorkerTaskDefinition
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerTaskDefinitionArn"
+  WorkerExecutionRoleArn:
+    Value: !GetAtt WorkerExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerExecutionRoleArn"
+  WorkerTaskRoleArn:
+    Value: !GetAtt WorkerTaskRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerTaskRoleArn"
+  CacheBucketName:
+    Value: !Ref CacheBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CacheBucketName"
+  CacheBucketArn:
+    Value: !GetAtt CacheBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CacheBucketArn"
