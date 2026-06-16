@@ -96,348 +96,6 @@ class TestStreamIndexFileFourdnSidecar:
         assert captured_urls[0].endswith("/x/abc.tbi")
 
     @pytest.mark.asyncio
-    async def test_stream_index_file_should_select_dict_shaped_file_format_sidecar(
-        self, mock_db, mocker
-    ):
-        """Test (IX-007) that a 4DN dict-shaped file_format sidecar is read.
-
-        Given:
-            A 4DN file whose ``extra.fourdn.extra_files`` carries
-            ``file_format`` as the CV object the materializer emits
-            (``{"display_title": "beddb"}``) — a non-index ``pairs_px2``
-            entry first and the ``beddb`` index second.
-        When:
-            ``stream_index_file`` is called.
-        Then:
-            It should read the token from ``display_title``, prefer the
-            ``beddb`` entry, and stream it rather than crashing on the
-            dict (the #26 500).
-        """
-        # Arrange
-        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
-        captured_urls: list[str] = []
-
-        async def fake_stream(url, _range):
-            captured_urls.append(url)
-            yield b"beddb-bytes"
-
-        mocker.patch.object(drs, "stream_from_url", fake_stream)
-
-        mock_db.files.docs = []
-        mock_db.file.docs = [
-            _make_file_doc(
-                extra={
-                    "fourdn": {
-                        "extra_files": [
-                            {
-                                "file_format": {"display_title": "pairs_px2"},
-                                "href": "/x/data.px2",
-                            },
-                            {
-                                "file_format": {"display_title": "beddb"},
-                                "href": "/x/abc.beddb",
-                                "file_size": 100,
-                            },
-                        ]
-                    }
-                }
-            )
-        ]
-
-        # Act
-        resp = await stream_index_file(
-            "4dn", "4DNFIBED01", _make_request(), range=None
-        )
-
-        # Assert
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert body == b"beddb-bytes"
-        assert captured_urls[0].endswith("/x/abc.beddb")
-
-    @pytest.mark.asyncio
-    async def test_stream_index_file_should_fall_back_when_dict_file_format_lacks_display_title(
-        self, mock_db, mocker
-    ):
-        """Test (IX-008) that a dict file_format with no display_title falls back.
-
-        Given:
-            A 4DN file whose sole ``extra.fourdn.extra_files`` entry has
-            ``file_format`` as a dict carrying no ``display_title`` key.
-        When:
-            ``stream_index_file`` is called.
-        Then:
-            The missing token resolves to no-match, the entry is served
-            via the first-entry fallback, and no AttributeError is raised
-            (the #26 crash line).
-        """
-        # Arrange
-        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
-        captured_urls: list[str] = []
-
-        async def fake_stream(url, _range):
-            captured_urls.append(url)
-            yield b"fallback-bytes"
-
-        mocker.patch.object(drs, "stream_from_url", fake_stream)
-
-        mock_db.files.docs = []
-        mock_db.file.docs = [
-            _make_file_doc(
-                extra={
-                    "fourdn": {
-                        "extra_files": [
-                            {
-                                "file_format": {"@id": "/file-formats/beddb/"},
-                                "href": "/x/only.beddb",
-                                "file_size": 50,
-                            },
-                        ]
-                    }
-                }
-            )
-        ]
-
-        # Act
-        resp = await stream_index_file(
-            "4dn", "4DNFIBED01", _make_request(), range=None
-        )
-
-        # Assert
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert body == b"fallback-bytes"
-        assert captured_urls[0].endswith("/x/only.beddb")
-
-    @pytest.mark.asyncio
-    async def test_stream_index_file_should_reject_non_index_dict_token(
-        self, mock_db, mocker
-    ):
-        """Test (IX-009) that a non-index dict display_title does not match.
-
-        Given:
-            A 4DN file with two dict-shaped sidecar entries: a non-index
-            ``pairs_px2`` entry first and a ``bai`` index entry second.
-        When:
-            ``stream_index_file`` is called.
-        Then:
-            The non-index dict token must not match the canonical index
-            formats; the ``bai`` index entry is selected and streamed.
-        """
-        # Arrange
-        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
-        captured_urls: list[str] = []
-
-        async def fake_stream(url, _range):
-            captured_urls.append(url)
-            yield b"bai-bytes"
-
-        mocker.patch.object(drs, "stream_from_url", fake_stream)
-
-        mock_db.files.docs = []
-        mock_db.file.docs = [
-            _make_file_doc(
-                extra={
-                    "fourdn": {
-                        "extra_files": [
-                            {
-                                "file_format": {"display_title": "pairs_px2"},
-                                "href": "/x/data.px2",
-                            },
-                            {
-                                "file_format": {"display_title": "bai"},
-                                "href": "/x/y.bai",
-                                "file_size": 80,
-                            },
-                        ]
-                    }
-                }
-            )
-        ]
-
-        # Act
-        resp = await stream_index_file(
-            "4dn", "4DNFIBED01", _make_request(), range=None
-        )
-
-        # Assert
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert body == b"bai-bytes"
-        assert captured_urls[0].endswith("/x/y.bai")
-
-    @pytest.mark.asyncio
-    async def test_stream_index_file_should_normalize_mixed_string_and_dict_entries(
-        self, mock_db, mocker
-    ):
-        """Test (IX-010) that string and dict file_format entries coexist.
-
-        Given:
-            A 4DN file with a bare-string non-index entry first and a
-            dict-shaped ``tbi`` index entry second.
-        When:
-            ``stream_index_file`` is called.
-        Then:
-            Both shapes normalize in one pass and the dict ``tbi`` entry
-            is selected and streamed.
-        """
-        # Arrange
-        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
-        captured_urls: list[str] = []
-
-        async def fake_stream(url, _range):
-            captured_urls.append(url)
-            yield b"tbi-bytes"
-
-        mocker.patch.object(drs, "stream_from_url", fake_stream)
-
-        mock_db.files.docs = []
-        mock_db.file.docs = [
-            _make_file_doc(
-                extra={
-                    "fourdn": {
-                        "extra_files": [
-                            {"file_format": "data", "href": "/x/data"},
-                            {
-                                "file_format": {"display_title": "tbi"},
-                                "href": "/x/abc.tbi",
-                                "file_size": 100,
-                            },
-                        ]
-                    }
-                }
-            )
-        ]
-
-        # Act
-        resp = await stream_index_file(
-            "4dn", "4DNFIBED01", _make_request(), range=None
-        )
-
-        # Assert
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert body == b"tbi-bytes"
-        assert captured_urls[0].endswith("/x/abc.tbi")
-
-    @pytest.mark.asyncio
-    async def test_stream_index_file_should_match_dict_token_case_insensitively(
-        self, mock_db, mocker
-    ):
-        """Test (IX-011) that a dict display_title token matches regardless of case.
-
-        Given:
-            A 4DN file with a non-index entry first and a dict index entry
-            whose ``display_title`` is upper-case (``TBI``).
-        When:
-            ``stream_index_file`` is called.
-        Then:
-            The token is lowercased before matching, so the ``TBI`` entry
-            is selected and streamed.
-        """
-        # Arrange
-        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
-        captured_urls: list[str] = []
-
-        async def fake_stream(url, _range):
-            captured_urls.append(url)
-            yield b"tbi-bytes"
-
-        mocker.patch.object(drs, "stream_from_url", fake_stream)
-
-        mock_db.files.docs = []
-        mock_db.file.docs = [
-            _make_file_doc(
-                extra={
-                    "fourdn": {
-                        "extra_files": [
-                            {
-                                "file_format": {"display_title": "pairs_px2"},
-                                "href": "/x/data.px2",
-                            },
-                            {
-                                "file_format": {"display_title": "TBI"},
-                                "href": "/x/abc.tbi",
-                                "file_size": 100,
-                            },
-                        ]
-                    }
-                }
-            )
-        ]
-
-        # Act
-        resp = await stream_index_file(
-            "4dn", "4DNFIBED01", _make_request(), range=None
-        )
-
-        # Assert
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert body == b"tbi-bytes"
-        assert captured_urls[0].endswith("/x/abc.tbi")
-
-    @pytest.mark.parametrize("bad_format", [None, 123, ["tbi"]])
-    @pytest.mark.asyncio
-    async def test_stream_index_file_should_tolerate_non_string_file_format(
-        self, mock_db, mocker, bad_format
-    ):
-        """Test (IX-012) that an unexpected file_format type does not 500.
-
-        Given:
-            A 4DN file whose sole sidecar entry has ``file_format`` as a
-            non-dict, non-string value (None, an int, or a list).
-        When:
-            ``stream_index_file`` is called.
-        Then:
-            The value is treated as a non-match, the entry is served via
-            the first-entry fallback, and no AttributeError/500 occurs.
-        """
-        # Arrange
-        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
-        captured_urls: list[str] = []
-
-        async def fake_stream(url, _range):
-            captured_urls.append(url)
-            yield b"fallback-bytes"
-
-        mocker.patch.object(drs, "stream_from_url", fake_stream)
-
-        mock_db.files.docs = []
-        mock_db.file.docs = [
-            _make_file_doc(
-                extra={
-                    "fourdn": {
-                        "extra_files": [
-                            {
-                                "file_format": bad_format,
-                                "href": "/x/only.tbi",
-                                "file_size": 40,
-                            },
-                        ]
-                    }
-                }
-            )
-        ]
-
-        # Act
-        resp = await stream_index_file(
-            "4dn", "4DNFIBED01", _make_request(), range=None
-        )
-
-        # Assert
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert body == b"fallback-bytes"
-        assert captured_urls[0].endswith("/x/only.tbi")
-
-    @pytest.mark.asyncio
     async def test_stream_index_file_should_resolve_nested_fourdn_extra_files(
         self, mock_db, mocker
     ):
@@ -654,6 +312,421 @@ class TestStreamIndexFileFourdnSidecar:
         assert body == b"idx-bytes"
         assert len(captured_urls) == 1
         assert captured_urls[0].endswith("/x/abc.tbi")
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_select_dict_shaped_file_format_sidecar(
+        self, mock_db, mocker
+    ):
+        """Test (IX-007) that a 4DN dict-shaped file_format sidecar is read.
+
+        Given:
+            A 4DN file whose ``extra.fourdn.extra_files`` carries
+            ``file_format`` as the CV object the materializer emits — a
+            non-index ``bw`` entry first and the ``beddb`` index second.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            It should read the token from ``display_title``, prefer the
+            ``beddb`` entry, and stream it rather than crashing on the
+            dict (the #26 500).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"beddb-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/data.bw",
+                            },
+                            {
+                                "file_format": {"display_title": "beddb"},
+                                "href": "/x/abc.beddb",
+                                "file_size": 100,
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"beddb-bytes"
+        assert captured_urls[0].endswith("/x/abc.beddb")
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_fall_back_when_dict_file_format_lacks_display_title(
+        self, mock_db, mocker
+    ):
+        """Test (IX-008) that a dict file_format with no display_title falls back.
+
+        Given:
+            A 4DN file with two non-index entries: one whose ``file_format``
+            dict carries no ``display_title`` key (first) and a ``bw`` entry
+            (second), so nothing matches the index allowlist.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            The missing token resolves to no-match, the first-entry fallback
+            serves the first entry (not the second), and no AttributeError
+            is raised (the #26 crash line).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"fallback-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"@id": "/file-formats/beddb/"},
+                                "href": "/x/first.beddb",
+                                "file_size": 50,
+                            },
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/second.bw",
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"fallback-bytes"
+        assert captured_urls[0].endswith("/x/first.beddb")
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_reject_non_index_dict_token(
+        self, mock_db, mocker
+    ):
+        """Test (IX-009) that a non-index dict display_title does not match.
+
+        Given:
+            A 4DN file with two dict-shaped sidecar entries: a non-index
+            ``bw`` entry first and a ``bai`` index entry second.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            The non-index dict token must not match the canonical index
+            formats; the ``bai`` index entry is selected and streamed.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"bai-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/data.bw",
+                            },
+                            {
+                                "file_format": {"display_title": "bai"},
+                                "href": "/x/y.bai",
+                                "file_size": 80,
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"bai-bytes"
+        assert captured_urls[0].endswith("/x/y.bai")
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_match_bare_string_index_alongside_dict_entry(
+        self, mock_db, mocker
+    ):
+        """Test (IX-010) that a bare-string index token is matched.
+
+        Given:
+            A 4DN file with a non-index dict ``bw`` entry first and a
+            bare-string ``tbi`` index entry second.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            The bare-string entry is normalized and matched, so the ``tbi``
+            entry is selected and streamed — exercising the string branch
+            alongside the dict branch in one pass.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"tbi-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/data.bw",
+                            },
+                            {
+                                "file_format": "tbi",
+                                "href": "/x/abc.tbi",
+                                "file_size": 100,
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"tbi-bytes"
+        assert captured_urls[0].endswith("/x/abc.tbi")
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_match_dict_token_case_insensitively(
+        self, mock_db, mocker
+    ):
+        """Test (IX-011) that a dict display_title token matches regardless of case.
+
+        Given:
+            A 4DN file with a non-index ``bw`` entry first and a dict index
+            entry whose ``display_title`` is upper-case (``TBI``).
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            The token is lowercased before matching, so the ``TBI`` entry
+            is selected and streamed.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"tbi-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/data.bw",
+                            },
+                            {
+                                "file_format": {"display_title": "TBI"},
+                                "href": "/x/abc.tbi",
+                                "file_size": 100,
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"tbi-bytes"
+        assert captured_urls[0].endswith("/x/abc.tbi")
+
+    @pytest.mark.parametrize("bad_format", [None, 123, ["tbi"]])
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_tolerate_non_string_file_format(
+        self, mock_db, mocker, bad_format
+    ):
+        """Test (IX-012) that an unexpected file_format type does not 500.
+
+        Given:
+            A 4DN file with two non-matching entries: one whose
+            ``file_format`` is a non-dict, non-string value (None, an int,
+            or a list) first, and a ``bw`` entry second.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            The value is treated as a non-match, the first-entry fallback
+            serves the first entry, and no AttributeError/500 occurs.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"fallback-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": bad_format,
+                                "href": "/x/first.dat",
+                                "file_size": 40,
+                            },
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/second.bw",
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"fallback-bytes"
+        assert captured_urls[0].endswith("/x/first.dat")
+
+    @pytest.mark.parametrize("index_token", ["pairs_px2", "bg_px2"])
+    @pytest.mark.asyncio
+    async def test_stream_index_file_should_match_pairix_index_tokens(
+        self, mock_db, mocker, index_token
+    ):
+        """Test (IX-013) that 4DN pairix index tokens are matched by format.
+
+        Given:
+            A 4DN file with a non-index ``bw`` entry first and a pairix
+            index entry (``pairs_px2`` or ``bg_px2``) second.
+        When:
+            ``stream_index_file`` is called.
+        Then:
+            The pairix token matches the index allowlist and wins over array
+            order, so the index entry is selected and streamed rather than
+            the first-entry fallback serving the ``bw``.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        captured_urls: list[str] = []
+
+        async def fake_stream(url, _range):
+            captured_urls.append(url)
+            yield b"px2-bytes"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={
+                    "fourdn": {
+                        "extra_files": [
+                            {
+                                "file_format": {"display_title": "bw"},
+                                "href": "/x/data.bw",
+                            },
+                            {
+                                "file_format": {"display_title": index_token},
+                                "href": "/x/abc.px2",
+                                "file_size": 100,
+                            },
+                        ]
+                    }
+                }
+            )
+        ]
+
+        # Act
+        resp = await stream_index_file(
+            "4dn", "4DNFIBED01", _make_request(), range=None
+        )
+
+        # Assert
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.body_iterator])
+        assert body == b"px2-bytes"
+        assert captured_urls[0].endswith("/x/abc.px2")
 
 
 class TestStreamIndexFileWorkflowPaths:
