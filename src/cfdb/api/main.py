@@ -321,9 +321,12 @@ async def lifespan(_: FastAPI):
             )
 
             async with _build_discovery(profile) as discovery:
+                # No lease cap: admit every worker discovery surfaces. The
+                # ecs profile launches one ephemeral worker per workflow,
+                # so concurrency is bounded by the AWS Fargate vCPU service
+                # quota, not an in-process lease.
                 async with wool.WorkerPool(
                     discovery=discovery,
-                    lease=api.WORKFLOW_WORKER_COUNT,
                     credentials=worker_credentials,
                 ):
                     # Snapshot the lifespan task's contextvars after the
@@ -339,12 +342,11 @@ async def lifespan(_: FastAPI):
                     executor_handle = api.executor
                     log.info(
                         "Workflow subsystem enabled: profile=%s cache=%s "
-                        "workdir=%s lease=%d discovery=%s provisioner=%s "
+                        "workdir=%s discovery=%s provisioner=%s "
                         "worker_mtls=%s",
                         profile.kind,
                         type(api.cache).__name__,
                         profile.workdir_root,
-                        api.WORKFLOW_WORKER_COUNT,
                         type(discovery).__name__,
                         "EcsProvisioner" if provisioner is not None else "none",
                         "enabled" if worker_credentials is not None else "disabled",

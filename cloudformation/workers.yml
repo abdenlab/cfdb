@@ -15,12 +15,17 @@ Parameters:
     Description: ECR image URI for the cfdb wool worker (Dockerfile.wool)
   WorkerCpu:
     Type: String
-    Default: "2048"
+    Default: "1024"
     Description: Fargate task CPU units for a worker (1024 = 1 vCPU)
   WorkerMemory:
     Type: String
-    Default: "4096"
-    Description: Fargate task memory (MiB) for a worker
+    Default: "2048"
+    Description: >
+      Fargate task memory (MiB). 2048 is the Fargate minimum for 1 vCPU.
+      The tools cfdb drives are memory-capped and spill to disk (samtools
+      sort -m and GNU sort -S, both 256M by default), so peak RSS stays
+      well under this; ephemeral storage, not memory, is the binding
+      resource.
   WorkerEphemeralStorageGiB:
     Type: Number
     Default: 50

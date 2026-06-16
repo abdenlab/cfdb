@@ -61,19 +61,6 @@ def _parse_int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return parsed
 
 
-#: Upper bound on how many wool workers the API leases at once. The API
-#: is **lease-only** — it never spawns workers in process. Workers are
-#: provisioned externally (in development by manually starting a wool
-#: pool with ``--spawn``; in production as ECS tasks) and discovered via
-#: wool's discovery layer. When a workflow needs to launch, the executor
-#: should also signal the provisioner to scale up so a worker exists by
-#: the time dispatch retries surface it; the dispatch retry budget
-#: (``cfdb.workflows.executor._DISPATCH_WAIT_SECONDS``) is sized for an
-#: ECS cold start.
-WORKFLOW_WORKER_COUNT: Final = _parse_int_env(
-    "WORKFLOW_WORKER_COUNT", 2, minimum=1
-)
-
 #: Wool ``LanDiscovery`` namespace shared by the API (subscriber/leaser)
 #: and the worker pool process(es) (publisher). Both sides MUST use the
 #: same string; otherwise the API's discovery service won't see the
