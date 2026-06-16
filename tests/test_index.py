@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from wool.runtime.routine.task import do_dispatch
 
 from cfdb import api
-from cfdb.api.routers.index import stream_index_file
+from cfdb.api.routers.index import stream_index_file, stream_index_file_status
 from cfdb.services import drs, locks
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind
@@ -1103,3 +1103,298 @@ class TestStreamIndexFileWorkflowPaths:
         assert isinstance(resp, JSONResponse)
         assert resp.status_code == 202
         assert resp.headers["location"].startswith("/jobs/")
+
+
+class TestStreamIndexFileStatus:
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_raise_400_when_dcc_invalid(
+        self, mock_db, mocker
+    ):
+        """Test that an unknown DCC is rejected the same as /index.
+
+        Given:
+            A status probe for a DCC name not in the registry.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should raise HTTPException(400).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file_status("nope", "file-1")
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_raise_404_when_file_missing(
+        self, mock_db, mocker
+    ):
+        """Test that a missing file mirrors /index's 404.
+
+        Given:
+            A valid DCC but no matching file document.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should raise HTTPException(404).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mock_db.files.docs = []
+        mock_db.file.docs = []
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file_status("4dn", "missing")
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_report_ready_when_sidecar_present(
+        self, mock_db, mocker
+    ):
+        """Test that an upstream sidecar reports ready immediately.
+
+        Given:
+            A 4DN BED with an ``extra.extra_files`` sidecar entry.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should return ``{"ready": True}`` without opening any
+            upstream stream.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        stream_calls: list = []
+
+        async def fake_stream(url, _range):
+            stream_calls.append(url)
+            yield b"should-not-stream"
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={"extra_files": [{"href": "/x/abc.tbi", "file_size": 100}]}
+            )
+        ]
+
+        # Act
+        result = await stream_index_file_status("4dn", "4DNFIBED01")
+
+        # Assert
+        assert result == {"ready": True}
+        assert stream_calls == []
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_502_when_sidecar_href_missing(
+        self, mock_db, mocker
+    ):
+        """Test that a malformed sidecar mirrors /index's 502.
+
+        Given:
+            A 4DN sidecar entry with no ``href`` key.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should raise HTTPException(502).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(extra={"extra_files": [{"file_format": "tbi"}]})
+        ]
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file_status("4dn", "4DNFIBED01")
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_report_ready_on_cache_hit(
+        self, mock_db, mocker, tmp_path
+    ):
+        """Test that a cached INDEX artifact reports ready without dispatch.
+
+        Given:
+            A BAM file with no sidecar, a registered ``BamIndexProcessor``,
+            and the INDEX cache pre-populated with the BAI bytes.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should return ``{"ready": True}`` and ``ensure_workflow``
+            MUST NOT be called.
+        """
+        # Arrange
+        from cfdb.workflows import keys as key_utils
+        from cfdb.workflows.cache import LocalFsCache
+
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"bai-cached")
+        processor = BamIndexProcessor()
+        index_key = key_utils.cache_key(
+            dcc="4dn_dcic",
+            local_id="4DNFIBAM01",
+            artifact_kind=ArtifactKind.INDEX,
+            md5=FIXTURE_MD5,
+            processor_version=processor.processor_version,
+        )
+        await cache.put(index_key, src)
+
+        class _FailIfDispatched:
+            async def ensure_workflow(self, _file_doc):
+                raise AssertionError("status probe must NOT dispatch a workflow")
+
+        registry = ProcessorRegistry()
+        registry.register(processor)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "executor", _FailIfDispatched())
+
+        bam_doc = _make_file_doc(
+            file_format={"name": "BAM"},
+            filename="x.bam",
+            local_id="4DNFIBAM01",
+        )
+        bam_doc.pop("extra", None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [bam_doc]
+
+        # Act
+        result = await stream_index_file_status("4dn", "4DNFIBAM01")
+
+        # Assert
+        assert result == {"ready": True}
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_report_not_ready_on_cache_miss(
+        self, mock_db, mocker
+    ):
+        """Test that a processable-but-uncached index reports not-ready.
+
+        Given:
+            A BAM file with no sidecar, a registered processor emitting an
+            INDEX artifact, an empty cache, and an executor that fails if
+            dispatched.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should return ``{"ready": False}`` and ``ensure_workflow``
+            MUST NOT be called — the probe never dispatches.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        class _MissCache:
+            async def head(self, _k):
+                return None
+
+            def get(self, _k, _r=None):
+                raise AssertionError
+
+            async def put(self, *_a, **_kw):
+                raise AssertionError
+
+            async def delete(self, _k):
+                return False
+
+        class _FailIfDispatched:
+            async def ensure_workflow(self, _file_doc):
+                raise AssertionError("status probe must NOT dispatch a workflow")
+
+        registry = ProcessorRegistry()
+        registry.register(BamIndexProcessor())
+        mocker.patch.object(api, "cache", _MissCache())
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "executor", _FailIfDispatched())
+
+        bam_doc = _make_file_doc(
+            file_format={"name": "BAM"},
+            filename="x.bam",
+            local_id="4DNFIBAM01",
+        )
+        bam_doc.pop("extra", None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [bam_doc]
+
+        # Act
+        result = await stream_index_file_status("4dn", "4DNFIBAM01")
+
+        # Assert
+        assert result == {"ready": False}
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_raise_404_for_passthrough_format(
+        self, mock_db, mocker, tmp_path
+    ):
+        """Test that a passthrough format mirrors /index's no-index 404.
+
+        Given:
+            A CSV file with no sidecar and the workflow subsystem wired
+            with an empty registry.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should raise HTTPException(404) — CSV has no index in any
+            state of the world.
+        """
+        # Arrange
+        from cfdb.workflows.cache import LocalFsCache
+
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        doc = _make_file_doc(file_format={"name": "CSV"})
+        doc.pop("extra", None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [doc]
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(api, "processor_registry", ProcessorRegistry())
+        mocker.patch.object(
+            api,
+            "executor",
+            WoolExecutor(
+                mock_db,
+                api.cache,
+                api.processor_registry,
+                workdir_root=tmp_path / "jobs",
+            ),
+        )
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file_status("4dn", "4DNFIBED01")
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_raise_503_when_subsystem_disabled(
+        self, mock_db, mocker
+    ):
+        """Test that a processable format with the subsystem off mirrors 503.
+
+        Given:
+            A BAM file with no sidecar and the workflow subsystem unwired
+            (``api.executor is None``).
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should raise HTTPException(503).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "executor", None)
+        mocker.patch.object(api, "cache", None)
+        mocker.patch.object(api, "processor_registry", None)
+        doc = _make_file_doc(file_format={"name": "BAM"})
+        doc.pop("extra", None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [doc]
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file_status("4dn", "4DNFIBED01")
+        assert exc_info.value.status_code == 503
