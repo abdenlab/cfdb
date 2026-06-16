@@ -13,7 +13,7 @@ from cfdb.services import drs, locks
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind
 from cfdb.workflows.processors.bam import BamIndexProcessor
-from cfdb.workflows.processors.registry import ProcessorRegistry
+from cfdb.workflows.processors.registry import ProcessorRegistry, default_registry
 from tests.test_workflows import FIXTURE_MD5
 
 
@@ -1151,6 +1151,39 @@ class TestStreamIndexFileStatus:
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_stream_index_file_status_should_raise_403_when_hubmap_not_public(
+        self, mock_db, mocker
+    ):
+        """Test that a protected HuBMAP file mirrors /index's 403.
+
+        Given:
+            A HuBMAP file with ``data_access_level="consortium"``.
+        When:
+            stream_index_file_status is called.
+        Then:
+            It should raise HTTPException(403) before any sidecar or
+            workflow lookup.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            {
+                "submission": "hubmap",
+                "id_namespace": "tag:hubmapconsortium.org,2023:",
+                "local_id": "HBM-1",
+                "filename": "x.bed",
+                "data_access_level": "consortium",
+                "file_format": {"name": "BED"},
+            }
+        ]
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file_status("hubmap", "HBM-1")
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
     async def test_stream_index_file_status_should_report_ready_when_sidecar_present(
         self, mock_db, mocker
     ):
@@ -1336,8 +1369,8 @@ class TestStreamIndexFileStatus:
         """Test that a passthrough format mirrors /index's no-index 404.
 
         Given:
-            A CSV file with no sidecar and the workflow subsystem wired
-            with an empty registry.
+            A CSV file with no sidecar and the default registry wired, so
+            the matched PassthroughProcessor declares no index artifact.
         When:
             stream_index_file_status is called.
         Then:
@@ -1352,8 +1385,12 @@ class TestStreamIndexFileStatus:
         doc.pop("extra", None)
         mock_db.files.docs = []
         mock_db.file.docs = [doc]
+        # Wire the DEFAULT registry (which includes PassthroughProcessor)
+        # so CSV resolves to a processor that produces no artifacts —
+        # exercising the no-index-format branch rather than the generic
+        # "no processor matched" fall-through.
         mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
-        mocker.patch.object(api, "processor_registry", ProcessorRegistry())
+        mocker.patch.object(api, "processor_registry", default_registry())
         mocker.patch.object(
             api,
             "executor",
