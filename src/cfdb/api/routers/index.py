@@ -211,6 +211,12 @@ async def stream_index_file_status(
     ``true`` when an upstream sidecar exists or the processed index is
     already cached; ``false`` when the index is processable but not yet
     cached (a ``GET`` would return ``202``).
+
+    ``ready: true`` means *no preprocessing is required*, not that a
+    ``GET`` is guaranteed to return ``200``. The probe describes only the
+    default path: it takes no ``raw`` parameter, so for a file whose only
+    index is a cached workflow artifact (no upstream sidecar) it reports
+    ``ready: true`` even though ``GET ...?raw=true`` would ``404``.
     """
     await locks.wait_for_cutover()
 

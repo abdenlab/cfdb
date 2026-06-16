@@ -311,6 +311,14 @@ async def stream_file_status(
     (passthrough, or a format with no DATA artifact); ``false`` when the
     file is processable but the artifact is not yet cached (a ``GET``
     would return ``202``).
+
+    ``ready: true`` means *no preprocessing is required*, not that a
+    ``GET`` is guaranteed to return ``200``. Because the probe makes no
+    upstream calls, a subsequent ``GET`` may still fail when it resolves
+    the access URL (``403``/``404``/``501``/``502``/``504`` from the DRS
+    or HTTPS path), and when the workflow subsystem is disabled a
+    ``ready: true`` processable file is served as raw upstream bytes
+    rather than a preprocessed artifact.
     """
     await locks.wait_for_cutover()
 
