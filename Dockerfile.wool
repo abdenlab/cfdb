@@ -1,0 +1,113 @@
+# check=skip=FromPlatformFlagConstDisallowed
+# The constant ``FROM --platform=linux/amd64`` below is intentional, not an
+# oversight — UCSC ships ``bigBedToBed`` only as a linux.x86_64 binary, so the
+# worker image is deliberately amd64 on every build host. See the FROM comment.
+
+# Worker image for the cfdb preprocessing/indexing pool.
+#
+# This is the image ECS Fargate runs as the worker task (CMD
+# ``python -m cfdb.workflows.worker_main``). Workers boot a wool gRPC
+# server, expose a tiny HTTP ``/health`` endpoint, and shell out to the
+# bioinformatics tools the workflow processors drive (samtools sort/index,
+# bgzip+tabix, gffread, bigBedToBed). ``EcsDiscovery`` on the API side
+# surfaces running tasks by ListTasks/DescribeTasks, so the worker itself
+# registers nothing — it only needs to bind its gRPC port and answer the
+# health probe.
+#
+# Deliberately leaner than Dockerfile.api: no Rust materializer stage (the
+# materializer runs API/sync-side, never on a worker), no uvicorn (the
+# worker serves gRPC + an aiohttp health endpoint, not the HTTP API), and
+# no RDS CA bundle (the routine streams events back to the API process and
+# never opens a Mongo connection itself).
+
+# Base image pin. Uses a sha256 digest so a tip retag at Docker Hub cannot
+# silently swap the build base. Kept in lockstep with Dockerfile.api's
+# runtime stage; update both together during a maintenance window:
+#   docker pull python:3.12-slim-bookworm
+#   docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim-bookworm
+ARG PYTHON_BASE_DIGEST=sha256:d193c6f51a7dbd10395d6328de3a7edb0516fb0608ca138036576f574c3e07d2
+
+# Pin the image to linux/amd64. The bigBed workflow shells out to UCSC's
+# ``bigBedToBed``, which UCSC publishes only as a linux.x86_64 binary (no
+# arm64 build exists). Without this pin the image inherits the build
+# host's arch, and on arm64 (Apple Silicon dev, Graviton) that x86_64
+# binary fails at exec with ``rosetta error: failed to open elf
+# /lib64/ld-linux-x86-64.so.2``, breaking bigBed preprocessing. Pinning
+# amd64 makes the worker run native on x86_64 Fargate and emulated (but
+# correct) on arm64 hosts. The digest above is a multi-arch index, so
+# ``--platform`` selects its amd64 variant.
+FROM --platform=linux/amd64 python:3.12-slim-bookworm@${PYTHON_BASE_DIGEST}
+
+# gRPC worker port (CFDB_WORKER_GRPC_PORT) and HTTP health port
+# (CFDB_WORKER_HEALTH_PORT). Documented for operators; the actual values
+# come from worker_main's CLI/env defaults at runtime.
+EXPOSE 50051
+EXPOSE 8080
+
+WORKDIR /app
+
+# sha256 of the linux.x86_64 ``bigBedToBed`` binary UCSC currently
+# publishes. UCSC does not expose pre-built versioned binaries (only
+# source tarballs), so the rolling URL is bound by content hash. Kept in
+# lockstep with Dockerfile.api. When UCSC ships a new build the layer
+# rebuilds with the new hash after maintainers re-verify out-of-band.
+# Updating: download the binary, run ``sha256sum``, paste here.
+ARG UCSC_BIGBEDTOBED_SHA256=9d1ea2158f5aa958fd8820fb7a2e5fb0947a9da7b183b8f9237429b8fbacd386
+
+# Install curl (for the container/ECS health check) and the bioinformatics
+# tools the workflow subsystem shells out to. samtools/tabix/bcftools/
+# gffread ship in Debian main; the ``tabix`` package also provides
+# ``bgzip``. UCSC kent tools come from the upstream release URL over HTTPS
+# with sha256 verification against the hash pinned above so a MITM or
+# silent tip change cannot substitute an unexpected binary that then
+# executes on attacker-supplied bigBed bytes via the workflow shell
+# pipelines.
+# Fetch the Debian package index and tools over HTTPS rather than the
+# image default of plain HTTP. apt verifies package signatures with GPG
+# regardless, but HTTP (port 80) egress to the mirrors is blocked in some
+# build environments (corporate firewalls, restricted CI) where HTTPS
+# (443) is allowed; the rewrite makes the build portable. The base image
+# pins the deb822-format sources at debian.sources; ca-certificates ship
+# in the base, and bookworm's apt speaks HTTPS natively.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        samtools \
+        tabix \
+        bcftools \
+        gffread \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail -sSL -o /usr/local/bin/bigBedToBed \
+        https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/bigBedToBed \
+    && echo "${UCSC_BIGBEDTOBED_SHA256}  /usr/local/bin/bigBedToBed" | sha256sum -c - \
+    && chmod +x /usr/local/bin/bigBedToBed
+
+# Install the cfdb package — non-editable, production deps only (wool,
+# aiohttp, boto3, click, motor, pymongo). uvicorn is intentionally omitted;
+# the worker does not serve the HTTP API. Dev extras (test frameworks,
+# linters) are not shipped to the runtime image.
+#
+# The project derives its version from git via setuptools_scm, but the
+# slim runtime carries no ``git`` binary (and we don't want the .git tree
+# in the image). Pretend a version so the wheel builds hermetically; CI
+# can inject the real tag with ``--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=…``.
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+docker
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
+COPY . /app
+RUN pip install --no-cache-dir .
+
+# Create non-root user. /tmp remains writable for per-job scratch workdirs
+# the executor hands the routine.
+RUN useradd app
+USER app
+
+# Surface worker liveness to ``docker ps`` and any orchestrator that reads
+# the image HEALTHCHECK. ECS task definitions typically declare their own
+# healthCheck, but mirroring it here keeps local runs observable. Probes
+# the aiohttp ``/health`` endpoint worker_main serves on the health port.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail http://localhost:8080/health || exit 1
+
+CMD ["python", "-m", "cfdb.workflows.worker_main"]

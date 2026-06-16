@@ -10,6 +10,7 @@ import pytest
 
 from cfdb.workflows import SORT_MEMORY_CAP, keys as key_utils
 from cfdb.workflows.cache import LocalFsCache
+from cfdb.workflows.events import Complete
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors import tabix as tabix_module
 from cfdb.workflows.processors.tabix import TabixIntervalProcessor
@@ -29,15 +30,18 @@ def _file_meta(fmt: str) -> dict[str, Any]:
 
 async def _drain_run(proc, file_meta, workdir, cache_root):
     """Drive the processor's async-generator ``run`` to completion."""
-    return [event async for event in proc.run(file_meta, workdir, cache_root)]
+    return [
+        event
+        async for event in proc.run(file_meta, workdir, LocalFsCache(cache_root))
+    ]
 
 
-def _final_artifacts(events: list[dict]) -> dict[str, str]:
-    """Return the artifact mapping from the terminal ``complete`` event."""
+def _final_artifacts(events: list) -> dict[str, str]:
+    """Return the artifact mapping from the terminal ``Complete`` event."""
     for event in reversed(events):
-        if event.get("event") == "complete":
-            return dict(event.get("artifacts") or {})
-    raise AssertionError("processor did not emit a `complete` event")
+        if isinstance(event, Complete):
+            return dict(event.artifacts)
+    raise AssertionError("processor did not emit a `Complete` event")
 
 
 class _PipelineHarness:
@@ -454,7 +458,7 @@ class TestTabixIntervalProcessorPipelines:
         # Act & assert
         with pytest.raises(RuntimeError, match="Refusing to commit empty"):
             async for _event in TabixIntervalProcessor().run(
-                _file_meta("BED"), workdir, cache_root
+                _file_meta("BED"), workdir, LocalFsCache(cache_root)
             ):
                 pass
         cache = LocalFsCache(cache_root)

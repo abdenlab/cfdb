@@ -27,7 +27,10 @@ Runtime / lifecycle (consumed by the executor and lock modules):
 
 - ``CFDB_WORKFLOW_DURATION_CAP_S`` — per-workflow wall-clock cap, enforced
   via ``asyncio.timeout`` on the API side while consuming the routine's
-  event stream. Default ``1200`` (20 min).
+  event stream. Default ``14400`` (4 h) — sized for multi-hour
+  preprocessing runs (e.g., a ``samtools sort`` on a multi-GB BAM
+  followed by ``samtools index``). Operators running on bounded fixtures
+  in dev should lower this via env.
 - ``CFDB_WORKFLOW_DISPATCH_WAIT_S`` — how long ``ensure_workflow`` waits
   for a wool worker to become available before giving up. Default ``60``.
 - ``CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S`` — how often the routine emits a
@@ -109,7 +112,7 @@ SORT_PARALLEL: Final = _positive_int(
 # look like a hard failure).
 WORKFLOW_DURATION_CAP_S: Final = _positive_int(
     "CFDB_WORKFLOW_DURATION_CAP_S",
-    os.getenv("CFDB_WORKFLOW_DURATION_CAP_S", "1200"),
+    os.getenv("CFDB_WORKFLOW_DURATION_CAP_S", "14400"),
     minimum=1,
 )
 WORKFLOW_DISPATCH_WAIT_S: Final = _positive_int(

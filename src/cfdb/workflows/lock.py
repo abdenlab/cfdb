@@ -59,10 +59,6 @@ def _jobs(db) -> Any:
         return coll
     if not callable(getattr(configured, "find_one_and_update", None)):
         return coll
-    try:
-        result = configured.find_one_and_update.__wrapped__  # type: ignore[attr-defined]
-    except AttributeError:
-        result = None
     # Heuristic: real motor collections return a coroutine from these
     # methods. mongomock-motor's `with_options` historically degrades to
     # the sync collection — detect that by sniffing one method.
@@ -426,7 +422,7 @@ async def update_progress(db, job_id: str, value: str) -> None:
     """Set the free-form ``progress`` hint on an active job.
 
     Called by the executor's stream consumer in response to a
-    ``{"event": "progress", "value": str}`` event from the routine.
+    :class:`~cfdb.workflows.events.Progress` event from the routine.
     No-op when the job is no longer active. The value is truncated to
     256 chars to match the JobRecord field cap.
     """

@@ -586,7 +586,6 @@ async def integration_executor(
     executor = WoolExecutor(
         install_jobs_index,
         cache,
-        integration_cache_root,
         registry,
         workdir_root=integration_workdir_root,
     )

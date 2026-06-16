@@ -63,7 +63,7 @@ _CLAIM_MD5: str = "d41d8cd98f00b204e9800998ecf8427e"
 
 
 def _claim_args(
-    workflow_key: str = f"encode/x/d41d8cd98f00b204e9800998ecf8427e/v1",
+    workflow_key: str = "encode/x/d41d8cd98f00b204e9800998ecf8427e/v1",
 ) -> dict:
     """Return the keyword arguments shared across claim_workflow calls."""
     return dict(

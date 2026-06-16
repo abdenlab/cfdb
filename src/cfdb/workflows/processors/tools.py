@@ -15,7 +15,7 @@ import signal
 from pathlib import Path
 from typing import Any
 
-from cfdb.workflows.cache import LocalFsCache
+from cfdb.workflows.cache import CacheBackend
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +134,12 @@ async def run_shell(cmd: str) -> None:
         )
 
 
-async def copy_from_cache(cache: LocalFsCache, key: str, dest: Path) -> None:
-    """Stream a cached artifact into ``dest`` for tool consumption."""
+async def copy_from_cache(cache: CacheBackend, key: str, dest: Path) -> None:
+    """Stream a cached artifact into ``dest`` for tool consumption.
+
+    Accepts any :class:`CacheBackend` (``cache.get`` is the only call) so
+    the S3 profile downloads from S3 here, not just the local FS.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as fh:
         async for chunk in cache.get(key):

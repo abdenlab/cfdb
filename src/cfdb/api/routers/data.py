@@ -4,11 +4,13 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request, status
-from fastapi.responses import Response, StreamingResponse
 
 from cfdb import api
 from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
-from cfdb.api.routers.cache_stream import serve_workflow_artifact_or_dispatch
+from cfdb.api.routers.cache_stream import (
+    serve_workflow_artifact_or_dispatch,
+    stream_upstream_url,
+)
 from cfdb.models import FileMetadataModel
 from cfdb.services import drs, locks
 from cfdb.services.drs import (
@@ -242,93 +244,13 @@ async def stream_file(
                 )
                 logger.info(f"Streaming HTTPS file: {drs_object.name}")
 
-                # Prepare response headers
-                response_headers = {
-                    "Content-Disposition": f'attachment; filename="{drs_object.name or "file"}"',
-                    "Accept-Ranges": "bytes",
-                }
-
-                status_code = 200
-                range_header_to_send = None
-
-                # Handle Range request if present
-                if range:
-                    # Validate that file size is available. RFC 9110 §15.5.17
-                    # says a range request the server cannot satisfy because
-                    # the total size is unknown should produce 416 with
-                    # ``Content-Range: bytes */*`` so the client can fall
-                    # back to a plain GET; 500 mis-signals a server fault.
-                    if not drs_object.size:
-                        logger.warning(
-                            f"Range request for file without size metadata: {local_id}"
-                        )
-                        raise HTTPException(
-                            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
-                            detail="File size unknown; range cannot be satisfied",
-                            headers={"Content-Range": "bytes */*"},
-                        )
-
-                    try:
-                        # Parse and validate the Range header
-                        start, end, content_length = drs.parse_range_header(
-                            range, drs_object.size
-                        )
-
-                        logger.debug(
-                            f"Range request: bytes {start}-{end}/{drs_object.size}"
-                        )
-
-                        # Set response for partial content
-                        range_header_to_send = range
-                        status_code = 206
-                        response_headers["Content-Range"] = (
-                            f"bytes {start}-{end}/{drs_object.size}"
-                        )
-                        response_headers["Content-Length"] = str(content_length)
-
-                    except drs.RangeNotSatisfiableError as e:
-                        # Range exceeds file bounds - return 416
-                        logger.warning(
-                            f"Range not satisfiable: {range} for file size {e.file_size}"
-                        )
-                        raise HTTPException(
-                            status_code=416,
-                            headers={
-                                "Content-Range": f"bytes */{e.file_size}",
-                                "Accept-Ranges": "bytes",
-                            },
-                        )
-
-                    except ValueError as e:
-                        # Invalid Range header syntax - return 400
-                        logger.warning(f"Invalid Range header syntax: {range}")
-                        raise HTTPException(
-                            status_code=400, detail=f"Invalid Range header: {str(e)}"
-                        )
-
-                # Set Content-Type from DRS metadata
-                media_type = drs_object.mime_type or "application/octet-stream"
-
-                # For full file requests, include Content-Length from DRS metadata if available
-                if not range and drs_object.size:
-                    response_headers["Content-Length"] = str(drs_object.size)
-
-                # HEAD request - return headers only, no body
-                if request.method == "HEAD":
-                    return Response(
-                        status_code=status_code,
-                        media_type=media_type,
-                        headers=response_headers,
-                    )
-
-                # Stream file (with or without range)
-                chunk_gen = drs.stream_from_url(download_url, range_header_to_send)
-
-                return StreamingResponse(
-                    chunk_gen,
-                    status_code=status_code,
-                    media_type=media_type,
-                    headers=response_headers,
+                return stream_upstream_url(
+                    download_url,
+                    drs_object.size,
+                    drs_object.name or "file",
+                    request,
+                    range,
+                    media_type=drs_object.mime_type or "application/octet-stream",
                 )
 
             except HTTPException:
@@ -395,95 +317,26 @@ async def _stream_encode_file(
 
     logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
 
-    # Prepare response headers
-    response_headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Accept-Ranges": "bytes",
-    }
-
-    status_code = 200
-    range_to_send = None
-
-    # Handle Range request if present
-    if range_header:
-        if not file_size:
-            logger.warning("Range request for ENCODE file without size metadata")
-            # See RFC 9110 §15.5.17 — when the server cannot determine
-            # the total size, return 416 with ``Content-Range: bytes */*``
-            # instead of a misleading 500.
-            raise HTTPException(
-                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
-                detail="File size unknown; range cannot be satisfied",
-                headers={"Content-Range": "bytes */*"},
-            )
-
-        try:
-            start, end, content_length = drs.parse_range_header(range_header, file_size)
-
-            logger.debug(f"Range request: bytes {start}-{end}/{file_size}")
-
-            range_to_send = range_header
-            status_code = 206
-            response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            response_headers["Content-Length"] = str(content_length)
-
-        except drs.RangeNotSatisfiableError as e:
-            logger.warning(
-                f"Range not satisfiable: {range_header} for file size {e.file_size}"
-            )
-            raise HTTPException(
-                status_code=416,
-                headers={
-                    "Content-Range": f"bytes */{e.file_size}",
-                    "Accept-Ranges": "bytes",
-                },
-            )
-
-        except ValueError as e:
-            logger.warning(f"Invalid Range header syntax: {range_header}")
-            raise HTTPException(
-                status_code=400, detail=f"Invalid Range header: {str(e)}"
-            )
-
-    # Determine media type from filename or default to binary
+    # Determine media type from filename; default to binary. (Branches
+    # that resolve to the default are folded away.)
     media_type = "application/octet-stream"
     if filename:
         if filename.endswith(".gz"):
             media_type = "application/gzip"
-        elif filename.endswith(".bam"):
-            media_type = "application/octet-stream"
-        elif filename.endswith(".fastq") or filename.endswith(".fq"):
+        elif filename.endswith((".fastq", ".fq", ".bed")):
             media_type = "text/plain"
-        elif filename.endswith(".bed"):
-            media_type = "text/plain"
-        elif filename.endswith(".bigWig") or filename.endswith(".bw"):
-            media_type = "application/octet-stream"
-        elif filename.endswith(".bigBed") or filename.endswith(".bb"):
-            media_type = "application/octet-stream"
 
-    # For full file requests, include Content-Length if available
-    if not range_header and file_size:
-        response_headers["Content-Length"] = str(file_size)
-
-    # HEAD request - return headers only, no body
-    if request.method == "HEAD":
-        return Response(
-            status_code=status_code,
-            media_type=media_type,
-            headers=response_headers,
-        )
-
-    # Stream file content
     try:
-        chunk_gen = drs.stream_from_url(download_url, range_to_send)
-
-        return StreamingResponse(
-            chunk_gen,
-            status_code=status_code,
+        return stream_upstream_url(
+            download_url,
+            file_size,
+            filename,
+            request,
+            range_header,
             media_type=media_type,
-            headers=response_headers,
         )
-
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"ENCODE streaming error: {str(e)}")
         raise HTTPException(status_code=502, detail="Failed to stream ENCODE file")

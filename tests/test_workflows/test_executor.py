@@ -11,6 +11,13 @@ import pytest
 import wool
 
 from cfdb.workflows import executor as executor_module
+from cfdb.workflows import keys as key_utils
+from cfdb.workflows.events import (
+    Complete,
+    Heartbeat,
+    Progress,
+    StageComplete,
+)
 from cfdb.workflows.executor import (
     PIPELINE_VERSION,
     ExecutorDraining,
@@ -22,6 +29,7 @@ from cfdb.workflows.lock import get_job
 from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind, JobStatus
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.registry import ProcessorRegistry
+from cfdb.workflows.provisioner import EcsProvisioner, RetryableProvisionerError
 from tests.test_workflows import FIXTURE_MD5
 
 #: Canonical artifact keys the stubs emit. Built from FIXTURE_MD5 so the
@@ -60,8 +68,8 @@ class _StubProcessor(Processor):
     ) -> AsyncIterator[dict[str, Any]]:
         self.run_calls += 1
         for kind, key in self.artifacts.items():
-            yield {"event": "stage_complete", "kind": kind, "key": key}
-        yield {"event": "complete", "artifacts": dict(self.artifacts)}
+            yield StageComplete(kind=ArtifactKind(kind), key=key)
+        yield Complete(artifacts=dict(self.artifacts))
 
 
 class _FailingProcessor(Processor):
@@ -243,7 +251,7 @@ class TestWoolExecutorEnsureWorkflow:
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()  # empty
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act & assert
@@ -275,7 +283,7 @@ class TestWoolExecutorEnsureWorkflow:
         registry = ProcessorRegistry()
         registry.register(processor)
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -319,14 +327,14 @@ class TestWoolExecutorEnsureWorkflow:
                 self.run_calls += 1
                 await release.wait()
                 for kind, key in self.artifacts.items():
-                    yield {"event": "stage_complete", "kind": kind, "key": key}
-                yield {"event": "complete", "artifacts": dict(self.artifacts)}
+                    yield StageComplete(kind=ArtifactKind(kind), key=key)
+                yield Complete(artifacts=dict(self.artifacts))
 
         processor = _BlockingProcessor()
         registry = ProcessorRegistry()
         registry.register(processor)
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -364,7 +372,7 @@ class TestWoolExecutorEnsureWorkflow:
         registry = ProcessorRegistry()
         registry.register(_FailingProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -402,15 +410,15 @@ class TestWoolExecutorEnsureWorkflow:
                 workdir.mkdir(parents=True, exist_ok=True)
                 (workdir / "scratch").write_bytes(b"tmp")
                 for kind, key in self.artifacts.items():
-                    yield {"event": "stage_complete", "kind": kind, "key": key}
-                yield {"event": "complete", "artifacts": dict(self.artifacts)}
+                    yield StageComplete(kind=ArtifactKind(kind), key=key)
+                yield Complete(artifacts=dict(self.artifacts))
 
         # Arrange
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_WorkdirTouchingProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -447,7 +455,7 @@ class TestWoolExecutorEnsureWorkflow:
         registry = ProcessorRegistry()
         registry.register(_StubProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         async def boom(*_a, **_kw):
@@ -473,6 +481,7 @@ class TestWoolExecutorEnsureWorkflow:
         tmp_cache,
         tmp_workdir,
         no_wool_dispatch,
+        mocker,
     ):
         """Test that jobs exceeding the runtime cap are marked FAILED.
 
@@ -491,27 +500,23 @@ class TestWoolExecutorEnsureWorkflow:
         class _HangingProcessor(_StubProcessor):
             async def run(self, file_meta, workdir, cache_root):
                 self.run_calls += 1
-                yield {
-                    "event": "stage_complete",
-                    "kind": ArtifactKind.DATA.value,
-                    "key": _DATA_KEY,
-                }
+                yield StageComplete(kind=ArtifactKind.DATA, key=_DATA_KEY)
                 await asyncio.sleep(10)
-                yield {"event": "complete", "artifacts": {}}
+                yield Complete(artifacts={})
 
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_HangingProcessor())
+        # Tiny but non-zero cap: zero risks event-loop edge cases on
+        # some asyncio versions; 0.05s is short enough to keep the
+        # test fast and long enough to be deterministic. Module-level
+        # so the timeout reads through monkeypatch.
+        mocker.patch.object(executor_module, "_WORKFLOW_DURATION_CAP_SECONDS", 0.05)
         executor = WoolExecutor(
             mock_db,
             tmp_cache,
-            tmp_cache.root,
             registry,
             workdir_root=tmp_workdir,
-            # Tiny but non-zero cap: zero risks event-loop edge cases on
-            # some asyncio versions; 0.05s is short enough to keep the
-            # test fast and long enough to be deterministic.
-            workflow_duration_cap_seconds=0.05,
         )
 
         # Act
@@ -572,39 +577,26 @@ class TestWoolExecutorPartialCommit:
                     src = workdir / "data"
                     src.write_bytes(b"data-bytes")
                     await cache.put(_DATA_KEY, src)
-                    yield {
-                        "event": "stage_complete",
-                        "kind": ArtifactKind.DATA.value,
-                        "key": _DATA_KEY,
-                    }
+                    yield StageComplete(kind=ArtifactKind.DATA, key=_DATA_KEY)
                     raise RuntimeError("stage-2 failure")
                 invocations.append(True)
-                yield {
-                    "event": "stage_complete",
-                    "kind": ArtifactKind.DATA.value,
-                    "key": _DATA_KEY,
-                }
+                yield StageComplete(kind=ArtifactKind.DATA, key=_DATA_KEY)
                 src = workdir / "index"
                 src.write_bytes(b"index-bytes")
                 await cache.put(_INDEX_KEY, src)
-                yield {
-                    "event": "stage_complete",
-                    "kind": ArtifactKind.INDEX.value,
-                    "key": _INDEX_KEY,
-                }
-                yield {
-                    "event": "complete",
-                    "artifacts": {
+                yield StageComplete(kind=ArtifactKind.INDEX, key=_INDEX_KEY)
+                yield Complete(
+                    artifacts={
                         ArtifactKind.DATA.value: _DATA_KEY,
                         ArtifactKind.INDEX.value: _INDEX_KEY,
-                    },
-                }
+                    }
+                )
 
         processor = _PartialCommitProcessor()
         registry = ProcessorRegistry()
         registry.register(processor)
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act — first run fails after committing stage 1.
@@ -644,33 +636,34 @@ class TestWoolExecutorArtifactKindCoercion:
         tmp_workdir,
         no_wool_dispatch,
     ):
-        """Test that processors emitting unknown artifact kinds fail loud.
+        """Test that an ill-typed StageComplete fails the job, not the routine.
 
         Given:
-            A processor whose ``run`` yields a ``stage_complete`` event
-            naming a kind not in ``ArtifactKind``.
+            A processor that violates the typed event contract by emitting
+            a StageComplete whose ``kind`` is a bare string rather than an
+            ArtifactKind.
         When:
             ensure_workflow is awaited and the background task completes.
         Then:
-            The job should land in FAILED with an error mentioning the
-            malformed event.
+            The job should land in FAILED rather than crashing the routine
+            — the executor records the failure and moves on.
         """
 
         # Arrange
         class _BogusKindProcessor(_StubProcessor):
             async def run(self, file_meta, workdir, cache_root):
                 self.run_calls += 1
-                yield {
-                    "event": "stage_complete",
-                    "kind": "weird_kind",
-                    "key": "encode/x/weird/aa-v0",
-                }
+                # Deliberately off-contract: kind must be an ArtifactKind.
+                yield StageComplete(
+                    kind="weird_kind",  # type: ignore[arg-type]
+                    key="encode/x/weird/aa-v0",
+                )
 
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_BogusKindProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -681,7 +674,7 @@ class TestWoolExecutorArtifactKindCoercion:
         final = await get_job(mock_db, record.job_id)
         assert final is not None
         assert final.status == JobStatus.FAILED
-        assert "stage_complete" in (final.error or "")
+        assert final.error
 
 
 class TestWoolExecutorDrain:
@@ -703,7 +696,7 @@ class TestWoolExecutorDrain:
         registry = ProcessorRegistry()
         registry.register(_StubProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -740,13 +733,13 @@ class TestWoolExecutorDrain:
                 self.run_calls += 1
                 await release.wait()
                 for kind, key in self.artifacts.items():
-                    yield {"event": "stage_complete", "kind": kind, "key": key}
-                yield {"event": "complete", "artifacts": dict(self.artifacts)}
+                    yield StageComplete(kind=ArtifactKind(kind), key=key)
+                yield Complete(artifacts=dict(self.artifacts))
 
         registry = ProcessorRegistry()
         registry.register(_BlockingProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         record, _ = await executor.ensure_workflow(_file_meta())
@@ -799,12 +792,12 @@ class TestWoolExecutorDrain:
             async def run(self, file_meta, workdir, cache_root):
                 self.run_calls += 1
                 await forever.wait()
-                yield {"event": "complete", "artifacts": {}}
+                yield Complete(artifacts={})
 
         registry = ProcessorRegistry()
         registry.register(_ForeverProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
         record, _ = await executor.ensure_workflow(_file_meta())
 
@@ -842,7 +835,7 @@ class TestWoolExecutorDrain:
         registry = ProcessorRegistry()
         registry.register(_StubProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
         await executor.drain(timeout=1.0)
 
@@ -892,7 +885,7 @@ class TestOpenStreamWithRetry:
         processor = _StubProcessor()
         registry.register(processor)
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Build two routines: one that immediately raises NoWorkersAvailable
@@ -906,8 +899,8 @@ class TestOpenStreamWithRetry:
 
         async def working_stream():
             attempts["count"] += 1
-            yield {"event": "stage_complete", "kind": "index", "key": _INDEX_KEY}
-            yield {"event": "complete", "artifacts": {}}
+            yield StageComplete(kind=ArtifactKind.INDEX, key=_INDEX_KEY)
+            yield Complete(artifacts={})
 
         streams = [failing_stream(), working_stream()]
 
@@ -929,7 +922,7 @@ class TestOpenStreamWithRetry:
 
         # Assert
         assert attempts["count"] == 2
-        assert any(e.get("event") == "complete" for e in events)
+        assert any(isinstance(e, Complete) for e in events)
 
     @pytest.mark.asyncio
     async def test_open_stream_with_retry_should_raise_when_deadline_expires(
@@ -953,7 +946,7 @@ class TestOpenStreamWithRetry:
         processor = _StubProcessor()
         registry.register(processor)
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         async def failing_stream():
@@ -1000,14 +993,14 @@ class TestStreamConsumerProgressEvents:
         class _ProgressProcessor(_StubProcessor):
             async def run(self, file_meta, workdir, cache_root):
                 self.run_calls += 1
-                yield {"event": "progress", "value": "merging"}
-                yield {"event": "complete", "artifacts": {}}
+                yield Progress(value="merging")
+                yield Complete(artifacts={})
 
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_ProgressProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -1018,47 +1011,6 @@ class TestStreamConsumerProgressEvents:
         final = await get_job(mock_db, record.job_id)
         assert final is not None
         assert final.progress == "merging"
-
-    @pytest.mark.asyncio
-    async def test_ensure_workflow_should_ignore_progress_event_with_non_string_value(
-        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
-    ):
-        """Test that non-string progress values are silently dropped.
-
-        Given:
-            A stub processor that yields ``{"event": "progress",
-            "value": 12345}`` (an int, not a string).
-        When:
-            ``ensure_workflow`` is awaited.
-        Then:
-            The job should reach COMPLETED and the persisted ``progress``
-            field should remain untouched (None) — the type guard skips
-            non-string values rather than crashing.
-        """
-
-        # Arrange
-        class _NumericProgressProcessor(_StubProcessor):
-            async def run(self, file_meta, workdir, cache_root):
-                self.run_calls += 1
-                yield {"event": "progress", "value": 12345}
-                yield {"event": "complete", "artifacts": {}}
-
-        _install_jobs_index(mock_db)
-        registry = ProcessorRegistry()
-        registry.register(_NumericProgressProcessor())
-        executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
-        )
-
-        # Act
-        record, _ = await executor.ensure_workflow(_file_meta())
-        await _wait_for_terminal(mock_db, record.job_id)
-
-        # Assert
-        final = await get_job(mock_db, record.job_id)
-        assert final is not None
-        assert final.status == JobStatus.COMPLETED
-        assert final.progress is None
 
 
 class TestStreamConsumerHeartbeatEvents:
@@ -1082,14 +1034,14 @@ class TestStreamConsumerHeartbeatEvents:
         class _HeartbeatProcessor(_StubProcessor):
             async def run(self, file_meta, workdir, cache_root):
                 self.run_calls += 1
-                yield {"event": "heartbeat"}
-                yield {"event": "complete", "artifacts": {}}
+                yield Heartbeat()
+                yield Complete(artifacts={})
 
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_HeartbeatProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
         spy = mocker.spy(executor_module, "heartbeat_workflow")
 
@@ -1126,13 +1078,13 @@ class TestStreamConsumerUnknownEvent:
             async def run(self, file_meta, workdir, cache_root):
                 self.run_calls += 1
                 yield {"event": "weird"}
-                yield {"event": "complete", "artifacts": {}}
+                yield Complete(artifacts={})
 
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_WeirdEventProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         # Act
@@ -1190,7 +1142,7 @@ class TestOpenStreamMalformedFirstEvent:
         processor = _StubProcessor()
         registry.register(processor)
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
         async def boom_stream():
@@ -1229,7 +1181,7 @@ class TestEnsureWorkflowSnapshotsFileMeta:
         registry = ProcessorRegistry()
         registry.register(_StubProcessor())
         executor = WoolExecutor(
-            mock_db, tmp_cache, tmp_cache.root, registry, workdir_root=tmp_workdir
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
         meta = _file_meta()
 
@@ -1241,3 +1193,253 @@ class TestEnsureWorkflowSnapshotsFileMeta:
         final = await get_job(mock_db, record.job_id)
         assert final is not None
         assert final.file_meta_snapshot == meta
+
+
+class TestWoolExecutorWithProvisioner:
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_request_worker_when_provisioner_set(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that a fresh claim dispatches a provisioner request.
+
+        Given:
+            A WoolExecutor wired with a stub EcsProvisioner.
+        When:
+            ``ensure_workflow`` is awaited on a previously-unseen file.
+        Then:
+            The provisioner's ``request`` should be awaited exactly once
+            with ``dedup_key`` set to the workflow mutex key for the file.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
+        provisioner.request.return_value = ["arn:fake:task/abc"]
+        executor = WoolExecutor(
+            mock_db,
+            tmp_cache,
+            registry,
+            workdir_root=tmp_workdir,
+            provisioner=provisioner,
+        )
+        meta = _file_meta()
+        dcc, local_id, md5 = extract_identity(meta)
+        expected_key = key_utils.workflow_key(
+            dcc=dcc, local_id=local_id, md5=md5, pipeline_version=PIPELINE_VERSION
+        )
+
+        # Act
+        record, _ = await executor.ensure_workflow(meta)
+        await _wait_for_terminal(mock_db, record.job_id)
+
+        # Assert
+        provisioner.request.assert_awaited_once_with(dedup_key=expected_key)
+
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_skip_provisioner_when_attaching_to_existing_job(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that the provisioner is only invoked on fresh claims.
+
+        Given:
+            An executor with a stub provisioner and a blocking processor
+            so the first claim stays active when the second call arrives.
+        When:
+            ``ensure_workflow`` is awaited twice for the same file_meta.
+        Then:
+            ``provisioner.request`` should be awaited exactly once — the
+            attach path must not double-spend a Fargate worker against
+            an already-claimed workflow.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        release = asyncio.Event()
+
+        class _BlockingProcessor(_StubProcessor):
+            async def run(self, file_meta, workdir, cache_root):
+                self.run_calls += 1
+                await release.wait()
+                for kind, key in self.artifacts.items():
+                    yield StageComplete(kind=ArtifactKind(kind), key=key)
+                yield Complete(artifacts=dict(self.artifacts))
+
+        registry = ProcessorRegistry()
+        registry.register(_BlockingProcessor())
+        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
+        provisioner.request.return_value = ["arn:fake:task/abc"]
+        executor = WoolExecutor(
+            mock_db,
+            tmp_cache,
+            registry,
+            workdir_root=tmp_workdir,
+            provisioner=provisioner,
+        )
+
+        # Act
+        record_a, fresh_a = await executor.ensure_workflow(_file_meta())
+        record_b, fresh_b = await executor.ensure_workflow(_file_meta())
+        release.set()
+        await _wait_for_terminal(mock_db, record_a.job_id)
+
+        # Assert
+        assert fresh_a is True
+        assert fresh_b is False
+        assert record_a.job_id == record_b.job_id
+        provisioner.request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_fall_through_when_retryable_provisioner_raises(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that a retryable provisioner failure falls through to dispatch.
+
+        Given:
+            A provisioner whose ``request`` raises
+            ``RetryableProvisionerError`` (capacity / ENI exhaustion /
+            throttling) AND a wool pool that can still dispatch to an
+            existing worker (the no_wool_dispatch fixture runs the
+            routine in-process).
+        When:
+            ``ensure_workflow`` is awaited.
+        Then:
+            The retryable error should be logged but not fail the
+            workflow — the Wool pool routes to any available worker
+            via discovery, so an existing idle worker can service the
+            job even when ECS quota blocks a fresh launch. The
+            ``capacity:`` prefix is reserved for the case where
+            dispatch also exhausts its budget (see
+            ``test_ensure_workflow_should_record_capacity_failure_when_dispatch_also_fails``).
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
+        provisioner.request.side_effect = RetryableProvisionerError(
+            "ClientError: capacity-unavailable"
+        )
+        executor = WoolExecutor(
+            mock_db,
+            tmp_cache,
+            registry,
+            workdir_root=tmp_workdir,
+            provisioner=provisioner,
+        )
+
+        # Act
+        record, _ = await executor.ensure_workflow(_file_meta())
+        await _wait_for_terminal(mock_db, record.job_id)
+
+        # Assert
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        provisioner.request.assert_awaited_once()
+        # Provisioner failure was swallowed; in-process dispatch
+        # succeeded, so the workflow completes despite the
+        # retryable provisioner error.
+        assert final.status == JobStatus.COMPLETED
+        assert final.error is None
+
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_record_capacity_failure_when_dispatch_also_fails(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that the capacity: prefix fires when dispatch also exhausts.
+
+        Given:
+            A provisioner whose ``request`` raises
+            ``RetryableProvisionerError`` AND a dispatch path that
+            exhausts its budget with ``wool.NoWorkersAvailable``.
+        When:
+            ``ensure_workflow`` is awaited.
+        Then:
+            The workflow should reach ``FAILED`` with the
+            ``capacity:`` prefix — the wire contract clients parse to
+            decide whether to resubmit. Per C26 the origin of the
+            prefix shifted from the provisioner-failure branch to the
+            dispatch-budget-exhausted branch, but the on-wire shape
+            is unchanged.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
+        provisioner.request.side_effect = RetryableProvisionerError(
+            "ClientError: capacity-unavailable"
+        )
+        executor = WoolExecutor(
+            mock_db,
+            tmp_cache,
+            registry,
+            workdir_root=tmp_workdir,
+            provisioner=provisioner,
+        )
+        # Force the dispatch path to also fail with
+        # ``wool.NoWorkersAvailable``; the C26 stream-open branch
+        # translates that to the ``capacity:`` prefix.
+        mocker.patch.object(
+            executor,
+            "_open_stream_with_retry",
+            side_effect=wool.NoWorkersAvailable("pool empty after budget"),
+        )
+
+        # Act
+        record, _ = await executor.ensure_workflow(_file_meta())
+        await _wait_for_terminal(mock_db, record.job_id)
+
+        # Assert
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.FAILED
+        assert final.error is not None
+        assert final.error.startswith("capacity: "), (
+            f"expected 'capacity: ' prefix, got {final.error!r}"
+        )
+        assert "pool empty" in final.error
+
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_record_provisioner_prefix_for_generic_exception(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that non-retryable provisioner failures use the 'provisioner: ' prefix.
+
+        Given:
+            A provisioner whose ``request`` raises a generic
+            ``RuntimeError`` (a misconfiguration or unexpected boto
+            failure, not a retryable transient).
+        When:
+            ``ensure_workflow`` is awaited.
+        Then:
+            The job should reach ``FAILED`` with an error string that
+            starts with ``"provisioner: "`` so clients can distinguish
+            "retry me later" from "the provisioner crashed".
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
+        provisioner.request.side_effect = RuntimeError("misconfigured cluster")
+        executor = WoolExecutor(
+            mock_db,
+            tmp_cache,
+            registry,
+            workdir_root=tmp_workdir,
+            provisioner=provisioner,
+        )
+
+        # Act
+        record, _ = await executor.ensure_workflow(_file_meta())
+        await _wait_for_terminal(mock_db, record.job_id)
+
+        # Assert
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.FAILED
+        assert final.error is not None
+        assert final.error.startswith("provisioner: "), (
+            f"expected 'provisioner: ' prefix, got {final.error!r}"
+        )
+        assert "misconfigured cluster" in final.error

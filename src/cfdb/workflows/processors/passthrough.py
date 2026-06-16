@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.events import Complete, WorkflowEvent
 from cfdb.workflows.processors.base import Processor
 
 
@@ -30,8 +32,8 @@ class PassthroughProcessor(Processor):
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache_root: Path,
-    ) -> AsyncIterator[dict[str, Any]]:
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         """Never invoked; included to satisfy the Processor ABC."""
         raise RuntimeError(
             "PassthroughProcessor.run must not be called; these formats "
@@ -39,4 +41,4 @@ class PassthroughProcessor(Processor):
         )
         # Unreachable; kept so the function is syntactically an async
         # generator (matching the ABC contract).
-        yield {"event": "complete", "artifacts": {}}
+        yield Complete(artifacts={})

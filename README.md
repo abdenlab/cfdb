@@ -569,18 +569,44 @@ Required environment variables:
 
 Optional tunables (with defaults):
 
-- `CFDB_WORKFLOW_DURATION_CAP_S` — per-workflow wall-clock cap (default `1200`).
+- `CFDB_WORKFLOW_DURATION_CAP_S` — per-workflow wall-clock cap (default `14400`, i.e. 4 h — sized for multi-hour preprocessing runs; lower it for fixture-bound dev).
 - `CFDB_WORKFLOW_DISPATCH_WAIT_S` — how long `ensure_workflow` waits for a free worker before giving up (default `60`).
 - `CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S` — cadence at which the wool routine emits heartbeat events during quiet stages so the API can refresh `JobRecord.updated_at` (default `300`). The stale-reclaim threshold below is sized as `2 × heartbeat + safety_margin`; lowering this knob without also lowering the threshold widens the false-reclaim window.
 - `CFDB_WORKFLOW_STALE_THRESHOLD_S` — `updated_at` age beyond which an active row is reclaimable (default `900`; sized as `2 × heartbeat_interval + safety_margin` so a single missed heartbeat does not falsely reclaim a healthy worker).
 - `CFDB_SAMTOOLS_THREADS` (default `1`), `CFDB_SORT_PARALLEL` (default `2`) — CPU/thread caps for `samtools sort/index` and GNU `sort` respectively.
 - `CFDB_SAMTOOLS_MEMORY_CAP_PER_THREAD` (default `256M`), `CFDB_SORT_MEMORY_CAP` (default `256M`) — memory caps passed to the same tools. **`CFDB_SAMTOOLS_MEMORY_CAP_PER_THREAD` is per-thread**: total samtools RSS is bounded by `CFDB_SAMTOOLS_THREADS × CFDB_SAMTOOLS_MEMORY_CAP_PER_THREAD`. (The previous name `CFDB_SAMTOOLS_MEMORY_CAP` is rejected at import to surface deployments that haven't migrated; rename the env var.)
 
-Required tools on `PATH` for the **worker pool** (not the API): `samtools`, `bgzip`, `tabix`, `bcftools`, `gffread`, `bigBedToBed`. The `api` Docker image already installs all of these — the simplest local-dev / single-host deployment is to reuse `Dockerfile.api` as the worker image and override the `CMD` (or run the wool worker entrypoint via `python -m wool`). On the worker host, set `WORKFLOW_POOL_NAMESPACE` to match the API's value.
+Required tools on `PATH` for the **worker pool** (not the API): `samtools`, `bgzip`, `tabix`, `bcftools`, `gffread`, `bigBedToBed`. The dedicated worker image `Dockerfile.wool` installs all of these and is the image ECS runs (build it with `make wool`, tagged `cfdb-wool`; its `CMD` is the ECS entrypoint `python -m cfdb.workflows.worker_main`). For single-host local dev where the toolchain is already on your `PATH`, skip the image entirely and run the LAN worker pool directly — see "Running a local worker pool" below.
+
+#### ECS Fargate profile
+
+When the API runs on ECS Fargate (or LocalStack-backed dev that mirrors prod end-to-end), the lifespan switches from `LocalFsCache` + `LanDiscovery` to `S3Cache` + `EcsDiscovery` + `EcsProvisioner`. The selection is env-driven; with none of the variables below set the API runs the local PoC profile unchanged.
+
+- `AWS_ENDPOINT_URL` — boto3 endpoint override. Unset in production (boto3 hits real AWS); set to `http://localstack:4566` (or similar) for LocalStack-backed dev. The same application code runs in both environments — only this variable differs.
+- `AWS_REGION` — AWS region for the boto3 client (default `us-east-1`).
+- `WORKFLOW_S3_BUCKET` — when set, the lifespan instantiates `S3Cache` instead of `LocalFsCache`. The bucket must already exist (creation is out of band). When unset, the API stays on the local filesystem cache.
+- `WORKFLOW_S3_PREFIX` — optional key prefix the S3 backend prepends to every cache key (default empty). Lets a single bucket host multiple environments (`dev/`, `staging/`, `prod/`) without collisions.
+- `ECS_CLUSTER` — ECS cluster name or ARN. Gates the ECS-backed provisioner and discovery profile; unset means the PoC profile stays on `LanDiscovery` with no provisioner.
+- `ECS_WORKER_TASK_DEFINITION` — task definition for the worker container, as a family name (`cfdb-worker`) or `family:revision`. The provisioner passes it through to `RunTask` verbatim.
+- `ECS_WORKER_TASK_FAMILY` — family used by `EcsDiscovery` to filter `ListTasks`. Defaults to `ECS_WORKER_TASK_DEFINITION` with any `:revision` suffix stripped; set explicitly only when the discovery family differs from the provisioner task-def family (rare).
+- `ECS_WORKER_SUBNETS` — comma-separated awsvpc subnet IDs the worker ENIs land in. Required for the ECS profile; an empty list with `ECS_CLUSTER` set is a misconfiguration.
+- `ECS_WORKER_SECURITY_GROUPS` — comma-separated awsvpc security group IDs. Optional — when empty, ECS applies the VPC default SG.
+- `ECS_WORKER_ASSIGN_PUBLIC_IP` — `ENABLED` or `DISABLED` (default `DISABLED`). Production should leave this disabled and reach AWS via VPC endpoints; LocalStack accepts either value.
+
+The worker container's `CMD` is `python -m cfdb.workflows.worker_main`. Worker-side knobs (gRPC port, health port, max lifetime, drain grace) are documented under `--help` on that command; their env vars are `CFDB_WORKER_GRPC_PORT`, `CFDB_WORKER_HEALTH_PORT`, `CFDB_WORKER_MAX_LIFETIME_SECONDS`, and `CFDB_WORKER_DRAIN_GRACE_SECONDS`. The worker task definition MUST declare a `healthCheck` against the gRPC port; without one ECS reports `healthStatus: UNKNOWN` indefinitely and the worker is never advertised to discovery.
 
 #### Running a local worker pool
 
-For single-host development, start a wool worker pool in a separate process before launching the API, with `WORKFLOW_POOL_NAMESPACE` matching what the API uses. The API connects via LAN discovery (zeroconf/mDNS) and dispatches workflows to whatever workers are publishing under that namespace. With no worker pool running, `/data` and `/index` requests for processable formats will hang on the dispatch retry budget (60s by default) before failing with `NoWorkersAvailable`.
+For single-host development, start a wool worker pool in a separate process *before* launching the API, with `WORKFLOW_POOL_NAMESPACE` matching what the API uses:
+
+```bash
+# Publishes WORKFLOW_WORKER_COUNT workers (default 2) under
+# WORKFLOW_POOL_NAMESPACE (default cfdb-workers) over LAN discovery.
+python -m cfdb.workflows.worker_lan --namespace cfdb-workers --workers 2
+# or, with defaults: make worker-local
+```
+
+This is the local-dev counterpart to the ECS entrypoint (`python -m cfdb.workflows.worker_main`): `worker_lan` spawns a `wool.WorkerPool` wired to `LanDiscovery` so the pool advertises its workers over zeroconf/mDNS, whereas `worker_main` boots a bare worker that `EcsDiscovery` finds by polling the ECS control plane. The API connects via LAN discovery and dispatches workflows to whatever workers are publishing under that namespace. With no worker pool running, `/data` and `/index` requests for processable formats will hang on the dispatch retry budget (60s by default) before failing with `NoWorkersAvailable`.
 
 **URL:** `GET /jobs/{job_id}`
 

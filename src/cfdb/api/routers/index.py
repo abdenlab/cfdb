@@ -26,16 +26,16 @@ from typing import Optional
 from urllib.parse import urljoin
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request, status
-from fastapi.responses import Response, StreamingResponse
 
 from cfdb import api
 from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
-from cfdb.api.routers.cache_stream import serve_workflow_artifact_or_dispatch
+from cfdb.api.routers.cache_stream import (
+    serve_workflow_artifact_or_dispatch,
+    stream_upstream_url,
+)
 from cfdb.dcc_registry import get_all_dcc_names, get_dcc_config, normalize_dcc_name
-from cfdb.services import drs, locks
+from cfdb.services import locks
 from cfdb.workflows.models import ArtifactKind
-from cfdb.workflows.processors.passthrough import PassthroughProcessor
-from cfdb.workflows.processors.tools import format_name
 from cfdb.workflows.urlsafe import UnsafeOutboundURL, validate_outbound_url
 
 logger = logging.getLogger(__name__)
@@ -137,16 +137,23 @@ async def stream_index_file(
         # No sidecar, no workflow handler. Two terminal cases:
         #
         # 1. The format has no index in any state of the world (CSV,
-        #    TSV, bigWig — passthrough formats with no companion
-        #    index file). Return 404 unconditionally; the issue spec
-        #    promises a clean "no index" signal regardless of
-        #    subsystem state.
+        #    TSV, bigWig — passthrough formats whose processor declares no
+        #    artifacts). Return 404 unconditionally; the issue spec
+        #    promises a clean "no index" signal regardless of subsystem
+        #    state. Asking the matched processor whether it produces any
+        #    artifacts keeps the "is this a no-index format?" decision in
+        #    the registry rather than hard-coding PassthroughProcessor's
+        #    format set here.
         # 2. The format could be processed into an index but the
         #    workflow subsystem is disabled — return 503 so operators
         #    can distinguish degraded mode from an inherent no-index
         #    format.
-        fmt = format_name(file_doc)
-        if fmt is not None and fmt in PassthroughProcessor.supported_formats:
+        processor = (
+            api.processor_registry.lookup_for(file_doc)
+            if api.processor_registry is not None
+            else None
+        )
+        if processor is not None and not processor.artifact_kinds_produced(file_doc):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="No index file available for this file format",
@@ -257,55 +264,8 @@ async def _try_serve_fourdn_sidecar(
 
     logger.info(f"Streaming 4DN sidecar: {filename} from {download_url}")
 
-    response_headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Accept-Ranges": "bytes",
-    }
-
-    status_code = status.HTTP_200_OK
-    range_to_send: Optional[str] = None
-    if range_header:
-        if not file_size:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Cannot process range request: index file size unavailable",
-            )
-        try:
-            start, end, content_length = drs.parse_range_header(range_header, file_size)
-            range_to_send = range_header
-            status_code = status.HTTP_206_PARTIAL_CONTENT
-            response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            response_headers["Content-Length"] = str(content_length)
-        except drs.RangeNotSatisfiableError as e:
-            raise HTTPException(
-                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
-                headers={
-                    "Content-Range": f"bytes */{e.file_size}",
-                    "Accept-Ranges": "bytes",
-                },
-            )
-        except ValueError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid Range header: {str(e)}",
-            )
-
-    if not range_header and file_size:
-        response_headers["Content-Length"] = str(file_size)
-
-    if request.method == "HEAD":
-        return Response(
-            status_code=status_code,
-            media_type="application/octet-stream",
-            headers=response_headers,
-        )
-
-    chunk_gen = drs.stream_from_url(download_url, range_to_send)
-    return StreamingResponse(
-        chunk_gen,
-        status_code=status_code,
-        media_type="application/octet-stream",
-        headers=response_headers,
+    return stream_upstream_url(
+        download_url, file_size, filename, request, range_header
     )
 
 

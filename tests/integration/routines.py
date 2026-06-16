@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Final
 
+from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.events import Complete, StageComplete, WorkflowEvent
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.base import Processor
 
@@ -87,17 +89,17 @@ class StubProcessor(Processor):
         self,
         file_meta: dict[str, Any],
         workdir: Path,
-        cache_root: Path,
-    ) -> AsyncIterator[dict[str, Any]]:
+        cache: CacheBackend,
+    ) -> AsyncIterator[WorkflowEvent]:
         if self.sleep_seconds > 0:
             await asyncio.sleep(self.sleep_seconds)
         if self.raise_during_stage is not None:
             raise self.raise_during_stage
         for kind, key in self.artifacts.items():
-            yield {"event": "stage_complete", "kind": kind, "key": key}
+            yield StageComplete(kind=ArtifactKind(kind), key=key)
             if self.sleep_between_yields > 0:
                 await asyncio.sleep(self.sleep_between_yields)
-        yield {"event": "complete", "artifacts": dict(self.artifacts)}
+        yield Complete(artifacts=dict(self.artifacts))
 
 
 def stub_file_meta() -> dict[str, Any]:

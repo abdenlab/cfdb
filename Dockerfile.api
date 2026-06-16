@@ -10,6 +10,21 @@ ARG PYTHON_BASE_DIGEST=sha256:d193c6f51a7dbd10395d6328de3a7edb0516fb0608ca138036
 
 # Build stage for the Rust materializer
 FROM rust:1.88-slim-bookworm@${RUST_BASE_DIGEST} AS builder
+# The materializer's mongodb crate uses openssl-tls, so openssl-sys must
+# be able to link against system OpenSSL. The slim image ships only the
+# Rust toolchain; install pkg-config and libssl-dev so the build can
+# locate the headers and library.
+#
+# Fetch over HTTPS rather than the image default of plain HTTP: HTTP
+# (port 80) egress to the Debian mirrors is blocked in some build
+# environments (corporate firewalls, restricted CI) where HTTPS (443) is
+# allowed. The rewrite covers both deb822 (*.sources) and classic
+# (sources.list) layouts so it survives a base-image bump.
+RUN find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) \
+        -exec sed -i 's|http://deb.debian.org|https://deb.debian.org|g' {} + \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY materialize/ .
 RUN cargo build --release
@@ -42,7 +57,9 @@ ARG RDS_BUNDLE_SHA256=e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9d
 # against the hash pinned in the ARG above so a MITM or silent tip
 # change cannot substitute an unexpected binary that then executes on
 # attacker-supplied bigBed bytes via the workflow shell pipelines.
-RUN apt-get update \
+RUN find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) \
+        -exec sed -i 's|http://deb.debian.org|https://deb.debian.org|g' {} + \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
         samtools \
@@ -65,6 +82,12 @@ COPY --from=builder /build/target/release/materialize /usr/local/bin/materialize
 # Install Python dependencies — non-editable, production extras only.
 # Dev dependencies (test frameworks, linters) are NOT shipped to the
 # runtime image; install them in CI via ``pip install '.[dev]'``.
+# setuptools_scm derives the version from git, which the slim runtime
+# doesn't carry. Pretend a version so the wheel builds without git or the
+# .git tree; CI can inject the real tag via
+# ``--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=…``.
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+docker
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 COPY . /app
 RUN pip install --no-cache-dir . uvicorn
 

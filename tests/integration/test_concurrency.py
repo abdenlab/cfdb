@@ -33,6 +33,8 @@ from tests.integration.conftest import (
     make_file_meta,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def _job_id_from_202(resp) -> str:
     assert isinstance(resp, JSONResponse)

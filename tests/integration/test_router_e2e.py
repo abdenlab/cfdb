@@ -11,12 +11,10 @@ exercising the full workflow logic, cache lookup, and streaming path.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 from allpairspy import AllPairs
@@ -252,7 +250,7 @@ class TestRouterE2E:
             )
             final = await get_job(mock_db, job_id)
             assert final is not None
-            cache_root = wired_api._cache_root
+            cache_root = wired_api._cache.root
             cached_path = cache_root / final.artifact_cache_keys["index"]
             payload = cached_path.read_bytes()
             size = len(payload)
@@ -307,7 +305,7 @@ class TestRouterE2E:
             )
             final = await get_job(mock_db, job_id)
             assert final is not None
-            cache_root = wired_api._cache_root
+            cache_root = wired_api._cache.root
             cached_path = cache_root / final.artifact_cache_keys["index"]
             size = cached_path.stat().st_size
 
@@ -486,7 +484,6 @@ class TestRouterE2E:
         from cfdb.workflows.processors.passthrough import PassthroughProcessor
         from cfdb.workflows.processors.registry import ProcessorRegistry
 
-        registry: ProcessorRegistry = wired_api._registry
         # The wired registry only has BAM + tabix processors, not
         # passthrough. Build a fresh probe registry to confirm the
         # passthrough lookup behavior.
@@ -778,7 +775,7 @@ class TestRouterE2E:
 
             final = await get_job(mock_db, job_id)
             assert final is not None
-            cache_root = wired_api._cache_root
+            cache_root = wired_api._cache.root
             cached_path = cache_root / final.artifact_cache_keys["index"]
             cached_bytes = cached_path.read_bytes()
             size = len(cached_bytes)

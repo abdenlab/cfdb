@@ -23,6 +23,7 @@ import subprocess
 import pytest
 
 from cfdb.workflows.cache import LocalFsCache
+from cfdb.workflows.events import Complete, StageComplete
 from cfdb.workflows.processors import bam as bam_module
 from cfdb.workflows.processors import tabix as tabix_module
 from cfdb.workflows.processors.bam import BamIndexProcessor
@@ -91,10 +92,13 @@ class TestBamIndexProcessorDirectCall:
         # Act — drain the processor's async-generator event stream and
         # extract the artifact mapping from the terminal ``complete`` event.
         events = [
-            e async for e in BamIndexProcessor().run(file_meta, workdir, cache_root)
+            e
+            async for e in BamIndexProcessor().run(
+                file_meta, workdir, LocalFsCache(cache_root)
+            )
         ]
-        complete = next(e for e in reversed(events) if e.get("event") == "complete")
-        artifacts = complete["artifacts"]
+        complete = next(e for e in reversed(events) if isinstance(e, Complete))
+        artifacts = complete.artifacts
 
         # Assert — only the index is produced; data falls through to upstream.
         cache = LocalFsCache(cache_root)
@@ -193,24 +197,17 @@ class TestBamIndexProcessorDirectCall:
 
         # Act
         events = [
-            e async for e in BamIndexProcessor().run(file_meta, workdir, cache_root)
+            e
+            async for e in BamIndexProcessor().run(
+                file_meta, workdir, LocalFsCache(cache_root)
+            )
         ]
 
         # Assert
-        kinds = [
-            (e.get("event"), e.get("kind"))
-            for e in events
-            if e.get("event") == "stage_complete"
-        ]
-        assert (
-            "stage_complete",
-            ArtifactKind.DATA.value,
-        ) in kinds
-        assert (
-            "stage_complete",
-            ArtifactKind.INDEX.value,
-        ) in kinds
-        assert any(e.get("event") == "complete" for e in events)
+        kinds = [e.kind for e in events if isinstance(e, StageComplete)]
+        assert ArtifactKind.DATA in kinds
+        assert ArtifactKind.INDEX in kinds
+        assert any(isinstance(e, Complete) for e in events)
         assert shell_invocations == [], (
             "Stage-1 convert+sort pipeline must not run when the data "
             f"cache is warm; got invocations: {shell_invocations!r}"
@@ -277,11 +274,11 @@ class TestTabixIntervalProcessorDirectCall:
         events = [
             e
             async for e in TabixIntervalProcessor().run(
-                file_meta, workdir, cache_root
+                file_meta, workdir, LocalFsCache(cache_root)
             )
         ]
-        complete = next(e for e in reversed(events) if e.get("event") == "complete")
-        artifacts = complete["artifacts"]
+        complete = next(e for e in reversed(events) if isinstance(e, Complete))
+        artifacts = complete.artifacts
 
         # Assert
         cache = LocalFsCache(cache_root)
@@ -339,11 +336,11 @@ class TestTabixIntervalProcessorDirectCall:
         events = [
             e
             async for e in TabixIntervalProcessor().run(
-                file_meta, workdir, cache_root
+                file_meta, workdir, LocalFsCache(cache_root)
             )
         ]
-        complete = next(e for e in reversed(events) if e.get("event") == "complete")
-        artifacts = complete["artifacts"]
+        complete = next(e for e in reversed(events) if isinstance(e, Complete))
+        artifacts = complete.artifacts
 
         # Assert
         cache = LocalFsCache(cache_root)
@@ -416,16 +413,16 @@ class TestTabixIntervalProcessorDirectCall:
         events = [
             e
             async for e in TabixIntervalProcessor().run(
-                file_meta, workdir, cache_root
+                file_meta, workdir, LocalFsCache(cache_root)
             )
         ]
 
         # Assert
         complete = next(
-            (e for e in reversed(events) if e.get("event") == "complete"), None
+            (e for e in reversed(events) if isinstance(e, Complete)), None
         )
         assert complete is not None, "expected a terminal complete event"
-        artifacts = complete["artifacts"]
+        artifacts = complete.artifacts
         cache = LocalFsCache(cache_root)
 
         bgz_path = tmp_path / "out.bgz"

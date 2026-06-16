@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,9 @@ from cfdb.services import drs
 from cfdb.workflows.urlsafe import validate_outbound_url
 
 logger = logging.getLogger(__name__)
+
+#: gzip stream magic number (RFC 1952).
+_GZIP_MAGIC = b"\x1f\x8b"
 
 
 async def download_source(file_meta: dict[str, Any], dest: Path) -> Path:
@@ -64,6 +68,53 @@ async def download_source(file_meta: dict[str, Any], dest: Path) -> Path:
 
     logger.info("Downloaded %s to %s (%d bytes)", download_url, dest, bytes_written)
     return dest
+
+
+async def peek_decompressed_prefix(
+    file_meta: dict[str, Any], *, max_compressed_bytes: int = 262_144
+) -> bytes:
+    """Fetch and decompress only the leading bytes of the source file.
+
+    Streams at most ``max_compressed_bytes`` of the source — via a
+    ``Range`` request, with an early stream break as the fallback when
+    the server ignores ``Range`` — and gunzips them if the source is
+    gzip-compressed. This lets a processor inspect a file's header
+    (e.g. a SAM ``@`` block) and fail fast *before* downloading and
+    processing the whole file. The trailing gzip member of a bounded
+    range is necessarily truncated; the resulting ``zlib`` error is
+    expected and the cleanly-decompressed prefix is returned.
+
+    Raises ``ValueError`` when ``file_meta`` has no ``access_url``.
+    """
+    access_url = file_meta.get("access_url")
+    if not access_url:
+        raise ValueError("file_meta has no access_url — cannot peek source")
+
+    download_url = await _resolve_download_url(access_url)
+    range_header = f"bytes=0-{max_compressed_bytes - 1}"
+
+    decompressor = None
+    is_gzip: bool | None = None
+    out = bytearray()
+    consumed = 0
+    async for chunk in drs.stream_from_url(download_url, range_header=range_header):
+        consumed += len(chunk)
+        if is_gzip is None:
+            is_gzip = chunk[:2] == _GZIP_MAGIC
+            if is_gzip:
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        if is_gzip:
+            try:
+                out += decompressor.decompress(chunk)
+            except zlib.error:
+                # Bounded range cut the final gzip member mid-stream;
+                # keep whatever decompressed cleanly up to the cut.
+                break
+        else:
+            out += chunk
+        if consumed >= max_compressed_bytes:
+            break
+    return bytes(out)
 
 
 async def _resolve_download_url(access_url: str) -> str:

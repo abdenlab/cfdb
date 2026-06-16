@@ -161,7 +161,6 @@ class TestStreamFileWorkflowPath:
             WoolExecutor(
                 mock_db,
                 api.cache,
-                "/tmp/cfdb/cache",
                 registry,
                 workdir_root="/tmp/cfdb/jobs",
             ),

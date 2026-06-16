@@ -416,7 +416,6 @@ class TestStreamIndexFileWorkflowPaths:
             WoolExecutor(
                 mock_db,
                 api.cache,
-                api.cache.root,
                 api.processor_registry,
                 workdir_root=tmp_path / "jobs",
             ),
@@ -663,7 +662,6 @@ class TestStreamIndexFileWorkflowPaths:
             WoolExecutor(
                 mock_db,
                 api.cache,
-                "/tmp/cfdb/cache",
                 registry,
                 workdir_root="/tmp/cfdb/jobs",
             ),
