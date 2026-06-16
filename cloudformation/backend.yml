@@ -10,9 +10,18 @@ Parameters:
   DatabaseStackName:
     Type: String
     Description: Name of the database stack
+  WorkersStackName:
+    Type: String
+    Description: Name of the workers stack (worker task def + S3 cache)
   ImageURI:
     Type: String
     Description: ECR image URI for the CFDB API
+  WorkflowS3Prefix:
+    Type: String
+    Default: ""
+    Description: >
+      Optional key prefix the S3 cache prepends to every artifact key,
+      letting one bucket host multiple environments (WORKFLOW_S3_PREFIX).
   DesiredCount:
     Type: Number
     Default: 1
@@ -167,6 +176,32 @@ Resources:
               Value: "false"
             - Name: SYNC_DATA_DIR
               Value: /tmp/sync-data
+            # Selects the "ecs" workflow profile (S3Cache + EcsDiscovery +
+            # EcsProvisioner). ECS_CLUSTER reuses this stack's own cluster.
+            - Name: ECS_CLUSTER
+              Value: !Ref ECSCluster
+            - Name: ECS_WORKER_TASK_DEFINITION
+              Value:
+                Fn::ImportValue: !Sub "${WorkersStackName}-WorkerTaskFamily"
+            - Name: ECS_WORKER_SUBNETS
+              Value:
+                Fn::ImportValue: !Sub "${NetworkStackName}-PublicSubnetIds"
+            - Name: ECS_WORKER_SECURITY_GROUPS
+              Value:
+                Fn::ImportValue: !Sub "${NetworkStackName}-WorkerSecurityGroupId"
+            # Workers fetch upstream files over HTTPS; private subnets have
+            # no NAT, so workers run in public subnets with a public IP.
+            # Safe because the worker SG closes all inbound except 50051
+            # from the API SG — the public IP is egress-only in practice.
+            - Name: ECS_WORKER_ASSIGN_PUBLIC_IP
+              Value: ENABLED
+            - Name: WORKFLOW_S3_BUCKET
+              Value:
+                Fn::ImportValue: !Sub "${WorkersStackName}-CacheBucketName"
+            - Name: WORKFLOW_S3_PREFIX
+              Value: !Ref WorkflowS3Prefix
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
           Secrets:
             - Name: DATABASE_URL
               ValueFrom:
@@ -258,6 +293,9 @@ Resources:
           Value: !Sub "${AWS::StackName}-execution-role"
 
   # ---------- IAM: task role ----------
+  # The API dispatches workflows to the worker fleet (EcsProvisioner
+  # RunTask, EcsDiscovery ListTasks/DescribeTasks), passes the worker
+  # roles to those tasks, and reads cached artifacts back from S3.
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -268,6 +306,57 @@ Resources:
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
+      Policies:
+        - PolicyName: workflow-dispatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${Family}:*"
+                  - Family:
+                      Fn::ImportValue: !Sub "${WorkersStackName}-WorkerTaskFamily"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt ECSCluster.Arn
+              # ListTasks doesn't support resource-level ARNs, but it does
+              # honor the ecs:cluster condition key — scope it to this
+              # cluster so the role can't enumerate tasks account-wide.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt ECSCluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ECSCluster}/*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt ECSCluster.Arn
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - Fn::ImportValue: !Sub "${WorkersStackName}-WorkerExecutionRoleArn"
+                  - Fn::ImportValue: !Sub "${WorkersStackName}-WorkerTaskRoleArn"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+        - PolicyName: cache-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "${BucketArn}/*"
+                  - BucketArn:
+                      Fn::ImportValue: !Sub "${WorkersStackName}-CacheBucketArn"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::ImportValue: !Sub "${WorkersStackName}-CacheBucketArn"
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-task-role"

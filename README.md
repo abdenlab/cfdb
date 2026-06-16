@@ -88,6 +88,31 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 | `make worker-certs` | Generate the wool worker mutual-TLS material (CA + worker + API client certs) for local dev |
 | `make worker-local-tls` | Start a local LAN worker pool with worker mTLS enabled |
 
+### Deploying the CloudFormation stacks
+
+Production runs on four CloudFormation stacks under `cloudformation/`. Deploy them in dependency order (each imports exports from the earlier ones):
+
+1. `network.yml` — VPC, subnets, security groups (including the worker SG), S3 gateway endpoint.
+2. `database.yml` — DocumentDB cluster and connection-URL secret.
+3. `workers.yml` — wool worker task definition, S3 artifact cache, worker IAM roles.
+4. `backend.yml` — API service, ALB, and the IAM/env wiring that dispatches to the worker fleet.
+
+Tear down in the reverse order (`backend` → `workers` → `database` → `network`); `backend` imports the worker exports, so it must be deleted first. The `cfdb-wool` ECR repository is a prerequisite created out of band (like the `cfdb` repository); consider giving it an `IMMUTABLE` tag policy and a lifecycle policy to prune untagged images.
+
+**Rolling the worker fleet.** The CI pipeline builds, scans, and pushes the worker image to `cfdb-wool:<sha>` on every merge to `master`, but it does not roll workers — the worker task definition pins `Image: !Ref WorkerImageURI`. To deploy a new worker image, redeploy the workers stack with the SHA-tagged URI:
+
+```bash
+aws cloudformation deploy \
+  --stack-name <workers-stack> \
+  --template-file cloudformation/workers.yml \
+  --parameter-overrides WorkerImageURI=<account>.dkr.ecr.<region>.amazonaws.com/cfdb-wool:<sha> \
+  --capabilities CAPABILITY_IAM
+```
+
+This registers a new task-definition revision that `EcsProvisioner` launches on the next workflow dispatch. Pin to an immutable `:<sha>` (not `:latest`) so the running fleet is traceable to a commit and rollback is a redeploy with the prior SHA.
+
+**Tearing down the cache.** CloudFormation cannot delete a non-empty S3 bucket, so empty the `CacheBucket` before deleting the workers stack or the delete will fail and roll back.
+
 ## GraphQL API
 
 **URL:** `POST /metadata`
