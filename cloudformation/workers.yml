@@ -4,7 +4,10 @@ Description: >
   (run on demand by EcsProvisioner) and the S3 artifact cache the
   preprocessing/indexing pipeline writes to. Deploy after the network
   stack and before the backend stack: backend.yml imports the worker
-  task family, worker role ARNs, and cache bucket from here.
+  task family, worker role ARNs, and cache bucket from here. Tear down
+  in reverse — delete the backend stack before this one, since those
+  imports lock these exports — and empty the cache bucket first (see the
+  CacheBucket DeletionPolicy note).
 
 Parameters:
   WorkerImageURI:
@@ -53,9 +56,19 @@ Parameters:
 
 Resources:
   # ---------- S3 artifact cache ----------
+  # DeletionPolicy/UpdateReplacePolicy are explicit Delete: the cache is
+  # disposable (content-addressed by upstream md5, re-materialized on a
+  # miss). NOTE: CloudFormation cannot delete a non-empty bucket, so a
+  # stack delete (or a replacement-triggering update) fails until the
+  # bucket is emptied — empty it before tearing down the stack.
   CacheBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
+      # SSE-S3 (AES256) is a deliberate choice over SSE-KMS: no per-request
+      # KMS cost or key management. Revisit if the cached artifacts ever
+      # need key-policy access control or CloudTrail data events.
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -75,6 +88,26 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-cache"
+
+  # Deny any non-TLS access to the cache at the bucket-policy layer so
+  # artifact reads/writes are HTTPS-only regardless of caller IAM.
+  CacheBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CacheBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CacheBucket.Arn
+              - !Sub "${CacheBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   # ---------- CloudWatch log group ----------
   WorkerLogGroup:
@@ -205,6 +238,13 @@ Resources:
             Interval: 30
             Timeout: 5
             Retries: 3
+            # Grace window so boot-time probes don't transiently mark the
+            # task UNHEALTHY (EcsDiscovery only advertises HEALTHY tasks);
+            # mirrors the image HEALTHCHECK's --start-period.
+            StartPeriod: 60
+          # Match WorkerDrainGraceSeconds (default 120) so ECS does not
+          # SIGKILL at the 30s Fargate default and cut the drain short.
+          StopTimeout: 120
 
 Outputs:
   WorkerTaskFamily:

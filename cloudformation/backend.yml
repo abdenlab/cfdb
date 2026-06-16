@@ -191,6 +191,8 @@ Resources:
                 Fn::ImportValue: !Sub "${NetworkStackName}-WorkerSecurityGroupId"
             # Workers fetch upstream files over HTTPS; private subnets have
             # no NAT, so workers run in public subnets with a public IP.
+            # Safe because the worker SG closes all inbound except 50051
+            # from the API SG — the public IP is egress-only in practice.
             - Name: ECS_WORKER_ASSIGN_PUBLIC_IP
               Value: ENABLED
             - Name: WORKFLOW_S3_BUCKET
@@ -318,12 +320,15 @@ Resources:
                 Condition:
                   ArnEquals:
                     ecs:cluster: !GetAtt ECSCluster.Arn
-              # ListTasks does not support resource-level scoping; it is
-              # granted on "*" and naturally bounded by the cluster the
-              # API passes at call time.
+              # ListTasks doesn't support resource-level ARNs, but it does
+              # honor the ecs:cluster condition key — scope it to this
+              # cluster so the role can't enumerate tasks account-wide.
               - Effect: Allow
                 Action: ecs:ListTasks
                 Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt ECSCluster.Arn
               - Effect: Allow
                 Action: ecs:DescribeTasks
                 Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ECSCluster}/*"
