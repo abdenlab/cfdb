@@ -48,12 +48,15 @@ router = APIRouter(prefix="/index", tags=["index"])
 _PATH_PARAM_PATTERN = r"^[A-Za-z0-9._-]+$"
 _PATH_PARAM_MAX_LEN = 256
 
-#: Index artifact kind → preferred sidecar ``file_format`` tokens used in
-#: 4DN's ``extra.extra_files`` / ``extra.fourdn.extra_files`` arrays. The
-#: lookup is best-effort: if no entry matches we fall back to the first
-#: sidecar entry (legacy behavior) so existing 4DN BED→beddb / BED→tbi
-#: cases keep working.
-_SIDECAR_INDEX_FORMATS = ("bai", "tbi", "beddb", "csi")
+#: Sidecar ``file_format`` tokens (4DN ``display_title`` values or bare
+#: strings) recognized as index artifacts in 4DN's ``extra.extra_files`` /
+#: ``extra.fourdn.extra_files`` arrays: ``bai``/``csi`` (BAM), ``tbi``
+#: (tabix), ``beddb`` (HiGlass BED), and the pairix indexes ``pairs_px2``
+#: (.pairs) and ``bg_px2`` (bedGraph). ``bw`` (bigWig) is deliberately
+#: excluded — it is self-indexed data, not a sidecar index. The lookup is
+#: best-effort: if no entry matches we fall back to the first sidecar entry
+#: (legacy behavior) so existing 4DN BED→beddb / BED→tbi cases keep working.
+_SIDECAR_INDEX_FORMATS = ("bai", "tbi", "beddb", "csi", "pairs_px2", "bg_px2")
 
 
 @router.head("/{dcc}/{local_id}")
@@ -196,7 +199,10 @@ async def _try_serve_fourdn_sidecar(
 
     Looks first at ``extra.extra_files`` (the path used by pre-materialized
     documents) and then at ``extra.fourdn.extra_files`` (the DCC-specific
-    subdocument).
+    subdocument). Each entry's ``file_format`` is normalized from either a
+    ``{display_title: ...}`` CV object (the shape 4DN materializes) or a
+    bare string before matching ``_SIDECAR_INDEX_FORMATS``; an entry whose
+    token is unrecognized falls through to the first-entry fallback.
     """
     extra = file_doc.get("extra") or {}
     extra_files = extra.get("extra_files") or []
