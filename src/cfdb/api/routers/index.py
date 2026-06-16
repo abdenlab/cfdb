@@ -48,12 +48,15 @@ router = APIRouter(prefix="/index", tags=["index"])
 _PATH_PARAM_PATTERN = r"^[A-Za-z0-9._-]+$"
 _PATH_PARAM_MAX_LEN = 256
 
-#: Index artifact kind → preferred sidecar ``file_format`` tokens used in
-#: 4DN's ``extra.extra_files`` / ``extra.fourdn.extra_files`` arrays. The
-#: lookup is best-effort: if no entry matches we fall back to the first
-#: sidecar entry (legacy behavior) so existing 4DN BED→beddb / BED→tbi
-#: cases keep working.
-_SIDECAR_INDEX_FORMATS = ("bai", "tbi", "beddb", "csi")
+#: Sidecar ``file_format`` tokens (4DN ``display_title`` values or bare
+#: strings) recognized as index artifacts in 4DN's ``extra.extra_files`` /
+#: ``extra.fourdn.extra_files`` arrays: ``bai``/``csi`` (BAM), ``tbi``
+#: (tabix), ``beddb`` (HiGlass BED), and the pairix indexes ``pairs_px2``
+#: (.pairs) and ``bg_px2`` (bedGraph). ``bw`` (bigWig) is deliberately
+#: excluded — it is self-indexed data, not a sidecar index. The lookup is
+#: best-effort: if no entry matches we fall back to the first sidecar entry
+#: (legacy behavior) so existing 4DN BED→beddb / BED→tbi cases keep working.
+_SIDECAR_INDEX_FORMATS = ("bai", "tbi", "beddb", "csi", "pairs_px2", "bg_px2")
 
 
 @router.head("/{dcc}/{local_id}")
@@ -196,7 +199,10 @@ async def _try_serve_fourdn_sidecar(
 
     Looks first at ``extra.extra_files`` (the path used by pre-materialized
     documents) and then at ``extra.fourdn.extra_files`` (the DCC-specific
-    subdocument).
+    subdocument). Each entry's ``file_format`` is normalized from either a
+    ``{display_title: ...}`` CV object (the shape 4DN materializes) or a
+    bare string before matching ``_SIDECAR_INDEX_FORMATS``; an entry whose
+    token is unrecognized falls through to the first-entry fallback.
     """
     extra = file_doc.get("extra") or {}
     extra_files = extra.get("extra_files") or []
@@ -211,12 +217,21 @@ async def _try_serve_fourdn_sidecar(
     # back to the first entry to preserve legacy behavior for files
     # whose sidecar omits ``file_format``. Iterating defends against
     # future 4DN docs that publish multiple sidecar artifacts where
-    # the data file (not the index) happens to be first.
+    # the data file (not the index) happens to be first. 4DN
+    # materializes ``file_format`` as a CV object carrying the token
+    # under ``display_title``; pre-materialized docs use a bare string,
+    # so normalize both shapes before matching.
     index_entry: Optional[dict] = None
     for candidate in extra_files:
         if not isinstance(candidate, dict):
             continue
-        fmt = (candidate.get("file_format") or "").lower()
+        raw_fmt = candidate.get("file_format")
+        if isinstance(raw_fmt, dict):
+            raw_fmt = raw_fmt.get("display_title")
+        # Only a string carries a usable token; anything else (a dict with
+        # no display_title, None, or an unexpected type) is a non-match,
+        # never an AttributeError on .lower().
+        fmt = raw_fmt.lower() if isinstance(raw_fmt, str) else ""
         if fmt in _SIDECAR_INDEX_FORMATS:
             index_entry = candidate
             break
