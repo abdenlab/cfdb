@@ -33,26 +33,53 @@ jobs:
         run: |
           SHA_TAG=${GITHUB_SHA::8}
           docker build --file Dockerfile.api \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+$SHA_TAG \
             -t $REGISTRY/$REPOSITORY:latest \
             -t $REGISTRY/$REPOSITORY:$SHA_TAG .
           docker push $REGISTRY/$REPOSITORY:latest
           docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
-      # Build the wool worker image (Dockerfile.wool) and push to a
-      # separate ECR repository. Pinned to linux/amd64 because the image
-      # bundles UCSC's x86_64-only bigBedToBed. Workers are launched on
-      # demand via RunTask against the task definition's :latest image, so
-      # no service update is needed here. The cfdb-wool repository must
+      # Build the wool worker image (Dockerfile.wool), scan it, then push to
+      # a separate ECR repository. Pinned to linux/amd64 because the image
+      # bundles UCSC's x86_64-only bigBedToBed. The cfdb-wool repository must
       # exist in ECR (created out of band, like the cfdb repository).
-      - name: Build and push wool worker to ECR
+      #
+      # This publishes the image only — it does NOT roll the worker fleet.
+      # The worker task definition pins `Image: !Ref WorkerImageURI`, so
+      # rolling workers is a deliberate `aws cloudformation deploy` of the
+      # workers stack with WorkerImageURI set to the :$SHA_TAG URI pushed
+      # here (see README "Deploying the CloudFormation stacks"). :latest is
+      # pushed only as a convenience pointer.
+      - name: Build wool worker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: cfdb-wool
         run: |
           SHA_TAG=${GITHUB_SHA::8}
+          echo "WOOL_IMAGE=$REGISTRY/$REPOSITORY:$SHA_TAG" >> "$GITHUB_ENV"
           docker build --platform linux/amd64 --file Dockerfile.wool \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+$SHA_TAG \
             -t $REGISTRY/$REPOSITORY:latest \
             -t $REGISTRY/$REPOSITORY:$SHA_TAG .
+
+      # Fail the build on HIGH/CRITICAL OS/library vulnerabilities before the
+      # image can reach ECR — the worker shells out to samtools/tabix/
+      # bigBedToBed over untrusted upstream bytes.
+      - name: Scan wool worker image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.WOOL_IMAGE }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Push wool worker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: cfdb-wool
+        run: |
+          SHA_TAG=${GITHUB_SHA::8}
           docker push $REGISTRY/$REPOSITORY:latest
           docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
