@@ -222,7 +222,10 @@ async def _try_serve_fourdn_sidecar(
         raw_fmt = candidate.get("file_format")
         if isinstance(raw_fmt, dict):
             raw_fmt = raw_fmt.get("display_title")
-        fmt = (raw_fmt or "").lower()
+        # Only a string carries a usable token; anything else (a dict with
+        # no display_title, None, or an unexpected type) is a non-match,
+        # never an AttributeError on .lower().
+        fmt = raw_fmt.lower() if isinstance(raw_fmt, str) else ""
         if fmt in _SIDECAR_INDEX_FORMATS:
             index_entry = candidate
             break
