@@ -630,10 +630,10 @@ class TestRouterE2E:
         async def fake_stream(*_args, **_kwargs):
             yield sidecar_bytes
 
-        # Patch on the module where the index router imported it from.
-        from cfdb.api.routers import index as index_module
-
-        mocker.patch.object(index_module.drs, "stream_from_url", fake_stream)
+        # The sidecar path now streams via ``cache_stream.stream_upstream_url``,
+        # which calls ``drs.stream_from_url`` on the shared ``cfdb.services.drs``
+        # module — patch it there.
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
 
         # Act
         resp = await stream_index_file(

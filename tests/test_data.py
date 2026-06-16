@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from wool.runtime.routine.task import do_dispatch
 
 from cfdb import api
-from cfdb.api.routers.data import stream_file
+from cfdb.api.routers.data import stream_file, stream_file_status
 from cfdb.services import drs, locks
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.models import ACTIVE_STATUSES
@@ -591,3 +591,362 @@ class TestStreamFileWorkflowPath:
             "passthrough must reach the direct DRS streaming path, "
             "not the workflow dispatch path"
         )
+
+
+class TestStreamFileStatus:
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_raise_400_when_dcc_invalid(
+        self, mock_db, mocker
+    ):
+        """Test that an unknown DCC is rejected the same as /data.
+
+        Given:
+            A status probe for a DCC name not in the registry.
+        When:
+            stream_file_status is called.
+        Then:
+            It should raise HTTPException(400).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_file_status("nope", "file-1")
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_raise_404_when_file_missing(
+        self, mock_db, mocker
+    ):
+        """Test that a missing file mirrors /data's 404.
+
+        Given:
+            A valid DCC but no matching file document.
+        When:
+            stream_file_status is called.
+        Then:
+            It should raise HTTPException(404).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mock_db.files.docs = []
+        mock_db.file.docs = []
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_file_status("4dn", "missing")
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_raise_403_when_hubmap_not_public(
+        self, mock_db, mocker
+    ):
+        """Test that a protected HuBMAP file mirrors /data's 403.
+
+        Given:
+            A HuBMAP file with ``data_access_level="consortium"`` and an
+            access_url.
+        When:
+            stream_file_status is called.
+        Then:
+            It should raise HTTPException(403).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mock_db.dcc.docs = [_make_dcc_doc()]
+        mock_db.file.docs = [_make_file_doc(access_level="consortium")]
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_file_status("hubmap", "file-1")
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_raise_501_when_no_access_url(
+        self, mock_db, mocker
+    ):
+        """Test that a file with no access method mirrors /data's 501.
+
+        Given:
+            A 4DN file document with no ``access_url``.
+        When:
+            stream_file_status is called.
+        Then:
+            It should raise HTTPException(501).
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            {
+                "submission": "4dn",
+                "id_namespace": "tag:4dn.org,2015:",
+                "local_id": "4DNFINOURL",
+                "filename": "x.csv",
+                "file_format": {"name": "CSV"},
+            }
+        ]
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_file_status("4dn", "4DNFINOURL")
+        assert exc_info.value.status_code == 501
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_report_ready_on_cache_hit_for_sam(
+        self, mock_db, mocker, tmp_path
+    ):
+        """Test that a cached DATA artifact reports ready without dispatch.
+
+        Given:
+            A SAM file with the DATA cache pre-populated and a wired
+            workflow subsystem whose executor fails if dispatched.
+        When:
+            stream_file_status is called.
+        Then:
+            It should return ``{"ready": True}`` and ``ensure_workflow``
+            MUST NOT be called.
+        """
+        # Arrange
+        from cfdb.workflows import keys as key_utils
+        from cfdb.workflows.cache import LocalFsCache
+        from cfdb.workflows.models import ArtifactKind
+
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"sam-cached-bytes")
+        processor = BamIndexProcessor()
+        data_key = key_utils.cache_key(
+            dcc="4dn_dcic",
+            local_id="4DNFISAM01",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=processor.processor_version,
+        )
+        await cache.put(data_key, src)
+
+        class _FailIfDispatched:
+            async def ensure_workflow(self, _file_doc):
+                raise AssertionError("status probe must NOT dispatch a workflow")
+
+        registry = ProcessorRegistry()
+        registry.register(processor)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "executor", _FailIfDispatched())
+
+        mock_db.dcc.docs = [
+            {
+                "dcc_abbreviation": "4DN_DCIC",
+                "project_id_namespace": "tag:4dn.org,2015:",
+            }
+        ]
+        mock_db.file.docs = [
+            {
+                "submission": "4dn",
+                "id_namespace": "tag:4dn.org,2015:",
+                "local_id": "4DNFISAM01",
+                "filename": "x.sam",
+                "md5": FIXTURE_MD5,
+                "access_url": "https://example.com/x.sam",
+                "dcc": {"dcc_abbreviation": "4DN_DCIC"},
+                "file_format": {"name": "SAM"},
+            }
+        ]
+
+        # Act
+        result = await stream_file_status("4dn", "4DNFISAM01")
+
+        # Assert
+        assert result == {"ready": True}
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_report_not_ready_on_cache_miss_for_sam(
+        self, mock_db, mocker
+    ):
+        """Test that a processable-but-uncached file reports not-ready.
+
+        Given:
+            A SAM file with an empty cache, a registered BAM/SAM
+            processor, and an executor that fails if dispatched.
+        When:
+            stream_file_status is called.
+        Then:
+            It should return ``{"ready": False}`` and ``ensure_workflow``
+            MUST NOT be called — the probe never dispatches.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        class _MissCache:
+            async def head(self, _k):
+                return None
+
+            def get(self, _k, _r=None):
+                raise AssertionError
+
+            async def put(self, *_a, **_kw):
+                raise AssertionError
+
+            async def delete(self, _k):
+                return False
+
+        class _FailIfDispatched:
+            async def ensure_workflow(self, _file_doc):
+                raise AssertionError("status probe must NOT dispatch a workflow")
+
+        registry = ProcessorRegistry()
+        registry.register(BamIndexProcessor())
+        mocker.patch.object(api, "cache", _MissCache())
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "executor", _FailIfDispatched())
+
+        mock_db.dcc.docs = [
+            {
+                "dcc_abbreviation": "4DN_DCIC",
+                "project_id_namespace": "tag:4dn.org,2015:",
+            }
+        ]
+        mock_db.file.docs = [
+            {
+                "submission": "4dn",
+                "id_namespace": "tag:4dn.org,2015:",
+                "local_id": "4DNFISAM01",
+                "filename": "x.sam",
+                "md5": FIXTURE_MD5,
+                "access_url": "https://example.com/x.sam",
+                "dcc": {"dcc_abbreviation": "4DN_DCIC"},
+                "file_format": {"name": "SAM"},
+            }
+        ]
+
+        # Act
+        result = await stream_file_status("4dn", "4DNFISAM01")
+
+        # Assert
+        assert result == {"ready": False}
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_report_ready_for_passthrough_format(
+        self, mock_db, mocker
+    ):
+        """Test that a passthrough format reports ready immediately.
+
+        Given:
+            A CSV file (a PassthroughProcessor format) with a wired
+            workflow subsystem whose cache and executor fail if consulted.
+        When:
+            stream_file_status is called.
+        Then:
+            It should return ``{"ready": True}`` — passthrough files
+            stream directly, so the probe never consults the cache.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", default_registry())
+
+        class _FailIfConsulted:
+            async def head(self, _k):
+                raise AssertionError("passthrough must not consult cache")
+
+            def get(self, *_a, **_kw):
+                raise AssertionError
+
+            async def put(self, *_a, **_kw):
+                raise AssertionError
+
+            async def delete(self, _k):
+                return False
+
+        mocker.patch.object(api, "cache", _FailIfConsulted())
+        mocker.patch.object(api, "executor", object())
+
+        mock_db.dcc.docs = [
+            {
+                "dcc_abbreviation": "4DN_DCIC",
+                "project_id_namespace": "tag:4dn.org,2015:",
+            }
+        ]
+        mock_db.file.docs = [
+            {
+                "submission": "4dn",
+                "id_namespace": "tag:4dn.org,2015:",
+                "local_id": "4DNFICSV01",
+                "filename": "x.csv",
+                "md5": FIXTURE_MD5,
+                "access_url": "drs://4dn/abc",
+                "file_format": {"name": "CSV"},
+            }
+        ]
+
+        # Act
+        result = await stream_file_status("4dn", "4DNFICSV01")
+
+        # Assert
+        assert result == {"ready": True}
+
+    @pytest.mark.asyncio
+    async def test_stream_file_status_should_report_ready_for_bam_without_data_artifact(
+        self, mock_db, mocker
+    ):
+        """Test that a BAM (no DATA artifact) reports ready for /data.
+
+        Given:
+            A 4DN BAM file with a registered ``BamIndexProcessor``. BAM
+            advertises only an INDEX artifact (the source is already
+            coordinate-sorted upstream), so /data falls through to direct
+            streaming.
+        When:
+            stream_file_status is called.
+        Then:
+            It should return ``{"ready": True}`` without consulting the
+            cache — the DATA path is a direct upstream stream.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        class _FailIfConsulted:
+            async def head(self, _k):
+                raise AssertionError("BAM /data must not consult the cache")
+
+            def get(self, *_a, **_k):
+                raise AssertionError
+
+            async def put(self, *_a, **_k):
+                raise AssertionError
+
+            async def delete(self, _k):
+                return False
+
+        registry = ProcessorRegistry()
+        registry.register(BamIndexProcessor())
+        mocker.patch.object(api, "cache", _FailIfConsulted())
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "executor", object())
+
+        mock_db.dcc.docs = [
+            {
+                "dcc_abbreviation": "4DN_DCIC",
+                "project_id_namespace": "tag:4dn.org,2015:",
+            }
+        ]
+        mock_db.file.docs = [
+            {
+                "submission": "4dn",
+                "id_namespace": "tag:4dn.org,2015:",
+                "local_id": "4DNFIBAM01",
+                "filename": "x.bam",
+                "md5": FIXTURE_MD5,
+                "access_url": "drs://4dn/abc",
+                "dcc": {"dcc_abbreviation": "4DN_DCIC"},
+                "file_format": {"name": "BAM"},
+            }
+        ]
+
+        # Act
+        result = await stream_file_status("4dn", "4DNFIBAM01")
+
+        # Assert
+        assert result == {"ready": True}

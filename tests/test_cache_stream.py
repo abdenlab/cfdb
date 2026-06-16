@@ -12,6 +12,7 @@ from starlette.responses import StreamingResponse
 
 from cfdb import api
 from cfdb.api.routers.cache_stream import (
+    probe_workflow_readiness,
     serve_workflow_artifact_or_dispatch,
     stream_cache_entry,
 )
@@ -569,3 +570,189 @@ class TestServeWorkflowArtifactOrDispatch:
         assert resp.status_code == 202
         assert resp.headers["location"] == f"/jobs/{record.job_id}"
         assert resp.headers["retry-after"] == "5"
+
+
+class TestProbeWorkflowReadiness:
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_none_when_subsystem_unwired(
+        self, mocker
+    ):
+        """Test that the probe bails when subsystem fields are None.
+
+        Given:
+            ``api.processor_registry``, ``api.cache``, and ``api.executor``
+            are all None.
+        When:
+            ``probe_workflow_readiness`` is awaited.
+        Then:
+            It should return None so the caller decides readiness for its
+            own non-workflow path.
+        """
+        # Arrange
+        mocker.patch.object(api, "processor_registry", None)
+        mocker.patch.object(api, "cache", None)
+        mocker.patch.object(api, "executor", None)
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_none_when_processor_does_not_need_processing(
+        self, mocker, tmp_path
+    ):
+        """Test that a no-work processor yields None.
+
+        Given:
+            Subsystem wired; registry returns a processor whose
+            ``needs_processing`` is False (a passthrough format).
+        When:
+            The probe is awaited.
+        Then:
+            It should return None.
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor(needs=False))
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(api, "executor", _RecordingExecutor())
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_none_when_artifact_kind_not_produced(
+        self, mocker, tmp_path
+    ):
+        """Test that an unproduced artifact kind yields None.
+
+        Given:
+            A processor whose ``artifact_kinds_produced`` returns
+            ``(INDEX,)`` only, probed with ``artifact_kind=DATA``.
+        When:
+            The probe is awaited.
+        Then:
+            It should return None.
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor(produced=(ArtifactKind.INDEX,)))
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(api, "executor", _RecordingExecutor())
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_none_when_extract_identity_raises(
+        self, mocker, tmp_path
+    ):
+        """Test that an incomplete file_doc yields None.
+
+        Given:
+            A processor that applies and a file_doc missing ``md5`` so
+            ``extract_identity`` raises ``ValueError``.
+        When:
+            The probe is awaited.
+        Then:
+            It should return None — the missing-field error is treated as
+            "workflow not applicable".
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(api, "executor", _RecordingExecutor())
+        broken = _file_doc()
+        del broken["md5"]
+
+        # Act
+        result = await probe_workflow_readiness(broken, ArtifactKind.DATA)
+
+        # Assert
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_true_on_cache_hit(
+        self, mocker, tmp_path
+    ):
+        """Test that a cached artifact reports ready without dispatching.
+
+        Given:
+            The cache pre-populated with the derived key and an executor
+            that fails if dispatched.
+        When:
+            The probe is awaited.
+        Then:
+            It should return True and ``ensure_workflow`` MUST NOT be
+            called.
+        """
+        # Arrange
+        from cfdb.workflows import keys as key_utils
+
+        processor = _StubProcessor()
+        registry = ProcessorRegistry()
+        registry.register(processor)
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"cached-data")
+        key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF123",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=processor.processor_version,
+        )
+        await cache.put(key, src)
+        executor = _RecordingExecutor()
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "executor", executor)
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is True
+        assert executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_false_on_cache_miss(
+        self, mocker, tmp_path
+    ):
+        """Test that a workflow-applicable cache miss reports not-ready.
+
+        Given:
+            A processor that applies, an empty cache, and an executor that
+            fails if dispatched.
+        When:
+            The probe is awaited.
+        Then:
+            It should return False (a GET would dispatch) and
+            ``ensure_workflow`` MUST NOT be called.
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = _RecordingExecutor()
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(api, "executor", executor)
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is False
+        assert executor.calls == []

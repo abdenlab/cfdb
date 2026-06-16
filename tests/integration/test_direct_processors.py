@@ -465,11 +465,18 @@ class TestTabixIntervalProcessorDirectCall:
             if shutil.which(tool) is None:
                 pytest.skip(f"{tool} not on PATH")
 
+        from cfdb.workflows.models import ArtifactKind
+
         # Arrange
         workdir = tmp_path / "work"
         cache_root = tmp_path / "cache"
         workdir.mkdir()
         cache_root.mkdir()
+        # Production hands the processor a real CacheBackend, not a bare
+        # path — drive it the same way so the cache-state assertions below
+        # exercise the genuine commit/head contract.
+        cache = LocalFsCache(cache_root)
+        processor = TabixIntervalProcessor()
 
         empty_vcf = tmp_path / "empty.vcf"
         empty_vcf.write_text(
@@ -495,29 +502,15 @@ class TestTabixIntervalProcessorDirectCall:
 
         # Act & assert
         with pytest.raises(RuntimeError, match="Refusing to commit empty"):
-            async for _ in TabixIntervalProcessor().run(
-                file_meta, workdir, cache_root
-            ):
+            async for _ in processor.run(file_meta, workdir, cache):
                 pass
 
-        # Cache MUST stay empty so a fixed-source retry can run cleanly.
-        cache = LocalFsCache(cache_root)
-        from cfdb.workflows import keys as key_utils
-        from cfdb.workflows.models import ArtifactKind
-
-        data_key = key_utils.cache_key(
-            dcc="encode",
-            local_id="int-vcf-empty",
-            artifact_kind=ArtifactKind.DATA,
-            md5="c4ca4238a0b923820dcc509a6f75849b",
-            processor_version=TabixIntervalProcessor.processor_version,
-        )
-        index_key = key_utils.cache_key(
-            dcc="encode",
-            local_id="int-vcf-empty",
-            artifact_kind=ArtifactKind.INDEX,
-            md5="c4ca4238a0b923820dcc509a6f75849b",
-            processor_version=TabixIntervalProcessor.processor_version,
-        )
+        # The rejection MUST leave the cache pristine so a later retry
+        # against a fixed source can populate it cleanly. Resolve the keys
+        # through the processor's own ``cache_key_for`` — the single
+        # cache-key authority production consumers use — rather than
+        # re-deriving the formula here.
+        data_key = processor.cache_key_for(file_meta, ArtifactKind.DATA)
+        index_key = processor.cache_key_for(file_meta, ArtifactKind.INDEX)
         assert await cache.head(data_key) is None
         assert await cache.head(index_key) is None

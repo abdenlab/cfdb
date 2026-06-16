@@ -288,3 +288,57 @@ async def serve_workflow_artifact_or_dispatch(
             "Retry-After": "5",
         },
     )
+
+
+async def probe_workflow_readiness(
+    file_doc: dict[str, Any],
+    artifact_kind: ArtifactKind,
+) -> Optional[bool]:
+    """Report whether a GET would stream a workflow artifact immediately.
+
+    Mirrors the applicability checks in
+    ``serve_workflow_artifact_or_dispatch`` exactly — workflow-subsystem
+    wired → processor lookup → ``needs_processing`` →
+    ``artifact_kinds_produced`` → cache-key derivation — but **never
+    dispatches**: it only reads cache state. This is the side-effect-free
+    counterpart used by the ``/status`` probes.
+
+    Args:
+        file_doc: Source file metadata document.
+        artifact_kind: Which artifact kind to probe for.
+
+    Returns:
+        - ``True`` — the artifact is cached; a GET would stream it now.
+        - ``False`` — the file is workflow-applicable for ``artifact_kind``
+          but the artifact is not cached; a GET would dispatch (202).
+        - ``None`` — the workflow subsystem is unwired, the file isn't
+          workflow-applicable, the processor doesn't produce
+          ``artifact_kind``, or ``file_doc`` is incomplete. The caller
+          decides what "ready" means for its own non-workflow path.
+    """
+    if api.processor_registry is None or api.cache is None or api.executor is None:
+        return None
+
+    processor = api.processor_registry.lookup_for(file_doc)
+    if processor is None or not processor.needs_processing(file_doc):
+        return None
+
+    if artifact_kind not in processor.artifact_kinds_produced(file_doc):
+        return None
+
+    try:
+        # Single cache-key authority: the processor derives the key it
+        # writes under; the probe reads the same key here, exactly as
+        # ``serve_workflow_artifact_or_dispatch`` does.
+        cache_key = processor.cache_key_for(file_doc, artifact_kind)
+    except ValueError as exc:
+        # Mirror the dispatch helper: treat an incomplete file_meta as
+        # "workflow not applicable" so the caller falls through to its own
+        # path rather than 500ing on a stale/hand-edited document.
+        logger.warning(
+            f"Cannot probe workflow readiness — file_meta incomplete: {exc}"
+        )
+        return None
+
+    entry = await api.cache.head(cache_key)
+    return entry is not None

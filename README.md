@@ -579,6 +579,40 @@ Stream index files (e.g., `.px2`, `.bai`) associated with DCC data files.
 curl -O http://localhost:8000/index/4dn/4DNFIG5NX1EC
 ```
 
+### Readiness Probes
+
+**URL:** `GET /data/{dcc}/{local_id}/status` | `GET /index/{dcc}/{local_id}/status`
+
+Side-effect-free probes that report whether a streaming `GET` to the corresponding endpoint would return bytes immediately or first require preprocessing. They reuse the same lookup, DCC normalization, and access-control logic as `/data` and `/index` and mirror their error codes, but on success return a small JSON body `{ "ready": bool }` instead of streaming. They **never dispatch a workflow** and make no upstream network calls — they read only database and cache metadata, so they are cheap control-plane queries safe to call before committing to a fetch.
+
+**Path Parameters:**
+- `dcc` - DCC abbreviation (e.g., `4dn`, `hubmap`, `encode`) - case insensitive
+- `local_id` - The file's unique ID within the DCC
+
+- `ready: true` — a `GET` would not require preprocessing: the processed artifact is already cached, an upstream sidecar exists (`/index`), or the format is served directly (passthrough such as CSV/TSV/bigWig, or a format with no processed `/data` artifact).
+- `ready: false` — the file is accessible, but a `GET` would trigger preprocessing (a processable format whose artifact is not yet cached, i.e. `GET` would return `202`).
+
+`ready` reflects only the default (preprocessed) path. It indicates that **no preprocessing is required**, not that a `GET` is guaranteed to return `200`: the subsequent `GET` may still resolve an access URL upstream and return `403`/`404`/`501`/`502`/`504`, and when the workflow subsystem is disabled a `ready: true` processable file is served as raw upstream bytes rather than a preprocessed artifact. The probes take no `raw`, `Range`, or `HEAD` semantics — they always describe the default path.
+
+| Code | Description |
+|------|-------------|
+| 200 | Readiness reported as `{ "ready": bool }` |
+| 400 | Invalid DCC or path-param shape |
+| 403 | File requires consortium/protected access (HuBMAP) |
+| 404 | File not found, or (on `/index`) the format has no index (CSV/TSV/bigWig) |
+| 501 | (`/data` only) File has no access URL |
+| 502 | (`/index` only) Malformed upstream sidecar |
+| 503 | (`/index` only) Workflow subsystem disabled (set `SYNC_DATA_DIR`) for a processable format |
+
+```bash
+# Will a GET stream immediately, or trigger preprocessing?
+curl http://localhost:8000/data/4dn/4DNFIG5NX1EC/status
+# {"ready": true}
+
+curl http://localhost:8000/index/encode/ENCFF123ABC/status
+# {"ready": false}
+```
+
 ### Preprocessing & indexing workflow
 
 Many upstream files are not directly consumable by Gosling Designer without preprocessing (e.g., sort+index for BAM, bgzip+tabix for VCF/GFF/BED). When `/data` or `/index` is called for a format that needs preprocessing and the processed artifact is not yet in cache, the API dispatches a workflow and returns `202 Accepted` with a `Location` header pointing to a job status endpoint. A subsequent call, after the workflow completes, streams the processed artifact from cache (with `Range` support). Both endpoints share a single workflow per source file via a Mongo-backed mutex.
