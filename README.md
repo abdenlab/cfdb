@@ -113,6 +113,13 @@ This registers a new task-definition revision that `EcsProvisioner` launches on 
 
 **Tearing down the cache.** CloudFormation cannot delete a non-empty S3 bucket, so empty the `CacheBucket` before deleting the workers stack or the delete will fail and roll back.
 
+**Worker mTLS on ECS (optional, off by default).** The same `CFDB_WORKER_TLS_*` gating that secures the local channel ([Worker mTLS](#worker-mtls)) is wired into the Fargate task definitions, but disabled unless you supply cert ARNs. Fargate cannot mount a Secrets Manager secret as a file, so the mechanism is: store each PEM as a Secrets Manager secret, inject them as env vars via the task definition's `Secrets:`, and let the image entrypoint (`scripts/cfdb-tls-entrypoint.sh`) write them to files and point `CFDB_WORKER_TLS_CA/CERT/KEY` at them before the app starts. To enable:
+
+1. Generate certs (`make worker-certs`) and upload each PEM to Secrets Manager, e.g. `aws secretsmanager create-secret --name cfdb/worker-tls/ca --secret-string file://certs/worker-ca/ca.pem` (and the worker + API leaf cert/key).
+2. Pass the ARNs to the workers stack (`WorkerTlsCaSecretArn`, `WorkerTlsCertSecretArn`, `WorkerTlsKeySecretArn`) and the backend stack (`ApiTlsCaSecretArn`, `ApiTlsCertSecretArn`, `ApiTlsKeySecretArn` — reuse the same CA secret). Supplying a CA ARN flips the per-stack condition that adds the `Secrets:` env and the least-privilege `secretsmanager:GetSecretValue` IAM. Leave them empty to keep dispatch plaintext.
+
+> **Caveat — not yet functional on Fargate.** `EcsDiscovery` dials each worker at its *dynamic* awsvpc IP and wool does not override the gRPC authority, so a static worker cert's SAN cannot match the dialed address and the mTLS handshake will fail verification. The wiring above is in place, but **leave the cert ARNs empty** until wool gains a client-side target-name override (tracked separately). Until then, the worker security group is the access control on ECS.
+
 ## GraphQL API
 
 **URL:** `POST /metadata`

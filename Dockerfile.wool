@@ -98,6 +98,14 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 COPY . /app
 RUN pip install --no-cache-dir .
 
+# mTLS cert-materialization entrypoint. ECS injects the worker-channel
+# certs as env vars (Secrets Manager), but cfdb reads CFDB_WORKER_TLS_*
+# as file paths; this shim writes the PEM env vars to files before exec.
+# Inert when those env vars are absent (plaintext / local mounted-cert
+# paths pass straight through).
+RUN install -m 0755 /app/scripts/cfdb-tls-entrypoint.sh \
+        /usr/local/bin/cfdb-tls-entrypoint.sh
+
 # Create non-root user. /tmp remains writable for per-job scratch workdirs
 # the executor hands the routine.
 RUN useradd app
@@ -110,4 +118,5 @@ USER app
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl --fail http://localhost:8080/health || exit 1
 
+ENTRYPOINT ["/usr/local/bin/cfdb-tls-entrypoint.sh"]
 CMD ["python", "-m", "cfdb.workflows.worker_main"]
