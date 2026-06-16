@@ -18,8 +18,11 @@ Requires Python 3.11 or later.
 |----------|-------------|---------|
 | `SYNC_API_KEY` | API key for the sync endpoint. If unset, sync is unprotected (suitable for local dev). | - |
 | `SYNC_DATA_DIR` | Root directory for downloaded sync data, the workflow cache (`$SYNC_DATA_DIR/cache`), and per-job workdirs (`$SYNC_DATA_DIR/jobs`). When unset the preprocessing/indexing workflow subsystem is disabled: `/data` falls through to direct upstream streaming, `/index` returns 503 for processable formats (BAM/VCF/etc.) and 404 for passthrough formats (CSV/TSV/bigWig). Both subdirectories must share a filesystem because `LocalFsCache.put` relies on `os.replace` atomicity. | - |
-| `WORKFLOW_WORKER_COUNT` | Number of wool workers to lease from the external worker pool. Must be >= 1. The API does NOT spawn workers in-process. | `2` |
+| `WORKFLOW_WORKER_COUNT` | Local-dev only: number of workers the LAN pool (`worker_lan`) spawns. The API no longer leases a fixed count — its pool admits every discovered worker, so in the ECS profile concurrency is bounded by the AWS Fargate vCPU service quota. | `2` |
 | `WORKFLOW_POOL_NAMESPACE` | wool LAN discovery namespace shared by the API and the worker-pool process. Both processes MUST set the same value or dispatch will hang on `NoWorkersAvailable`. | `cfdb-workers` |
+| `CFDB_WORKER_TLS_CA` | Path to the shared CA certificate for the wool worker gRPC channel. When this and the cert/key below are all set, the API↔worker dispatch channel uses mutual TLS (`mutual=True`); when all three are unset the channel stays plaintext. Partial config fails fast at startup. The API and every worker MUST use certs signed by the same CA. See [Worker mTLS](#worker-mtls). | - |
+| `CFDB_WORKER_TLS_CERT` | Path to this process's PEM certificate on the worker gRPC channel — the worker leaf cert on a worker (`worker_main`/`worker_lan`), the API client cert on the API. Must be signed by `CFDB_WORKER_TLS_CA`. | - |
+| `CFDB_WORKER_TLS_KEY` | Path to this process's PEM private key paired with `CFDB_WORKER_TLS_CERT`. | - |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
 | `DATABASE_URL` | MongoDB connection string | `mongodb://127.0.0.1:27017` |
 | `DATABASE_NAME` | Name of the MongoDB database to use | `cfdb` |
@@ -82,6 +85,8 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 | `make certs` | Generate TLS certificates for production |
 | `make mongodb-prod` | Start MongoDB with TLS/X.509 authentication |
 | `make api-prod` | Start API with X.509 client certificate |
+| `make worker-certs` | Generate the wool worker mutual-TLS material (CA + worker + API client certs) for local dev |
+| `make worker-local-tls` | Start a local LAN worker pool with worker mTLS enabled |
 
 ### Deploying the CloudFormation stacks
 
@@ -107,6 +112,13 @@ aws cloudformation deploy \
 This registers a new task-definition revision that `EcsProvisioner` launches on the next workflow dispatch. Pin to an immutable `:<sha>` (not `:latest`) so the running fleet is traceable to a commit and rollback is a redeploy with the prior SHA.
 
 **Tearing down the cache.** CloudFormation cannot delete a non-empty S3 bucket, so empty the `CacheBucket` before deleting the workers stack or the delete will fail and roll back.
+
+**Worker mTLS on ECS (optional, off by default).** The same `CFDB_WORKER_TLS_*` gating that secures the local channel ([Worker mTLS](#worker-mtls)) is wired into the Fargate task definitions, but disabled unless you supply cert ARNs. Fargate cannot mount a Secrets Manager secret as a file, so the mechanism is: store each PEM as a Secrets Manager secret, inject them as env vars via the task definition's `Secrets:`, and let the image entrypoint (`scripts/cfdb-tls-entrypoint.sh`) write them to files and point `CFDB_WORKER_TLS_CA/CERT/KEY` at them before the app starts. To enable:
+
+1. Generate certs (`make worker-certs`) and upload each PEM to Secrets Manager, e.g. `aws secretsmanager create-secret --name cfdb/worker-tls/ca --secret-string file://certs/worker-ca/ca.pem` (and the worker + API leaf cert/key).
+2. Pass the ARNs to the workers stack (`WorkerTlsCaSecretArn`, `WorkerTlsCertSecretArn`, `WorkerTlsKeySecretArn`) and the backend stack (`ApiTlsCaSecretArn`, `ApiTlsCertSecretArn`, `ApiTlsKeySecretArn` — reuse the same CA secret). Supplying a CA ARN flips the per-stack condition that adds the `Secrets:` env and the least-privilege `secretsmanager:GetSecretValue` IAM. Leave them empty to keep dispatch plaintext.
+
+> **Caveat — not yet functional on Fargate.** `EcsDiscovery` dials each worker at its *dynamic* awsvpc IP and wool does not override the gRPC authority, so a static worker cert's SAN cannot match the dialed address and the mTLS handshake will fail verification. The wiring above is in place, but **leave the cert ARNs empty** until wool gains a client-side target-name override (tracked separately). Until then, the worker security group is the access control on ECS.
 
 ## GraphQL API
 
@@ -589,7 +601,7 @@ Cache keys are content-addressed using each file's upstream `md5`, so a byte cha
 Required environment variables:
 
 - `SYNC_DATA_DIR` — directory under which the workflow cache and per-job workdirs live. Both subdirectories (`$SYNC_DATA_DIR/cache` and `$SYNC_DATA_DIR/jobs`) must share a filesystem because `LocalFsCache.put` relies on `os.replace` atomicity; the API asserts this at startup and fails fast if they live on different volumes. When unset, the workflow subsystem is disabled, `/data` falls through to direct upstream streaming, `/index` returns 404 for passthrough formats (CSV/TSV/bigWig — there is no index in any state of the world), and `/index` returns 503 for processable formats that would otherwise dispatch a workflow (sidecar-served files still work).
-- `WORKFLOW_WORKER_COUNT` — number of wool workers to **lease** from the surrounding worker pool (default `2`). The API does *not* spawn workers in-process; workers must be externally provisioned (e.g., as a separate ECS service or via the local-dev launch below) and discoverable via the wool LAN discovery namespace.
+- `WORKFLOW_WORKER_COUNT` — local-dev only: how many workers the LAN pool (`python -m cfdb.workflows.worker_lan`) spawns and publishes (default `2`). The API itself no longer leases a fixed count — its `WorkerPool` admits every worker discovery surfaces. In the ECS profile one ephemeral worker is launched per workflow (via `EcsProvisioner` `RunTask`), so the **maximum concurrent worker count is bounded by the AWS Fargate vCPU service quota** for the account/region — raise it in Service Quotas; at 1 vCPU per worker it maps roughly 1:1 to concurrent workers. A burst of N distinct uncached files can launch up to ~N workers concurrently, subject to that quota.
 - `WORKFLOW_POOL_NAMESPACE` — wool discovery namespace shared by the API and the external worker pool (default `cfdb-workers`). Both processes must agree on this value or dispatch will hang waiting for workers.
 
 Optional tunables (with defaults):
@@ -632,6 +644,43 @@ python -m cfdb.workflows.worker_lan --namespace cfdb-workers --workers 2
 ```
 
 This is the local-dev counterpart to the ECS entrypoint (`python -m cfdb.workflows.worker_main`): `worker_lan` spawns a `wool.WorkerPool` wired to `LanDiscovery` so the pool advertises its workers over zeroconf/mDNS, whereas `worker_main` boots a bare worker that `EcsDiscovery` finds by polling the ECS control plane. The API connects via LAN discovery and dispatches workflows to whatever workers are publishing under that namespace. With no worker pool running, `/data` and `/index` requests for processable formats will hang on the dispatch retry budget (60s by default) before failing with `NoWorkersAvailable`.
+
+#### Worker mTLS
+
+By default the API↔worker gRPC dispatch channel is plaintext, gated only by network reachability (in production, the worker security group). Setting the three `CFDB_WORKER_TLS_*` cert paths on **both** sides turns on wool's native mutual TLS (`mutual=True`): the channel is encrypted and each side presents a CA-signed certificate that the other verifies. wool's mTLS is peer-to-peer, so each process holds its own leaf cert/key while the CA is shared — the API and every worker MUST be signed by the same CA, or dispatch is rejected.
+
+The configuration is gating-by-presence: when all three of `CFDB_WORKER_TLS_CA`, `CFDB_WORKER_TLS_CERT`, and `CFDB_WORKER_TLS_KEY` are unset the plaintext path is used unchanged (local PoC dev needs no certs); when all three are set mTLS is enforced. A *partial* configuration (some set, some not) fails fast at startup rather than silently degrading to plaintext.
+
+Generate a local CA and the worker + API leaf certs with:
+
+```bash
+make worker-certs
+# wraps ./certs/generate-worker-certs.sh — see --help for SAN options.
+# Writes (all git-ignored):
+#   certs/worker-ca/ca.pem            shared CA
+#   certs/worker/worker-cert.pem,-key.pem   worker leaf
+#   certs/api/api-cert.pem,-key.pem         API client leaf
+```
+
+Then point each process at the shared CA plus its own leaf. The worker pool:
+
+```bash
+CFDB_WORKER_TLS_CA=certs/worker-ca/ca.pem \
+CFDB_WORKER_TLS_CERT=certs/worker/worker-cert.pem \
+CFDB_WORKER_TLS_KEY=certs/worker/worker-key.pem \
+python -m cfdb.workflows.worker_lan
+# or, with these env vars baked in: make worker-local-tls
+```
+
+…and the API process, with the **same** `CFDB_WORKER_TLS_CA` but the API leaf:
+
+```bash
+export CFDB_WORKER_TLS_CA=certs/worker-ca/ca.pem
+export CFDB_WORKER_TLS_CERT=certs/api/api-cert.pem
+export CFDB_WORKER_TLS_KEY=certs/api/api-key.pem
+```
+
+The same three env vars configure the ECS worker entrypoint (`worker_main`) and the API on Fargate; distributing the certs to the ECS task definitions is tracked as follow-up work and is not yet wired into the CloudFormation deploy.
 
 **URL:** `GET /jobs/{job_id}`
 

@@ -1,0 +1,5 @@
+# Generated mutual-TLS material — never commit key material.
+# generate-certs.sh writes the CA and leaf certs/keys here at dev time.
+*.pem
+*.csr
+*.srl

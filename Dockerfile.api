@@ -6,7 +6,7 @@
 # (and equivalent for python:3.12-slim-bookworm), paste the resulting
 # sha256 below, and rebuild. Both digests MUST be present.
 ARG RUST_BASE_DIGEST=sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89
-ARG PYTHON_BASE_DIGEST=sha256:d193c6f51a7dbd10395d6328de3a7edb0516fb0608ca138036576f574c3e07d2
+ARG PYTHON_BASE_DIGEST=sha256:76d4b7b6305788c6b4c6a19d6a22a3921bf802e9af4d5e1e5bd771208dba74bf
 
 # Build stage for the Rust materializer
 FROM rust:1.88-slim-bookworm@${RUST_BASE_DIGEST} AS builder
@@ -91,8 +91,17 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 COPY . /app
 RUN pip install --no-cache-dir . uvicorn
 
+# mTLS cert-materialization entrypoint. ECS injects the worker-channel
+# certs as env vars (Secrets Manager), but cfdb reads CFDB_WORKER_TLS_*
+# as file paths; this shim writes the PEM env vars to files before exec.
+# Inert when those env vars are absent (plaintext / local mounted-cert
+# paths pass straight through).
+RUN install -m 0755 /app/scripts/cfdb-tls-entrypoint.sh \
+        /usr/local/bin/cfdb-tls-entrypoint.sh
+
 # Create non-root user
 RUN useradd app
 USER app
 WORKDIR /app/src
+ENTRYPOINT ["/usr/local/bin/cfdb-tls-entrypoint.sh"]
 CMD ["uvicorn", "cfdb.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -15,12 +15,17 @@ Parameters:
     Description: ECR image URI for the cfdb wool worker (Dockerfile.wool)
   WorkerCpu:
     Type: String
-    Default: "2048"
+    Default: "1024"
     Description: Fargate task CPU units for a worker (1024 = 1 vCPU)
   WorkerMemory:
     Type: String
-    Default: "4096"
-    Description: Fargate task memory (MiB) for a worker
+    Default: "2048"
+    Description: >
+      Fargate task memory (MiB). 2048 is the Fargate minimum for 1 vCPU.
+      The tools cfdb drives are memory-capped and spill to disk (samtools
+      sort -m and GNU sort -S, both 256M by default), so peak RSS stays
+      well under this; ephemeral storage, not memory, is the binding
+      resource.
   WorkerEphemeralStorageGiB:
     Type: Number
     Default: 50
@@ -53,6 +58,37 @@ Parameters:
     Description: >
       Seconds /health returns 503 after SIGTERM before the gRPC port is
       torn down (CFDB_WORKER_DRAIN_GRACE_SECONDS).
+  # ---------- Worker mTLS (optional, off by default) ----------
+  # ARNs of Secrets Manager secrets holding the PEM material for mutual
+  # TLS on the API<->worker gRPC channel. Supply the shared CA cert, the
+  # worker leaf cert, and its key (each secret's plaintext value IS the
+  # PEM). Leave all three empty (default) to run the channel plaintext —
+  # the worker SG is the only access control in that case.
+  #
+  # NOTE: enforced mTLS over the ECS path is currently blocked upstream:
+  # EcsDiscovery dials the worker at its dynamic awsvpc IP and wool does
+  # not override the gRPC authority, so a static worker cert's SAN cannot
+  # match the dialed IP. Populating these turns the channel on but the
+  # handshake will not validate until wool gains a target-name override.
+  # Keep empty until then.
+  WorkerTlsCaSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the shared CA certificate PEM.
+  WorkerTlsCertSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the worker leaf certificate PEM.
+  WorkerTlsKeySecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the worker leaf private-key PEM.
+
+Conditions:
+  # mTLS is wired only when a CA secret ARN is supplied; otherwise every
+  # mTLS resource below renders to AWS::NoValue and the template is
+  # identical to the plaintext default.
+  WorkerMtlsEnabled: !Not [!Equals [!Ref WorkerTlsCaSecretArn, ""]]
 
 Resources:
   # ---------- S3 artifact cache ----------
@@ -150,6 +186,27 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-worker-execution-role"
 
+  # mTLS cert access (optional). The execution role — not the task role —
+  # pulls Secrets Manager values injected via the container's Secrets,
+  # so scope GetSecretValue to exactly the three cert ARNs. Only created
+  # when mTLS is enabled.
+  WorkerTlsSecretsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: WorkerMtlsEnabled
+    Properties:
+      PolicyName: worker-tls-secrets
+      Roles:
+        - !Ref WorkerExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !Ref WorkerTlsCaSecretArn
+              - !Ref WorkerTlsCertSecretArn
+              - !Ref WorkerTlsKeySecretArn
+
   # ---------- IAM: worker task role ----------
   # The processing routine runs in the worker and writes processed
   # artifacts to the cache (cache.head + cache.put), so the task role
@@ -222,6 +279,19 @@ Resources:
               Value: !Ref WorkerMaxLifetimeSeconds
             - Name: CFDB_WORKER_DRAIN_GRACE_SECONDS
               Value: !Ref WorkerDrainGraceSeconds
+          # mTLS PEMs (optional). ECS injects each secret as an env var;
+          # the image entrypoint (cfdb-tls-entrypoint.sh) writes them to
+          # files and points CFDB_WORKER_TLS_CA/CERT/KEY at them. Absent
+          # when mTLS is disabled, leaving the channel plaintext.
+          Secrets: !If
+            - WorkerMtlsEnabled
+            - - Name: CFDB_WORKER_TLS_CA_PEM
+                ValueFrom: !Ref WorkerTlsCaSecretArn
+              - Name: CFDB_WORKER_TLS_CERT_PEM
+                ValueFrom: !Ref WorkerTlsCertSecretArn
+              - Name: CFDB_WORKER_TLS_KEY_PEM
+                ValueFrom: !Ref WorkerTlsKeySecretArn
+            - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:

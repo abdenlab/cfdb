@@ -35,6 +35,32 @@ Parameters:
   DomainName:
     Type: String
     Default: cfdb.vis-api.link
+  # ---------- Worker mTLS (optional, off by default) ----------
+  # ARNs of Secrets Manager secrets holding the API's client-side PEM
+  # material for mutual TLS on the API<->worker gRPC channel: the shared
+  # CA cert (same secret the workers stack uses), the API leaf cert, and
+  # its key. Leave all three empty (default) to dispatch over plaintext.
+  # See the workers stack for the upstream-blocker caveat (wool does not
+  # override the gRPC authority, so enforced mTLS over the ECS path does
+  # not validate yet) — keep empty until that lands.
+  ApiTlsCaSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the shared CA certificate PEM.
+  ApiTlsCertSecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the API client certificate PEM.
+  ApiTlsKeySecretArn:
+    Type: String
+    Default: ""
+    Description: Secrets Manager ARN of the API client private-key PEM.
+
+Conditions:
+  # mTLS is wired only when a CA secret ARN is supplied; otherwise the
+  # cert Secrets and IAM render away and the template matches the
+  # plaintext default.
+  ApiMtlsEnabled: !Not [!Equals [!Ref ApiTlsCaSecretArn, ""]]
 
 Resources:
   # ---------- Secrets ----------
@@ -202,12 +228,28 @@ Resources:
               Value: !Ref WorkflowS3Prefix
             - Name: AWS_REGION
               Value: !Ref AWS::Region
-          Secrets:
-            - Name: DATABASE_URL
-              ValueFrom:
-                Fn::ImportValue: !Sub "${DatabaseStackName}-ConnectionURLSecretArn"
-            - Name: SYNC_API_KEY
-              ValueFrom: !Ref SyncApiKeySecret
+          # The cert PEMs (when mTLS is enabled) are injected as env vars
+          # and written to files by the image entrypoint
+          # (cfdb-tls-entrypoint.sh), which points CFDB_WORKER_TLS_CA/CERT/KEY
+          # at them. Absent when disabled, leaving dispatch plaintext.
+          Secrets: !If
+            - ApiMtlsEnabled
+            - - Name: DATABASE_URL
+                ValueFrom:
+                  Fn::ImportValue: !Sub "${DatabaseStackName}-ConnectionURLSecretArn"
+              - Name: SYNC_API_KEY
+                ValueFrom: !Ref SyncApiKeySecret
+              - Name: CFDB_WORKER_TLS_CA_PEM
+                ValueFrom: !Ref ApiTlsCaSecretArn
+              - Name: CFDB_WORKER_TLS_CERT_PEM
+                ValueFrom: !Ref ApiTlsCertSecretArn
+              - Name: CFDB_WORKER_TLS_KEY_PEM
+                ValueFrom: !Ref ApiTlsKeySecretArn
+            - - Name: DATABASE_URL
+                ValueFrom:
+                  Fn::ImportValue: !Sub "${DatabaseStackName}-ConnectionURLSecretArn"
+              - Name: SYNC_API_KEY
+                ValueFrom: !Ref SyncApiKeySecret
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -291,6 +333,26 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-execution-role"
+
+  # mTLS cert access (optional). The execution role pulls the cert PEMs
+  # injected via the container's Secrets; scope GetSecretValue to exactly
+  # the three API cert ARNs. Only created when mTLS is enabled.
+  ApiTlsSecretsPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ApiMtlsEnabled
+    Properties:
+      PolicyName: api-tls-secrets
+      Roles:
+        - !Ref ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !Ref ApiTlsCaSecretArn
+              - !Ref ApiTlsCertSecretArn
+              - !Ref ApiTlsKeySecretArn
 
   # ---------- IAM: task role ----------
   # The API dispatches workflows to the worker fleet (EcsProvisioner

@@ -36,6 +36,7 @@ import click
 import wool
 
 from cfdb.workflows.constants import DEFAULT_WORKER_PORT
+from cfdb.workflows.credentials import build_worker_credentials
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -84,6 +85,9 @@ async def serve(
     health_port: int = DEFAULT_HEALTH_PORT,
     max_lifetime_seconds: float = DEFAULT_MAX_LIFETIME_SECONDS,
     drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS,
+    tls_ca: Optional[str] = None,
+    tls_cert: Optional[str] = None,
+    tls_key: Optional[str] = None,
 ) -> int:
     """Run the worker until SIGTERM or maximum lifetime elapses.
 
@@ -96,7 +100,13 @@ async def serve(
     A second SIGTERM during drain short-circuits the grace window
     (operator impatience or ECS escalating before SIGKILL); the worker
     stops immediately.
+
+    When ``tls_ca`` / ``tls_cert`` / ``tls_key`` are all supplied the
+    worker requires mutual TLS (a CA-signed client certificate);
+    unset leaves the gRPC channel plaintext. Partial cert config raises
+    before the worker binds (see :func:`build_worker_credentials`).
     """
+    credentials = build_worker_credentials(tls_ca, tls_cert, tls_key)
     stop_event = asyncio.Event()
     force_stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -126,13 +136,16 @@ async def serve(
         health_port, lambda: stop_event.is_set()
     )
 
-    worker = wool.LocalWorker(host="0.0.0.0", port=worker_port)
+    worker = wool.LocalWorker(
+        host="0.0.0.0", port=worker_port, credentials=credentials
+    )
     await worker.start()
     try:
         logger.info(
-            "Wool worker listening on port %d (health on %d)",
+            "Wool worker listening on port %d (health on %d, mTLS %s)",
             worker_port,
             health_port,
+            "enabled" if credentials is not None else "disabled",
         )
         while True:
             # Check the self-termination path first. Max-lifetime is a
@@ -276,11 +289,35 @@ async def _shutdown_health_server(runner: Optional["web.AppRunner"]) -> None:
         "tearing down the gRPC port. A second SIGTERM short-circuits."
     ),
 )
+@click.option(
+    "--tls-ca",
+    envvar="CFDB_WORKER_TLS_CA",
+    default=None,
+    help=(
+        "Path to the shared CA certificate. Set all three --tls-* "
+        "options to require mutual TLS; leave them unset for plaintext."
+    ),
+)
+@click.option(
+    "--tls-cert",
+    envvar="CFDB_WORKER_TLS_CERT",
+    default=None,
+    help="Path to this worker's PEM certificate (CA-signed).",
+)
+@click.option(
+    "--tls-key",
+    envvar="CFDB_WORKER_TLS_KEY",
+    default=None,
+    help="Path to this worker's PEM private key.",
+)
 def main(
     worker_port: int,
     health_port: int,
     max_lifetime_seconds: float,
     drain_grace_seconds: float,
+    tls_ca: Optional[str],
+    tls_cert: Optional[str],
+    tls_key: Optional[str],
 ) -> None:
     """ECS Fargate worker entrypoint — invoked by the container CMD.
 
@@ -297,6 +334,9 @@ def main(
                 health_port=health_port,
                 max_lifetime_seconds=max_lifetime_seconds,
                 drain_grace_seconds=drain_grace_seconds,
+                tls_ca=tls_ca,
+                tls_cert=tls_cert,
+                tls_key=tls_key,
             )
         )
     )

@@ -34,10 +34,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from typing import Optional
 
 import click
 import wool
 from wool.runtime.discovery.lan import LanDiscovery
+
+from cfdb.workflows.credentials import build_worker_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +57,28 @@ DEFAULT_NAMESPACE = "cfdb-workers"
 DEFAULT_WORKER_COUNT = 2
 
 
-async def serve(*, namespace: str, workers: int) -> int:
+async def serve(
+    *,
+    namespace: str,
+    workers: int,
+    tls_ca: Optional[str] = None,
+    tls_cert: Optional[str] = None,
+    tls_key: Optional[str] = None,
+) -> int:
     """Spawn ``workers`` wool workers and publish them under ``namespace``.
 
     Blocks until SIGTERM/SIGINT, then drains the pool via the
     ``WorkerPool`` async-context exit and returns ``0``. Bind/spawn
     failures raise out so the cause surfaces in the process logs rather
     than as a silent non-zero exit.
+
+    When ``tls_ca`` / ``tls_cert`` / ``tls_key`` are all supplied the
+    pool's workers require mutual TLS; unset leaves the gRPC channel
+    plaintext. The API leasing these workers must hold a certificate
+    signed by the same CA. Partial cert config raises before the pool
+    starts (see :func:`build_worker_credentials`).
     """
+    credentials = build_worker_credentials(tls_ca, tls_cert, tls_key)
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -81,14 +98,17 @@ async def serve(*, namespace: str, workers: int) -> int:
             signal.signal(sig, _signal_handler_threaded)
 
     pool = wool.WorkerPool(
-        spawn=workers, discovery=LanDiscovery(namespace)
+        spawn=workers,
+        discovery=LanDiscovery(namespace),
+        credentials=credentials,
     )
     async with pool:
         logger.info(
-            "Published %d wool worker(s) under LAN namespace %r — "
-            "Ctrl-C to drain and exit",
+            "Published %d wool worker(s) under LAN namespace %r (mTLS %s) "
+            "— Ctrl-C to drain and exit",
             workers,
             namespace,
+            "enabled" if credentials is not None else "disabled",
         )
         await stop_event.wait()
     return 0
@@ -110,7 +130,35 @@ async def serve(*, namespace: str, workers: int) -> int:
     show_default=True,
     help="Number of wool workers to spawn and publish.",
 )
-def main(namespace: str, workers: int) -> None:
+@click.option(
+    "--tls-ca",
+    envvar="CFDB_WORKER_TLS_CA",
+    default=None,
+    help=(
+        "Path to the shared CA certificate. Set all three --tls-* "
+        "options to require mutual TLS; leave them unset for plaintext. "
+        "The API must use a cert signed by the same CA."
+    ),
+)
+@click.option(
+    "--tls-cert",
+    envvar="CFDB_WORKER_TLS_CERT",
+    default=None,
+    help="Path to the workers' PEM certificate (CA-signed).",
+)
+@click.option(
+    "--tls-key",
+    envvar="CFDB_WORKER_TLS_KEY",
+    default=None,
+    help="Path to the workers' PEM private key.",
+)
+def main(
+    namespace: str,
+    workers: int,
+    tls_ca: Optional[str],
+    tls_cert: Optional[str],
+    tls_key: Optional[str],
+) -> None:
     """Local-dev worker pool — publishes workers over LAN discovery.
 
     Run this in a separate process before starting the API so the API's
@@ -119,7 +167,15 @@ def main(namespace: str, workers: int) -> None:
     """
     logging.basicConfig(level=logging.INFO)
     raise SystemExit(
-        asyncio.run(serve(namespace=namespace, workers=workers))
+        asyncio.run(
+            serve(
+                namespace=namespace,
+                workers=workers,
+                tls_ca=tls_ca,
+                tls_cert=tls_cert,
+                tls_key=tls_key,
+            )
+        )
     )
 
 

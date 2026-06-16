@@ -61,19 +61,6 @@ def _parse_int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return parsed
 
 
-#: Upper bound on how many wool workers the API leases at once. The API
-#: is **lease-only** — it never spawns workers in process. Workers are
-#: provisioned externally (in development by manually starting a wool
-#: pool with ``--spawn``; in production as ECS tasks) and discovered via
-#: wool's discovery layer. When a workflow needs to launch, the executor
-#: should also signal the provisioner to scale up so a worker exists by
-#: the time dispatch retries surface it; the dispatch retry budget
-#: (``cfdb.workflows.executor._DISPATCH_WAIT_SECONDS``) is sized for an
-#: ECS cold start.
-WORKFLOW_WORKER_COUNT: Final = _parse_int_env(
-    "WORKFLOW_WORKER_COUNT", 2, minimum=1
-)
-
 #: Wool ``LanDiscovery`` namespace shared by the API (subscriber/leaser)
 #: and the worker pool process(es) (publisher). Both sides MUST use the
 #: same string; otherwise the API's discovery service won't see the
@@ -84,6 +71,32 @@ WORKFLOW_WORKER_COUNT: Final = _parse_int_env(
 #: ECS path discovers workers by polling the ECS control plane directly
 #: and does not need a shared zeroconf namespace.
 WORKFLOW_POOL_NAMESPACE: Final = os.getenv("WORKFLOW_POOL_NAMESPACE", "cfdb-workers")
+
+# Worker gRPC mutual-TLS. These three cert paths gate transport
+# encryption + peer authentication on the channel the API uses to
+# dispatch ``@wool.routine`` work to wool workers. When all three are
+# unset the channel stays plaintext (the PoC default); when all three
+# are set the API presents its client certificate and the workers
+# require a CA-signed one (``mutual=True``). Both sides must hold certs
+# signed by the same CA (see ``CFDB_WORKER_TLS_CA``). Partial config
+# (some set, some not) fails fast at pool construction — see
+# ``cfdb.workflows.credentials.build_worker_credentials``. The
+# ``CFDB_WORKER_TLS_*`` names are shared with the worker entrypoints
+# (``worker_main`` / ``worker_lan``); each process points CERT/KEY at
+# its own leaf material while the CA is common.
+
+#: Path to the shared CA certificate the API verifies workers against
+#: (and that signed the API's own client certificate). Unset disables
+#: worker mTLS.
+CFDB_WORKER_TLS_CA: Final = os.getenv("CFDB_WORKER_TLS_CA")
+
+#: Path to the API's PEM client certificate, presented to workers when
+#: mTLS is enabled. Must be signed by ``CFDB_WORKER_TLS_CA``.
+CFDB_WORKER_TLS_CERT: Final = os.getenv("CFDB_WORKER_TLS_CERT")
+
+#: Path to the API's PEM client private key paired with
+#: ``CFDB_WORKER_TLS_CERT``.
+CFDB_WORKER_TLS_KEY: Final = os.getenv("CFDB_WORKER_TLS_KEY")
 
 # AWS / ECS profile. These knobs are optional — when none of them are
 # set the API runs the PoC profile (``LocalFsCache`` + ``LanDiscovery``
