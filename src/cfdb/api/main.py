@@ -28,6 +28,7 @@ from cfdb.workflows.cache import (
     _build_s3_client,
     check_s3_bucket_or_raise,
 )
+from cfdb.workflows.credentials import build_worker_credentials
 from cfdb.workflows.discovery import EcsDiscovery
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.models import ACTIVE_STATUSES
@@ -309,10 +310,21 @@ async def lifespan(_: FastAPI):
             # its default ephemeral mode — ``WorkerPool(lease=N)`` alone
             # falls into the ``(spawn=None, discovery=None)`` branch which
             # spawns CPU-count workers locally.
+            # Mutual TLS on the worker dispatch channel, gated behind
+            # the three cert-path env vars. None (all unset) keeps the
+            # plaintext PoC path; a partial config raises here so a
+            # half-wired channel can't silently fall back to plaintext.
+            worker_credentials = build_worker_credentials(
+                api.CFDB_WORKER_TLS_CA,
+                api.CFDB_WORKER_TLS_CERT,
+                api.CFDB_WORKER_TLS_KEY,
+            )
+
             async with _build_discovery(profile) as discovery:
                 async with wool.WorkerPool(
                     discovery=discovery,
                     lease=api.WORKFLOW_WORKER_COUNT,
+                    credentials=worker_credentials,
                 ):
                     # Snapshot the lifespan task's contextvars after the
                     # pool's ``__aenter__`` has populated wool's internals.
@@ -327,13 +339,15 @@ async def lifespan(_: FastAPI):
                     executor_handle = api.executor
                     log.info(
                         "Workflow subsystem enabled: profile=%s cache=%s "
-                        "workdir=%s lease=%d discovery=%s provisioner=%s",
+                        "workdir=%s lease=%d discovery=%s provisioner=%s "
+                        "worker_mtls=%s",
                         profile.kind,
                         type(api.cache).__name__,
                         profile.workdir_root,
                         api.WORKFLOW_WORKER_COUNT,
                         type(discovery).__name__,
                         "EcsProvisioner" if provisioner is not None else "none",
+                        "enabled" if worker_credentials is not None else "disabled",
                     )
                     # Stack each teardown step as an async callback so a
                     # failure earlier in the chain (e.g. ``drain`` raises

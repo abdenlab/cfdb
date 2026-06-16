@@ -41,7 +41,13 @@ class TestMainCli:
             with a bare API.
         """
         # Arrange — clear any env overrides so defaults apply
-        for var in ("WORKFLOW_POOL_NAMESPACE", "WORKFLOW_WORKER_COUNT"):
+        for var in (
+            "WORKFLOW_POOL_NAMESPACE",
+            "WORKFLOW_WORKER_COUNT",
+            "CFDB_WORKER_TLS_CA",
+            "CFDB_WORKER_TLS_CERT",
+            "CFDB_WORKER_TLS_KEY",
+        ):
             monkeypatch.delenv(var, raising=False)
 
         # Act
@@ -51,6 +57,9 @@ class TestMainCli:
         assert exit_code == 0
         assert captured["namespace"] == worker_lan.DEFAULT_NAMESPACE
         assert captured["workers"] == worker_lan.DEFAULT_WORKER_COUNT
+        assert captured["tls_ca"] is None
+        assert captured["tls_cert"] is None
+        assert captured["tls_key"] is None
 
     def test_main_with_env_overrides(self, monkeypatch):
         """Test that environment variables override the defaults.
@@ -118,3 +127,50 @@ class TestMainCli:
         # Assert
         assert exit_code != 0
         assert "workers" not in captured
+
+    def test_main_passes_tls_paths_from_env(self, monkeypatch):
+        """Test that the TLS cert paths flow from env into serve.
+
+        Given:
+            ``CFDB_WORKER_TLS_CA`` / ``CFDB_WORKER_TLS_CERT`` /
+            ``CFDB_WORKER_TLS_KEY`` set in the environment.
+        When:
+            ``worker_lan.main`` is invoked with no TLS CLI flags.
+        Then:
+            ``serve`` should receive the env-driven cert paths so the
+            LAN pool can enable mTLS purely via env vars.
+        """
+        # Arrange
+        monkeypatch.setenv("CFDB_WORKER_TLS_CA", "/c/ca.pem")
+        monkeypatch.setenv("CFDB_WORKER_TLS_CERT", "/c/worker-cert.pem")
+        monkeypatch.setenv("CFDB_WORKER_TLS_KEY", "/c/worker-key.pem")
+
+        # Act
+        exit_code, captured = _invoke([])
+
+        # Assert
+        assert exit_code == 0
+        assert captured["tls_ca"] == "/c/ca.pem"
+        assert captured["tls_cert"] == "/c/worker-cert.pem"
+        assert captured["tls_key"] == "/c/worker-key.pem"
+
+    def test_main_tls_cli_flags_override_env_vars(self, monkeypatch):
+        """Test that TLS CLI flags win over environment variables.
+
+        Given:
+            ``CFDB_WORKER_TLS_CA`` set in the environment.
+        When:
+            ``worker_lan.main`` is invoked with an explicit ``--tls-ca``
+            CLI flag.
+        Then:
+            ``serve`` should receive the CLI-supplied cert path.
+        """
+        # Arrange
+        monkeypatch.setenv("CFDB_WORKER_TLS_CA", "/env/ca.pem")
+
+        # Act
+        exit_code, captured = _invoke(["--tls-ca", "/cli/ca.pem"])
+
+        # Assert
+        assert exit_code == 0
+        assert captured["tls_ca"] == "/cli/ca.pem"

@@ -55,3 +55,21 @@ wool:
 worker-local:
 	@echo "Starting a local LAN worker pool (namespace=$${WORKFLOW_POOL_NAMESPACE:-cfdb-workers}, workers=$${WORKFLOW_WORKER_COUNT:-2})..."
 	uv run python -m cfdb.workflows.worker_lan
+
+worker-certs:
+	@echo "Generating wool worker mutual-TLS material under certs/..."
+	./certs/generate-worker-certs.sh
+	@echo "Done. Export the cert paths on BOTH the worker pool and the API to enable mTLS:"
+	@echo "  export CFDB_WORKER_TLS_CA=certs/worker-ca/ca.pem"
+	@echo "  # worker pool:  CFDB_WORKER_TLS_CERT=certs/worker/worker-cert.pem CFDB_WORKER_TLS_KEY=certs/worker/worker-key.pem"
+	@echo "  # API:          CFDB_WORKER_TLS_CERT=certs/api/api-cert.pem       CFDB_WORKER_TLS_KEY=certs/api/api-key.pem"
+
+# Local LAN worker pool with mutual TLS enabled. Run `make worker-certs`
+# first; start the API with the matching CFDB_WORKER_TLS_CA plus the API
+# leaf cert/key so both sides authenticate against the shared CA.
+worker-local-tls:
+	@echo "Starting a local LAN worker pool with mTLS (namespace=$${WORKFLOW_POOL_NAMESPACE:-cfdb-workers}, workers=$${WORKFLOW_WORKER_COUNT:-2})..."
+	CFDB_WORKER_TLS_CA=certs/worker-ca/ca.pem \
+	CFDB_WORKER_TLS_CERT=certs/worker/worker-cert.pem \
+	CFDB_WORKER_TLS_KEY=certs/worker/worker-key.pem \
+	uv run python -m cfdb.workflows.worker_lan
