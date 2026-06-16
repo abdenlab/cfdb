@@ -1,0 +1,35 @@
+# Keep the Docker build context (COPY . /app in Dockerfile.api and
+# Dockerfile.wool) free of VCS history, virtualenvs, build/test caches,
+# and large local data files so images stay small and don't leak history.
+
+# Version control
+.git
+.github
+.gitignore
+
+# Python virtualenv and caches
+.venv
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.hypothesis
+
+# Rust materializer build artifacts
+materialize/target
+
+# Local data, scratch, and tooling
+.data
+.sandbox
+.understand-anything
+.claude
+build
+.encode_metadata.tsv
+
+# Tests are not needed in the runtime image
+tests
+
+# Editor / OS cruft
+.DS_Store
+*.swp
