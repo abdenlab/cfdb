@@ -8,6 +8,7 @@ from fastapi import APIRouter, Header, HTTPException, Path, Request, status
 from cfdb import api
 from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
 from cfdb.api.routers.cache_stream import (
+    probe_workflow_readiness,
     serve_workflow_artifact_or_dispatch,
     stream_upstream_url,
 )
@@ -282,6 +283,85 @@ async def stream_file(
         raise
     except Exception:
         logger.exception("Unexpected error in stream_file")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@router.get("/{dcc}/{local_id}/status")
+async def stream_file_status(
+    dcc: str = Path(
+        ..., max_length=_PATH_PARAM_MAX_LEN, pattern=_PATH_PARAM_PATTERN
+    ),
+    local_id: str = Path(
+        ..., max_length=_PATH_PARAM_MAX_LEN, pattern=_PATH_PARAM_PATTERN
+    ),
+):
+    """Report whether a ``GET /data`` would stream immediately.
+
+    A side-effect-free readiness probe: it reuses the same lookup, DCC
+    normalization, and access-control logic as ``stream_file`` and returns
+    the same error codes for files that can't be served, but on success
+    returns ``{"ready": bool}`` instead of streaming and **never
+    dispatches a workflow**.
+
+    ``ready`` reflects the default (preprocessed) path: ``true`` when the
+    processed artifact is already cached or the format is served directly
+    (passthrough, or a format with no DATA artifact); ``false`` when the
+    file is processable but the artifact is not yet cached (a ``GET``
+    would return ``202``).
+    """
+    await locks.wait_for_cutover()
+
+    try:
+        from cfdb.dcc_registry import get_all_dcc_names, normalize_dcc_name
+
+        normalized_dcc = normalize_dcc_name(dcc)
+        valid_dccs = get_all_dcc_names()
+
+        if normalized_dcc not in valid_dccs:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
+            )
+
+        if api.db is None:
+            logger.error("Database not initialized")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database not available",
+            )
+
+        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
+        if not file_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            )
+
+        # Mirror ``stream_file``'s ordering: the no-access-method 501 is
+        # checked before the HuBMAP access guard.
+        if not file_doc.get("access_url"):
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="File has no access URL",
+            )
+
+        enforce_hubmap_access(normalized_dcc, file_doc)
+
+        # Workflow cache state — never dispatches. ``None`` means the file
+        # is served directly from upstream (passthrough format, a format
+        # with no DATA artifact, or the subsystem is disabled), all of
+        # which stream immediately → ready.
+        readiness = await probe_workflow_readiness(file_doc, ArtifactKind.DATA)
+        if readiness is None:
+            return {"ready": True}
+        return {"ready": readiness}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error in stream_file_status")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",

@@ -30,6 +30,7 @@ from fastapi import APIRouter, Header, HTTPException, Path, Request, status
 from cfdb import api
 from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
 from cfdb.api.routers.cache_stream import (
+    probe_workflow_readiness,
     serve_workflow_artifact_or_dispatch,
     stream_upstream_url,
 )
@@ -189,20 +190,133 @@ async def stream_index_file(
         )
 
 
-async def _try_serve_fourdn_sidecar(
-    file_doc: dict,
-    normalized_dcc: str,
-    request: Request,
-    range_header: Optional[str],
+@router.get("/{dcc}/{local_id}/status")
+async def stream_index_file_status(
+    dcc: str = Path(
+        ..., max_length=_PATH_PARAM_MAX_LEN, pattern=_PATH_PARAM_PATTERN
+    ),
+    local_id: str = Path(
+        ..., max_length=_PATH_PARAM_MAX_LEN, pattern=_PATH_PARAM_PATTERN
+    ),
 ):
-    """Return a streaming response if the file carries a legacy sidecar.
+    """Report whether a ``GET /index`` would stream immediately.
 
-    Looks first at ``extra.extra_files`` (the path used by pre-materialized
-    documents) and then at ``extra.fourdn.extra_files`` (the DCC-specific
+    A side-effect-free readiness probe: it reuses the same lookup, DCC
+    normalization, and access-control logic as ``stream_index_file`` and
+    returns the same error codes for files that can't be served, but on
+    success returns ``{"ready": bool}`` instead of streaming and **never
+    dispatches a workflow**.
+
+    ``ready`` reflects the default (preprocessed) path:
+    ``true`` when an upstream sidecar exists or the processed index is
+    already cached; ``false`` when the index is processable but not yet
+    cached (a ``GET`` would return ``202``).
+    """
+    await locks.wait_for_cutover()
+
+    try:
+        normalized_dcc = normalize_dcc_name(dcc)
+        valid_dccs = get_all_dcc_names()
+
+        if normalized_dcc not in valid_dccs:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
+            )
+
+        if api.db is None:
+            logger.error("Database not initialized")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database not available",
+            )
+
+        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
+        if not file_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            )
+
+        enforce_hubmap_access(normalized_dcc, file_doc)
+
+        # 1. Upstream sidecar present → a GET streams it immediately.
+        #    A malformed sidecar raises 502, mirroring the stream path.
+        if _resolve_fourdn_sidecar(file_doc, normalized_dcc) is not None:
+            return {"ready": True}
+
+        # 2. Workflow cache state — never dispatches.
+        readiness = await probe_workflow_readiness(file_doc, ArtifactKind.INDEX)
+        if readiness is not None:
+            return {"ready": readiness}
+
+        # 3. Terminal cases mirror ``stream_index_file`` exactly: a
+        #    no-index format (the matched processor declares no artifacts)
+        #    has no index in any state of the world (404); a processable
+        #    format with the subsystem disabled is degraded mode (503);
+        #    otherwise no processor produces an index for this format
+        #    (404). Asking the registry's processor keeps the "is this a
+        #    no-index format?" decision out of a hard-coded format set.
+        processor = (
+            api.processor_registry.lookup_for(file_doc)
+            if api.processor_registry is not None
+            else None
+        )
+        if processor is not None and not processor.artifact_kinds_produced(file_doc):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No index file available for this file format",
+            )
+        if api.processor_registry is None or api.cache is None or api.executor is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Workflow subsystem disabled — set SYNC_DATA_DIR and "
+                    "start a wool worker pool to serve preprocessed "
+                    "indexes."
+                ),
+                headers={"Retry-After": "30"},
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No index file available for this file",
+        )
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error in stream_index_file_status")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+def _resolve_fourdn_sidecar(
+    file_doc: dict, normalized_dcc: str
+) -> Optional[tuple[str, dict]]:
+    """Resolve and validate a 4DN index sidecar, if the file carries one.
+
+    Pure (no I/O): the detection-and-validation half shared by the
+    sidecar streaming path and the ``/status`` probe. Looks first at
+    ``extra.extra_files`` (the path used by pre-materialized documents)
+    and then at ``extra.fourdn.extra_files`` (the DCC-specific
     subdocument). Each entry's ``file_format`` is normalized from either a
     ``{display_title: ...}`` CV object (the shape 4DN materializes) or a
     bare string before matching ``_SIDECAR_INDEX_FORMATS``; an entry whose
     token is unrecognized falls through to the first-entry fallback.
+
+    Returns:
+        ``(download_url, index_entry)`` when a valid sidecar is present,
+        or ``None`` when no sidecar exists or the DCC config is
+        unavailable (caller falls through to the workflow path).
+
+    Raises:
+        HTTPException(502): The sidecar is present but malformed — a
+            non-object entry, a missing ``href``, or a URL that fails the
+            outbound allowlist. Surfaced rather than silently falling
+            through because a workflow artifact (md5-cached) would not
+            match the bytes a client expected from the upstream sidecar.
     """
     extra = file_doc.get("extra") or {}
     extra_files = extra.get("extra_files") or []
@@ -246,10 +360,6 @@ async def _try_serve_fourdn_sidecar(
 
     href = index_entry.get("href")
     if not href:
-        # Sidecar entry is malformed — surface a clear 502 rather than
-        # silently falling through to the workflow path. A workflow
-        # artifact (md5-cached) would not match the bytes a client
-        # expected from the upstream sidecar.
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Upstream sidecar entry is missing required `href` field",
@@ -273,6 +383,27 @@ async def _try_serve_fourdn_sidecar(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Upstream sidecar URL failed allowlist validation",
         )
+
+    return download_url, index_entry
+
+
+async def _try_serve_fourdn_sidecar(
+    file_doc: dict,
+    normalized_dcc: str,
+    request: Request,
+    range_header: Optional[str],
+):
+    """Return a streaming response if the file carries a legacy sidecar.
+
+    Thin wrapper over ``_resolve_fourdn_sidecar`` that adds the
+    streaming/Range/HEAD handling; returns ``None`` when no sidecar is
+    present so the caller falls through to the workflow path.
+    """
+    resolved = _resolve_fourdn_sidecar(file_doc, normalized_dcc)
+    if resolved is None:
+        return None
+    download_url, index_entry = resolved
+    href = index_entry["href"]
 
     filename = href.rsplit("/", 1)[-1] if "/" in href else href
     file_size = index_entry.get("file_size")
