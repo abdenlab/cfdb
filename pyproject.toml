@@ -36,6 +36,7 @@ dev = ["allpairspy", "debugpy", "httpx", "hypothesis", "mongomock-motor", "moto[
 
 [project.scripts]
 cfdb = "cfdb.cli:cli"
+cfdb-ensure-indexes = "cfdb.ensure_indexes:main"
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
