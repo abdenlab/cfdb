@@ -84,6 +84,54 @@ class TestFilesQuery:
         assert len(result.data["files"]) == 2
 
     @pytest.mark.asyncio
+    async def test_returns_4dn_file_with_dict_shaped_extra_file_format(self, mock_db):
+        """Test the files query serializes 4DN extra_files with a CV-object format.
+
+        Given:
+            A 4DN file whose extra.fourdn.extra_files[0].file_format is a 4DN
+            CV object (a dict carrying the token under display_title) — the
+            shape that crashed the query.
+        When:
+            The GraphQL files query selects extra.fourdn.extraFiles.fileFormat.
+        Then:
+            It returns without errors and exposes the display_title token.
+        """
+        # Arrange
+        doc = _make_file_doc("4DNFITEST", submission="4dn")
+        doc["extra"] = {
+            "fourdn": {
+                "extra_files": [
+                    {
+                        "href": "/files/x.pairs_px2",
+                        "file_format": {
+                            "status": "released",
+                            "display_title": "pairs_px2",
+                        },
+                    }
+                ]
+            }
+        }
+        mock_db.files.docs = [doc]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files {
+                    localId
+                    extra { fourdn { extraFiles { href fileFormat } } }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        extra_file = result.data["files"][0]["extra"]["fourdn"]["extraFiles"][0]
+        assert extra_file["fileFormat"] == "pairs_px2"
+        assert extra_file["href"] == "/files/x.pairs_px2"
+
+    @pytest.mark.asyncio
     async def test_returns_all_submissions_without_filtering(self, mock_db):
         """Test the files query returns all DCCs when no filter is supplied.
 
