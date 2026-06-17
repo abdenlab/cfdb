@@ -42,6 +42,23 @@ ALLOWED_DISTINCT_FIELDS: frozenset[str] = frozenset(
 
 
 def from_pydantic(gql_type, obj):
+    """Build a Strawberry type from a fully-dumped model dict.
+
+    ``obj`` is expected to be a complete ``model_dump()`` of the
+    corresponding pydantic model (every field key present); callers pass
+    ``FileMetadataModel(...).model_dump()``. Mutates ``obj`` in place,
+    recursively converting nested-model fields (and lists thereof) into
+    their Strawberry types before constructing ``gql_type``.
+
+    Field nesting is resolved by peeling Strawberry's wrapper types: a
+    ``StrawberryOptional`` / ``StrawberryList`` exposes ``of_type`` but
+    not ``__strawberry_definition__``, while a concrete generated type
+    exposes ``__strawberry_definition__``. This distinction is a
+    Strawberry-internal contract — re-verify it on a major Strawberry
+    upgrade, as a change there would silently leave nested values as raw
+    dicts (the bug fixed in #51/#52). Scalar and JSON fields peel to a
+    leaf with no ``__strawberry_definition__`` and are left untouched.
+    """
     if obj is None:
         return obj
     for field_name, field_type in gql_type.__annotations__.items():
