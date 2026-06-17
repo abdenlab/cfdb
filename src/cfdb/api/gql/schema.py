@@ -45,18 +45,26 @@ def from_pydantic(gql_type, obj):
     if obj is None:
         return obj
     for field_name, field_type in gql_type.__annotations__.items():
-        if field_name in obj:
-            if hasattr(field_type, "__strawberry_definition__"):
-                obj[field_name] = from_pydantic(field_type, obj[field_name])
-            elif hasattr(field_type, "of_type") and hasattr(
-                field_type.of_type, "__strawberry_definition__"
-            ):
-                if isinstance(obj[field_name], list):
-                    obj[field_name] = [
-                        from_pydantic(field_type.of_type, o) for o in obj[field_name]
-                    ]
-                else:
-                    obj[field_name] = from_pydantic(field_type.of_type, obj[field_name])
+        if field_name not in obj or obj[field_name] is None:
+            continue
+        # Peel any nesting of Strawberry wrappers (StrawberryOptional /
+        # StrawberryList — both expose ``of_type`` but not
+        # ``__strawberry_definition__``) down to the concrete Strawberry
+        # type. This handles bare ``X``, ``Optional[X]``, ``List[X]`` and
+        # ``Optional[List[X]]`` alike — the last being how nested model
+        # lists such as ``extra.fourdn.extra_files`` are typed.
+        inner = field_type
+        while hasattr(inner, "of_type") and not hasattr(
+            inner, "__strawberry_definition__"
+        ):
+            inner = inner.of_type
+        if not hasattr(inner, "__strawberry_definition__"):
+            continue  # scalar / JSON field — leave the value untouched
+        value = obj[field_name]
+        if isinstance(value, list):
+            obj[field_name] = [from_pydantic(inner, o) for o in value]
+        else:
+            obj[field_name] = from_pydantic(inner, value)
 
     return gql_type(**obj)
 
