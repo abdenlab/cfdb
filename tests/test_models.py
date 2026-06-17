@@ -8,7 +8,70 @@ from cfdb.models import (
     ExtraFile,
     FileMetadataModel,
     Subject,
+    coerce_4dn_cv_token,
 )
+
+
+class TestCoerce4dnCvToken:
+    def test_returns_display_title_for_cv_object(self):
+        """Test that a CV object resolves to its display_title token.
+
+        Given:
+            A 4DN CV object carrying the token under display_title.
+        When:
+            coerce_4dn_cv_token is called.
+        Then:
+            It should return the display_title string.
+        """
+        # Act
+        result = coerce_4dn_cv_token(
+            {"status": "released", "display_title": "pairs_px2"}
+        )
+
+        # Assert
+        assert result == "pairs_px2"
+
+    def test_returns_none_for_cv_object_without_display_title(self):
+        """Test that a CV object lacking display_title resolves to None.
+
+        Given:
+            A dict with no display_title key.
+        When:
+            coerce_4dn_cv_token is called.
+        Then:
+            It should return None.
+        """
+        # Act
+        result = coerce_4dn_cv_token({"status": "released"})
+
+        # Assert
+        assert result is None
+
+    def test_passes_string_through_unchanged(self):
+        """Test that a bare string is returned unchanged.
+
+        Given:
+            A plain string token.
+        When:
+            coerce_4dn_cv_token is called.
+        Then:
+            It should return the string unchanged.
+        """
+        # Act, assert
+        assert coerce_4dn_cv_token("bai") == "bai"
+
+    def test_passes_none_through_unchanged(self):
+        """Test that None is returned unchanged.
+
+        Given:
+            A None value.
+        When:
+            coerce_4dn_cv_token is called.
+        Then:
+            It should return None.
+        """
+        # Act, assert
+        assert coerce_4dn_cv_token(None) is None
 
 
 class TestExtraFile:

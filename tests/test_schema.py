@@ -4,8 +4,42 @@ from __future__ import annotations
 
 import pytest
 
-from cfdb.api.gql.schema import schema
+from cfdb.api.gql.schema import from_pydantic, schema
+from cfdb.api.gql.types import FileMetadataType
+from cfdb.models import FileMetadataModel
 from cfdb.services import locks
+
+
+def test_from_pydantic_should_convert_nested_model_lists_and_leave_json_untouched():
+    """Test from_pydantic resolves Optional[List[Model]] and passes JSON through.
+
+    Given:
+        A dumped FileMetadataModel with a nested Optional[List[ExtraFile]]
+        (extra.fourdn.extra_files) and a JSON dict field
+        (collections[].extra.hubmap.metadata).
+    When:
+        from_pydantic builds the FileMetadataType.
+    Then:
+        It should convert the nested list items to the Strawberry type
+        (the #52 peel fix) while leaving the JSON dict field untouched.
+    """
+    # Arrange
+    payload = FileMetadataModel(
+        dcc={"dcc_abbreviation": "4DN_DCIC"},
+        collections=[
+            {"biosamples": [], "extra": {"hubmap": {"metadata": {"k": "v", "n": 1}}}}
+        ],
+        extra={"fourdn": {"extra_files": [{"href": "/x", "file_format": "pairs_px2"}]}},
+    ).model_dump()
+
+    # Act
+    result = from_pydantic(FileMetadataType, payload)
+
+    # Assert
+    extra_file = result.extra.fourdn.extra_files[0]
+    assert hasattr(type(extra_file), "__strawberry_definition__")
+    assert extra_file.file_format == "pairs_px2"
+    assert result.collections[0].extra.hubmap.metadata == {"k": "v", "n": 1}
 
 
 def _make_file_doc(local_id: str, submission: str = "hubmap") -> dict:
