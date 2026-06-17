@@ -217,6 +217,10 @@ async def claim_workflow(
             {
                 "$set": {
                     "status": JobStatus.FAILED.value,
+                    # Clear the mutex discriminator in lockstep with the
+                    # terminal status so the row leaves the partial-unique
+                    # index and a fresh claim can succeed.
+                    "active": False,
                     "error": "stale — reclaimed by later request",
                     "updated_at": now,
                 }
@@ -303,7 +307,9 @@ async def mark_running(db, job_id: str) -> None:
     now = _utcnow()
     result = await jobs.update_one(
         {"job_id": job_id, "status": JobStatus.PENDING.value},
-        {"$set": {"status": JobStatus.RUNNING.value, "updated_at": now}},
+        # PENDING→RUNNING stays active; re-assert ``active`` defensively so
+        # the discriminator can never drift from the status.
+        {"$set": {"status": JobStatus.RUNNING.value, "active": True, "updated_at": now}},
     )
     if getattr(result, "matched_count", 0) == 0:
         raise RuntimeError(
@@ -384,6 +390,9 @@ async def release_workflow(
     now = _utcnow()
     update: dict[str, Any] = {
         "status": final_status.value,
+        # Terminal status releases the mutex: drop the discriminator so the
+        # row leaves the partial-unique index and is eligible for TTL reap.
+        "active": False,
         "updated_at": now,
     }
     if error is not None:

@@ -184,18 +184,25 @@ db.locks.createIndex({ active: 1 });
 
 print("Creating indexes on 'jobs' collection...");
 // Partial unique index on workflow_key enforces per-source mutex: only one
-// active job (pending|running) may exist per source file. Terminal jobs
-// fall outside the filter so fresh claims can succeed.
+// active job (pending|running) may exist per source file. The filter keys
+// on the boolean `active` discriminator (active == status in
+// ACTIVE_STATUSES), which JobRecord.to_mongo stamps and cfdb.workflows.lock
+// maintains. Terminal jobs have active=false so they fall outside the
+// filter and fresh claims can succeed.
 //
-// IMPORTANT: the status values below MUST stay in sync with
-// cfdb.workflows.models.ACTIVE_STATUSES. Renaming either side without
-// updating both desyncs the partial index from the application's
-// active-status definition and breaks the mutex contract.
+// Why `active` instead of `status: { $in: [...] }`: Amazon DocumentDB
+// rejects the $in operator inside a partialFilterExpression (only $eq,
+// $exists, $and, $gt/$gte/$lt/$lte are supported), so the predicate is
+// expressed as implicit equality on `active`.
 //
-// Compatibility: requires MongoDB >= 3.2 (partial indexes) and a
-// DocumentDB engine version that supports partialFilterExpression.
-// Re-running with a changed predicate raises IndexOptionsConflict;
-// dropIndex first if the active-status set ever changes.
+// IMPORTANT: this MUST stay in sync with operational_index_specs() in
+// cfdb/indexes.py (the application source of truth); a lockstep test
+// guards drift. Renaming/repredicating one side without the other breaks
+// the mutex contract.
+//
+// Compatibility: requires MongoDB >= 3.2 / DocumentDB 5.0 (partial
+// indexes). Re-running with a changed predicate raises
+// IndexOptionsConflict; dropIndex first if the predicate ever changes.
 ensureIndex(
     db.jobs,
     { workflow_key: 1 },
@@ -203,7 +210,7 @@ ensureIndex(
         name: "workflow_key_active_unique",
         unique: true,
         partialFilterExpression: {
-            status: { $in: ["pending", "running"] }
+            active: true
         }
     }
 );
@@ -217,9 +224,11 @@ ensureIndex(
 // TTL index on terminal job rows. Without this, every stale-reclaim
 // transition leaves a permanent ``failed`` document and the collection
 // grows unbounded for any frequently-touched workflow_key. The partial
-// filter excludes active rows so the TTL never reaps an in-flight job.
-// 7 days gives operators a window to investigate recent failures before
-// the row is reclaimed.
+// filter excludes active rows (active=true) so the TTL never reaps an
+// in-flight job. 7 days gives operators a window to investigate recent
+// failures before the row is reclaimed. Filters on `active` (not a status
+// $in list) for DocumentDB partialFilterExpression compatibility — see
+// the workflow_key_active_unique note above.
 ensureIndex(
     db.jobs,
     { updated_at: 1 },
@@ -227,7 +236,7 @@ ensureIndex(
         name: "terminal_ttl",
         expireAfterSeconds: 60 * 60 * 24 * 7,
         partialFilterExpression: {
-            status: { $in: ["completed", "failed"] }
+            active: false
         }
     }
 );

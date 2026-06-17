@@ -30,8 +30,6 @@ from dataclasses import dataclass
 
 from pymongo.errors import OperationFailure
 
-from cfdb.workflows.models import ACTIVE_STATUSES, JobStatus
-
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -45,12 +43,16 @@ __all__ = [
 #: pymongo ``OperationFailure`` codes raised when an index already exists
 #: under the requested name but with different options/key spec. We drop
 #: and recreate in that case, matching the JS ``ensureIndex`` helper's
-#: drop-on-option-change behavior so a predicate change (e.g. a new
-#: active status) re-applies cleanly instead of aborting.
+#: drop-on-option-change behavior so a predicate change (e.g. flipping the
+#: mutex partial filter) re-applies cleanly instead of aborting.
 _INDEX_CONFLICT_CODES = (85, 86)  # IndexOptionsConflict, IndexKeySpecsConflict
 
+#: ``OperationFailure.code`` for IndexNotFound — pymongo has no dedicated
+#: exception class, so a ``dropIndex`` of an absent index surfaces as this.
+_INDEX_NOT_FOUND_CODE = 27
 
-def _default_index_name(keys: list[tuple[str, int]]) -> str:
+
+def _default_index_name(keys: tuple[tuple[str, int], ...]) -> str:
     """Reproduce MongoDB's default index name for a key spec.
 
     MongoDB names an unnamed index ``field_dir[_field_dir...]`` (e.g.
@@ -68,17 +70,23 @@ class IndexSpec:
     """A single MongoDB index to ensure on a collection.
 
     ``name`` defaults to MongoDB's derived name for ``keys`` when not
-    given, so plain field indexes need only their key spec.
+    given, so plain field indexes need only their key spec. ``keys`` is
+    normalized to a tuple of ``(field, direction)`` tuples in
+    ``__post_init__`` so a frozen spec holds only immutable data
+    (callers may pass a list for convenience).
     """
 
     collection: str
-    keys: list[tuple[str, int]]
+    keys: tuple[tuple[str, int], ...]
     name: str = ""
     unique: bool = False
     partial_filter: dict | None = None
     expire_after_seconds: int | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "keys", tuple((field, direction) for field, direction in self.keys)
+        )
         if not self.name:
             object.__setattr__(self, "name", _default_index_name(self.keys))
 
@@ -94,49 +102,48 @@ class IndexSpec:
         return kwargs
 
 
-def _terminal_statuses() -> list[str]:
-    """Status values excluded from the active mutex set (the complement).
-
-    Derived from :data:`ACTIVE_STATUSES` so the ``terminal_ttl`` filter
-    stays lockstep with the enum: any status that is not active is, by
-    definition, terminal and eligible for TTL reaping.
-    """
-    return [s.value for s in JobStatus if s not in ACTIVE_STATUSES]
-
-
 def operational_index_specs() -> list[IndexSpec]:
     """Indexes that must exist before the API serves traffic.
 
     Mirrors the ``locks`` + ``jobs`` block of
-    ``scripts/create-indexes.js``. The ``jobs.workflow_key`` partial
-    filter and the ``terminal_ttl`` filter are derived from
-    :data:`ACTIVE_STATUSES` rather than hard-coded.
+    ``scripts/create-indexes.js``.
+
+    The ``jobs`` partial indexes filter on the boolean ``active``
+    discriminator (``active == status in ACTIVE_STATUSES``, stamped by
+    :meth:`JobRecord.to_mongo` and maintained by ``workflows.lock``)
+    rather than a ``status`` ``$in`` list. Amazon DocumentDB rejects the
+    ``$in`` operator inside a ``partialFilterExpression`` (only ``$eq``,
+    ``$exists``, ``$and``, ``$gt/$gte/$lt/$lte`` are supported), so the
+    predicate is expressed as implicit equality on ``active`` — which is
+    DocumentDB's documented equivalent of ``$eq`` and what the test
+    doubles also understand. ``ACTIVE_STATUSES`` remains the conceptual
+    source of truth via the ``active`` derivation.
     """
-    active = [s.value for s in ACTIVE_STATUSES]
     return [
         # locks.active — drives the sync cutover lock lookup.
         IndexSpec("locks", [("active", 1)]),
         # Partial-unique mutex: at most one active (pending|running) job
-        # per source file. Terminal jobs fall outside the filter so a
-        # fresh claim can succeed.
+        # per source file. Terminal jobs have active=False so they fall
+        # outside the filter and a fresh claim can succeed.
         IndexSpec(
             "jobs",
             [("workflow_key", 1)],
             name="workflow_key_active_unique",
             unique=True,
-            partial_filter={"status": {"$in": active}},
+            partial_filter={"active": True},
         ),
         IndexSpec("jobs", [("job_id", 1)], name="job_id_unique", unique=True),
         IndexSpec("jobs", [("status", 1), ("updated_at", 1)], name="status_updated_at"),
         # TTL on terminal rows so the collection doesn't grow unbounded.
-        # The partial filter excludes active rows so an in-flight job is
-        # never reaped. 7 days gives operators a window to investigate.
+        # The partial filter excludes active rows (active=True) so an
+        # in-flight job is never reaped. 7 days gives operators a window
+        # to investigate.
         IndexSpec(
             "jobs",
             [("updated_at", 1)],
             name="terminal_ttl",
             expire_after_seconds=60 * 60 * 24 * 7,
-            partial_filter={"status": {"$in": _terminal_statuses()}},
+            partial_filter={"active": False},
         ),
     ]
 
@@ -340,6 +347,25 @@ def all_index_specs() -> list[IndexSpec]:
     return operational_index_specs() + data_index_specs()
 
 
+async def _conflicting_index_name(collection, spec: IndexSpec) -> str:
+    """Resolve the name of the index conflicting with ``spec``.
+
+    On an options/key conflict the existing index may be registered under
+    a different name than ``spec.name`` (e.g. a legacy unnamed index on
+    the same key, or a predicate flipped on the same key pattern). Match
+    by key pattern via ``index_information`` so the recreate path drops
+    the right index rather than blindly dropping ``spec.name`` and tripping
+    IndexNotFound. Falls back to ``spec.name`` when no key match is found.
+    """
+    target_keys = list(spec.keys)
+    info = await collection.index_information()
+    for existing_name, existing in info.items():
+        existing_keys = [tuple(pair) for pair in (existing.get("key") or [])]
+        if existing_keys == target_keys:
+            return existing_name
+    return spec.name
+
+
 async def ensure_indexes(db, specs: list[IndexSpec]) -> int:
     """Idempotently ensure ``specs`` exist on ``db``.
 
@@ -347,26 +373,44 @@ async def ensure_indexes(db, specs: list[IndexSpec]) -> int:
     matching spec is a no-op, so the steady state makes zero changes; an
     index whose options changed (``IndexOptionsConflict`` /
     ``IndexKeySpecsConflict``) is dropped and recreated so a predicate
-    change re-applies cleanly. Returns the number of specs ensured.
+    change re-applies cleanly. The conflicting index is located by key
+    pattern (not assumed to be named ``spec.name``), and an IndexNotFound
+    on the drop is swallowed so a racing/already-dropped index doesn't
+    abort the recreate. Returns the number of specs ensured.
+
+    Note: the drop+recreate path momentarily leaves the index absent. For
+    the ``workflow_key_active_unique`` mutex that is a brief window in
+    which a concurrent claim on another instance could admit a duplicate
+    active row — but this path only fires on a predicate change, not on
+    steady-state startup, so the exposure is limited to a deliberate
+    rollout. It is logged at WARNING so such rebuilds are visible.
 
     ``db`` is a Motor ``AsyncIOMotorDatabase`` (or an API-compatible
-    async stand-in); ``create_index`` / ``drop_index`` are awaited.
+    async stand-in); ``create_index`` / ``drop_index`` /
+    ``index_information`` are awaited.
     """
     for spec in specs:
         collection = db[spec.collection]
         kwargs = spec.create_kwargs()
+        keys = list(spec.keys)
         try:
-            await collection.create_index(spec.keys, **kwargs)
+            await collection.create_index(keys, **kwargs)
         except OperationFailure as exc:
-            if exc.code in _INDEX_CONFLICT_CODES:
-                logger.info(
-                    "Index %s.%s options changed; dropping and recreating",
-                    spec.collection,
-                    spec.name,
-                )
-                await collection.drop_index(spec.name)
-                await collection.create_index(spec.keys, **kwargs)
-            else:
+            if exc.code not in _INDEX_CONFLICT_CODES:
                 raise
+            drop_name = await _conflicting_index_name(collection, spec)
+            logger.warning(
+                "Index %s.%s conflicts with existing %r; dropping and "
+                "recreating (the index is briefly absent during rebuild)",
+                spec.collection,
+                spec.name,
+                drop_name,
+            )
+            try:
+                await collection.drop_index(drop_name)
+            except OperationFailure as drop_exc:
+                if drop_exc.code != _INDEX_NOT_FOUND_CODE:
+                    raise
+            await collection.create_index(keys, **kwargs)
     logger.info("Ensured %d index(es)", len(specs))
     return len(specs)
