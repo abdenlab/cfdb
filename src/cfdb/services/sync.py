@@ -22,6 +22,7 @@ from cfdb.dcc_registry import (
     normalize_dcc_name,
 )
 from cfdb.downloader import cleanup_zip, download_file, extract_zip
+from cfdb.indexes import data_index_specs, ensure_indexes
 from cfdb.services import locks
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,15 @@ async def _sync_dccs(task: SyncTask) -> None:
             await _sync_c2m2_zip(task, data_path, downloads_path)
 
         logger.info(f"{dcc.upper()} synced successfully")
+
+    # Ensure the data-collection query indexes now that data is loaded.
+    # Idempotent: a no-op on subsequent syncs. Kept out of API startup
+    # (operational indexes only) so we never build these against an
+    # empty database on a cold start.
+    task.current_step = "indexing"
+    task.progress = "Ensuring data indexes..."
+    logger.info(task.progress)
+    await ensure_indexes(api.db, data_index_specs())
 
     task.progress = "All DCCs synced successfully"
     logger.info(task.progress)

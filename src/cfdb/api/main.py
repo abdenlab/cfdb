@@ -28,6 +28,7 @@ from cfdb.workflows.cache import (
     _build_s3_client,
     check_s3_bucket_or_raise,
 )
+from cfdb.indexes import ensure_indexes, operational_index_specs
 from cfdb.workflows.credentials import build_worker_credentials
 from cfdb.workflows.discovery import EcsDiscovery
 from cfdb.workflows.executor import WoolExecutor
@@ -98,20 +99,20 @@ async def _reset_api_globals() -> None:
     api.wool_context = None
 
 
-async def _assert_jobs_indexes(db, log: logging.Logger) -> None:
-    """Verify ``scripts/create-indexes.js`` has been applied to ``jobs``.
+async def _warn_if_jobs_index_out_of_sync(db, log: logging.Logger) -> None:
+    """Warn if the ``jobs.workflow_key`` mutex index is missing or stale.
 
-    Specifically checks that the partial-unique index on
-    ``workflow_key`` filtered to active statuses exists. Without it the
-    workflow mutex doesn't actually serialize concurrent dispatches.
+    Belt-and-suspenders check run *after* :func:`ensure_indexes` has
+    created the operational set. The partial-unique index on
+    ``workflow_key`` (filtered to active statuses) is what makes the
+    workflow mutex actually serialize concurrent dispatches; if it is
+    somehow absent or its predicate no longer matches
+    ``ACTIVE_STATUSES``, surface it loudly so a desync is visible in the
+    logs — but don't crash the API, since the ensure step is now the
+    bootstrap and a transient read here shouldn't take the service down.
 
-    The expected filter is derived from ``ACTIVE_STATUSES`` so Python is
-    the single source of truth — if a new status is added to the enum
-    without a matching update to ``scripts/create-indexes.js``, this
-    startup check fires loudly rather than silently admitting duplicate
-    active rows under the partial index. The ``$in`` list is sorted on
-    both sides to handle ordering quirks across MongoDB and DocumentDB
-    versions.
+    The ``$in`` list is sorted on both sides to handle ordering quirks
+    across MongoDB and DocumentDB versions.
     """
     info = await db.jobs.index_information()
     expected_active = sorted(s.value for s in ACTIVE_STATUSES)
@@ -131,16 +132,11 @@ async def _assert_jobs_indexes(db, log: logging.Logger) -> None:
             continue
         if sorted(in_values) == expected_active:
             return
-    log.error(
+    log.warning(
         "jobs.workflow_key partial-unique index missing or out of sync "
-        "with ACTIVE_STATUSES=%s; run scripts/create-indexes.js",
+        "with ACTIVE_STATUSES=%s after ensure_indexes; the workflow mutex "
+        "may not serialize concurrent dispatches",
         expected_active,
-    )
-    raise RuntimeError(
-        "Required Mongo index 'jobs.workflow_key' (partial-unique, "
-        f"filter status in {expected_active}) not found; run "
-        "scripts/create-indexes.js against the target database before "
-        "starting the API."
     )
 
 
@@ -255,13 +251,17 @@ async def lifespan(_: FastAPI):
         # cannot silently degrade to PoC fallback.
         profile = WorkflowProfile.from_env()
 
-        # Fail-fast if the workflow mutex index is missing. The partial
+        # Self-heal the operational indexes before serving. The partial
         # unique index on ``jobs.workflow_key`` is the database-side
         # enforcement of "exactly one active workflow per source file";
         # without it, ``claim_workflow`` silently degrades to "no mutex"
-        # and every miss dispatches a duplicate workflow.
+        # and every miss dispatches a duplicate workflow. Ensuring them
+        # here (idempotently) means a fresh DocumentDB no longer needs a
+        # manual ``scripts/create-indexes.js`` run to boot. The warning
+        # check that follows is belt-and-suspenders against a desync.
         if profile is not None:
-            await _assert_jobs_indexes(api.db, log)
+            await ensure_indexes(api.db, operational_index_specs())
+            await _warn_if_jobs_index_out_of_sync(api.db, log)
 
             # Fail-fast on mkdir error: an operator who explicitly set
             # SYNC_DATA_DIR has signalled "workflows on"; silently
