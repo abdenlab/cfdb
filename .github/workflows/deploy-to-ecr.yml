@@ -44,12 +44,11 @@ jobs:
       # bundles UCSC's x86_64-only bigBedToBed. The cfdb-wool repository must
       # exist in ECR (created out of band, like the cfdb repository).
       #
-      # This publishes the image only — it does NOT roll the worker fleet.
-      # The worker task definition pins `Image: !Ref WorkerImageURI`, so
-      # rolling workers is a deliberate `aws cloudformation deploy` of the
-      # workers stack with WorkerImageURI set to the :$SHA_TAG URI pushed
-      # here (see README "Deploying the CloudFormation stacks"). :latest is
-      # pushed only as a convenience pointer.
+      # This step only builds + pushes the image; the "Deploy worker fleet"
+      # step below redeploys the workers stack with WorkerImageURI set to the
+      # :$SHA_TAG URI, which registers a new task-definition revision that
+      # EcsProvisioner launches on the next dispatch. :latest is pushed only
+      # as a convenience pointer; the task def pins the immutable :$SHA_TAG.
       - name: Build wool worker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -83,12 +82,50 @@ jobs:
           docker push $REGISTRY/$REPOSITORY:latest
           docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
-      - name: Deploy to ECS
+      # Deploy the freshly-pushed images by redeploying the CloudFormation
+      # stacks with the SHA-pinned image URIs. This is the real deploy:
+      # `aws cloudformation deploy` registers a new task-definition revision
+      # for the changed image and rolls the service, so each merge to master
+      # ships new code for BOTH the API and the worker fleet in lockstep.
+      #
+      # CloudFormation reuses every other parameter's previous value, so only
+      # the image URI is overridden. `--no-fail-on-empty-changeset` lets a
+      # no-op redeploy (unchanged SHA) succeed instead of erroring. Immutable
+      # `:<sha>` pinning is kept (not `:latest`), so the running fleet is
+      # traceable to a commit and rollback is a redeploy of a prior SHA.
+      #
+      # Workers are deployed first because the backend stack imports the
+      # workers stack's exports.
+      #
+      # Requires the CI role (AWS_IAM_ROLE) to be able to deploy these stacks:
+      # cloudformation:*ChangeSet*/DescribeStacks/DescribeStackEvents/
+      # GetTemplate*, ecs:RegisterTaskDefinition/UpdateService/Describe*/
+      # DeregisterTaskDefinition, and iam:PassRole on the stacks' task and
+      # execution roles. See README "Deploying the CloudFormation stacks".
+      - name: Deploy worker fleet (CloudFormation)
         env:
-          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
-          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          WORKERS_STACK: ${{ secrets.WORKERS_STACK_NAME }}
         run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --force-new-deployment
+          SHA_TAG=${GITHUB_SHA::8}
+          aws cloudformation deploy \
+            --region us-east-2 \
+            --stack-name "$WORKERS_STACK" \
+            --template-file cloudformation/workers.yml \
+            --parameter-overrides WorkerImageURI=$REGISTRY/cfdb-wool:$SHA_TAG \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy API (CloudFormation)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          BACKEND_STACK: ${{ secrets.BACKEND_STACK_NAME }}
+        run: |
+          SHA_TAG=${GITHUB_SHA::8}
+          aws cloudformation deploy \
+            --region us-east-2 \
+            --stack-name "$BACKEND_STACK" \
+            --template-file cloudformation/backend.yml \
+            --parameter-overrides ImageURI=$REGISTRY/cfdb:$SHA_TAG \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset

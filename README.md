@@ -99,7 +99,14 @@ Production runs on four CloudFormation stacks under `cloudformation/`. Deploy th
 
 Tear down in the reverse order (`backend` → `workers` → `database` → `network`); `backend` imports the worker exports, so it must be deleted first. The `cfdb-wool` ECR repository is a prerequisite created out of band (like the `cfdb` repository); consider giving it an `IMMUTABLE` tag policy and a lifecycle policy to prune untagged images.
 
-**Rolling the worker fleet.** The CI pipeline builds, scans, and pushes the worker image to `cfdb-wool:<sha>` on every merge to `master`, but it does not roll workers — the worker task definition pins `Image: !Ref WorkerImageURI`. To deploy a new worker image, redeploy the workers stack with the SHA-tagged URI:
+**CI auto-deploy.** Every merge to `master` runs `.github/workflows/deploy-to-ecr.yml`, which builds and pushes the API (`cfdb:<sha>`) and worker (`cfdb-wool:<sha>`) images, then **deploys both** by running `aws cloudformation deploy` on the workers stack (`WorkerImageURI=…/cfdb-wool:<sha>`) and the backend stack (`ImageURI=…/cfdb:<sha>`). CloudFormation reuses every other parameter's previous value, so only the image URI changes; it registers a new task-definition revision and rolls the service. The API and the worker fleet always advance to the same commit in lockstep. Immutable `:<sha>` pinning is kept (not `:latest`), so the running fleet is traceable to a commit and **rollback is a redeploy of a prior SHA** (re-run the workflow on that commit, or run the two `cloudformation deploy` commands by hand with the prior `:<sha>`). Worker task-def revisions take effect on the next `EcsProvisioner` dispatch; the API service rolls immediately.
+
+This needs two pieces of one-time configuration:
+
+- **GitHub secrets** (in addition to the existing `AWS_IAM_ROLE`): `BACKEND_STACK_NAME` and `WORKERS_STACK_NAME` — the CloudFormation stack names to deploy (e.g. `cfdb-backend-dev` and `cfdb-workers-dev`).
+- **CI role IAM**: the `AWS_IAM_ROLE` the workflow assumes must be able to deploy those stacks — `cloudformation:*ChangeSet*`, `cloudformation:DescribeStacks`/`DescribeStackEvents`/`GetTemplate*`, `ecs:RegisterTaskDefinition`/`UpdateService`/`Describe*`/`DeregisterTaskDefinition`, and `iam:PassRole` on the stacks' task and execution roles. An image-only redeploy only updates the task definition + service, but CloudFormation still executes the changeset as this role.
+
+To deploy out of band (rollback, or a manual redeploy), run the same commands the workflow runs:
 
 ```bash
 aws cloudformation deploy \
@@ -107,9 +114,12 @@ aws cloudformation deploy \
   --template-file cloudformation/workers.yml \
   --parameter-overrides WorkerImageURI=<account>.dkr.ecr.<region>.amazonaws.com/cfdb-wool:<sha> \
   --capabilities CAPABILITY_IAM
+aws cloudformation deploy \
+  --stack-name <backend-stack> \
+  --template-file cloudformation/backend.yml \
+  --parameter-overrides ImageURI=<account>.dkr.ecr.<region>.amazonaws.com/cfdb:<sha> \
+  --capabilities CAPABILITY_IAM
 ```
-
-This registers a new task-definition revision that `EcsProvisioner` launches on the next workflow dispatch. Pin to an immutable `:<sha>` (not `:latest`) so the running fleet is traceable to a commit and rollback is a redeploy with the prior SHA.
 
 **Tearing down the cache.** CloudFormation cannot delete a non-empty S3 bucket, so empty the `CacheBucket` before deleting the workers stack or the delete will fail and roll back.
 
