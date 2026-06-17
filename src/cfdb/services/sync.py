@@ -141,11 +141,13 @@ async def _sync_dccs(task: SyncTask) -> None:
     # Ensure the data-collection query indexes now that data is loaded.
     # Idempotent: a no-op on subsequent syncs. Kept out of API startup
     # (operational indexes only) so we never build these against an
-    # empty database on a cold start.
-    task.current_step = "indexing"
-    task.progress = "Ensuring data indexes..."
-    logger.info(task.progress)
-    await ensure_indexes(api.db, data_index_specs())
+    # empty database on a cold start; likewise skip when no DCC was
+    # actually synced so an empty request doesn't build them either.
+    if task.dcc_names:
+        task.current_step = "indexing"
+        task.progress = "Ensuring data indexes..."
+        logger.info(task.progress)
+        await ensure_indexes(api.db, data_index_specs())
 
     task.progress = "All DCCs synced successfully"
     logger.info(task.progress)
