@@ -1,23 +1,26 @@
 """CORS middleware tests for the FastAPI application."""
 
-from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import pytest
+from mongomock_motor import AsyncMongoMockClient
 from starlette.testclient import TestClient
-
-
-@asynccontextmanager
-async def _noop_lifespan(_app):
-    yield
 
 
 @pytest.fixture()
 def client():
-    with patch("cfdb.api.main.lifespan", _noop_lifespan):
-        from cfdb.api.main import app
+    # The app binds the real lifespan at import, so the lifespan runs on
+    # TestClient enter — and it ensures the operational indexes, which
+    # needs a database. Back it with an in-memory mongomock client and
+    # disable the workflow subsystem so the CORS test exercises only the
+    # middleware, no real MongoDB or wool pool.
+    from cfdb.api import main
 
-        with TestClient(app) as c:
+    with (
+        patch.object(main, "create_mongodb_client", return_value=AsyncMongoMockClient()),
+        patch.object(main.WorkflowProfile, "from_env", return_value=None),
+    ):
+        with TestClient(main.app) as c:
             yield c
 
 

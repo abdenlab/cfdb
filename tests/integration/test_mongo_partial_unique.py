@@ -52,9 +52,7 @@ async def mongomock_db():
     await db[JOBS_COLLECTION].create_index(
         [("workflow_key", 1)],
         unique=True,
-        partialFilterExpression={
-            "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-        },
+        partialFilterExpression={"active": True},
     )
     yield db
 

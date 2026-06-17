@@ -138,6 +138,15 @@ class JobRecord(BaseModel):
             "job_id": self.job_id,
             "workflow_key": self.workflow_key,
             "status": self.status.value,
+            # ``active`` is a pure DB projection of ``status`` (active ==
+            # status in ACTIVE_STATUSES). It backs the partial-filter
+            # predicates on the ``jobs`` indexes: Amazon DocumentDB rejects
+            # ``$in`` inside a partialFilterExpression, so the mutex /
+            # TTL indexes filter on this boolean with implicit equality
+            # ({"active": true}/{"active": false}) instead of a status
+            # ``$in`` list. ``lock.py`` keeps it in lockstep on every
+            # status-changing write.
+            "active": self.status in ACTIVE_STATUSES,
             "dcc": self.dcc,
             "local_id": self.local_id,
             "md5": self.md5,

@@ -28,10 +28,11 @@ from cfdb.workflows.cache import (
     _build_s3_client,
     check_s3_bucket_or_raise,
 )
+from cfdb.db import mongo_client_kwargs
+from cfdb.indexes import ensure_indexes, operational_index_specs
 from cfdb.workflows.credentials import build_worker_credentials
 from cfdb.workflows.discovery import EcsDiscovery
 from cfdb.workflows.executor import WoolExecutor
-from cfdb.workflows.models import ACTIVE_STATUSES
 from cfdb.workflows.processors.bam import BamIndexProcessor
 from cfdb.workflows.processors.registry import default_registry
 from cfdb.workflows.processors.tabix import TabixIntervalProcessor
@@ -98,49 +99,45 @@ async def _reset_api_globals() -> None:
     api.wool_context = None
 
 
-async def _assert_jobs_indexes(db, log: logging.Logger) -> None:
-    """Verify ``scripts/create-indexes.js`` has been applied to ``jobs``.
+def _selects_active_rows(pfe: object) -> bool:
+    """True if a partialFilterExpression selects active (active=True) rows.
 
-    Specifically checks that the partial-unique index on
-    ``workflow_key`` filtered to active statuses exists. Without it the
-    workflow mutex doesn't actually serialize concurrent dispatches.
+    Accepts both the implicit-equality form ``{"active": True}`` and the
+    explicit ``{"active": {"$eq": True}}`` form, since MongoDB and
+    DocumentDB may echo either shape back from ``index_information``.
+    """
+    if not isinstance(pfe, dict):
+        return False
+    clause = pfe.get("active")
+    if clause is True:
+        return True
+    return isinstance(clause, dict) and clause.get("$eq") is True
 
-    The expected filter is derived from ``ACTIVE_STATUSES`` so Python is
-    the single source of truth — if a new status is added to the enum
-    without a matching update to ``scripts/create-indexes.js``, this
-    startup check fires loudly rather than silently admitting duplicate
-    active rows under the partial index. The ``$in`` list is sorted on
-    both sides to handle ordering quirks across MongoDB and DocumentDB
-    versions.
+
+async def _warn_if_jobs_index_out_of_sync(db, log: logging.Logger) -> None:
+    """Warn if the ``jobs.workflow_key`` mutex index is missing or stale.
+
+    Belt-and-suspenders check run *after* :func:`ensure_indexes` has
+    created the operational set. The partial-unique index on
+    ``workflow_key`` (filtered to the ``active`` discriminator) is what
+    makes the workflow mutex actually serialize concurrent dispatches; if
+    it is somehow absent or its predicate no longer selects active rows,
+    surface it loudly so a desync is visible in the logs — but don't
+    crash the API, since the ensure step is now the bootstrap and a
+    transient read here shouldn't take the service down.
     """
     info = await db.jobs.index_information()
-    expected_active = sorted(s.value for s in ACTIVE_STATUSES)
     for spec in info.values():
         key_pairs = spec.get("key") or []
         keys = [k for k, _ in key_pairs]
         if not (keys == ["workflow_key"] and spec.get("unique")):
             continue
-        pfe = spec.get("partialFilterExpression")
-        if not isinstance(pfe, dict):
-            continue
-        status_clause = pfe.get("status")
-        if not isinstance(status_clause, dict):
-            continue
-        in_values = status_clause.get("$in")
-        if not isinstance(in_values, list):
-            continue
-        if sorted(in_values) == expected_active:
+        if _selects_active_rows(spec.get("partialFilterExpression")):
             return
-    log.error(
-        "jobs.workflow_key partial-unique index missing or out of sync "
-        "with ACTIVE_STATUSES=%s; run scripts/create-indexes.js",
-        expected_active,
-    )
-    raise RuntimeError(
-        "Required Mongo index 'jobs.workflow_key' (partial-unique, "
-        f"filter status in {expected_active}) not found; run "
-        "scripts/create-indexes.js against the target database before "
-        "starting the API."
+    log.warning(
+        "jobs.workflow_key active partial-unique index missing or out of "
+        "sync after ensure_indexes; the workflow mutex may not serialize "
+        "concurrent dispatches"
     )
 
 
@@ -219,23 +216,14 @@ async def _build_discovery(profile: WorkflowProfile) -> AsyncIterator[object]:
 def create_mongodb_client() -> AsyncIOMotorClient:
     """Create MongoDB client with optional TLS authentication."""
     log = logging.getLogger(__name__)
-    kwargs: dict = {}
-
-    if not api.MONGODB_RETRY_WRITES:
-        kwargs["retryWrites"] = False
-
-    if api.MONGODB_TLS_ENABLED:
+    kwargs = mongo_client_kwargs()
+    if kwargs.get("tls"):
         log.info("Connecting to MongoDB at %s with TLS", redact_url(api.DATABASE_URL))
-        return AsyncIOMotorClient(
-            api.DATABASE_URL,
-            tls=True,
-            tlsCAFile=api.MONGODB_CA_PATH,
-            **kwargs,
+    else:
+        log.info(
+            "Connecting to MongoDB at %s (no authentication)",
+            redact_url(api.DATABASE_URL),
         )
-    log.info(
-        "Connecting to MongoDB at %s (no authentication)",
-        redact_url(api.DATABASE_URL),
-    )
     return AsyncIOMotorClient(api.DATABASE_URL, **kwargs)
 
 
@@ -255,14 +243,21 @@ async def lifespan(_: FastAPI):
         # cannot silently degrade to PoC fallback.
         profile = WorkflowProfile.from_env()
 
-        # Fail-fast if the workflow mutex index is missing. The partial
-        # unique index on ``jobs.workflow_key`` is the database-side
-        # enforcement of "exactly one active workflow per source file";
-        # without it, ``claim_workflow`` silently degrades to "no mutex"
-        # and every miss dispatches a duplicate workflow.
-        if profile is not None:
-            await _assert_jobs_indexes(api.db, log)
+        # Self-heal the operational indexes before serving, unconditionally
+        # (i.e. regardless of whether the workflow subsystem is enabled).
+        # The ``locks`` collection backs the sync/cutover locks even when
+        # SYNC_DATA_DIR is unset, and the partial-unique index on
+        # ``jobs.workflow_key`` is the database-side enforcement of
+        # "exactly one active workflow per source file" — without it,
+        # ``claim_workflow`` silently degrades to "no mutex" and every
+        # miss dispatches a duplicate workflow. Ensuring them here
+        # (idempotently) means a fresh DocumentDB no longer needs a manual
+        # ``scripts/create-indexes.js`` run to boot. The warning check that
+        # follows is belt-and-suspenders against a desync.
+        await ensure_indexes(api.db, operational_index_specs())
+        await _warn_if_jobs_index_out_of_sync(api.db, log)
 
+        if profile is not None:
             # Fail-fast on mkdir error: an operator who explicitly set
             # SYNC_DATA_DIR has signalled "workflows on"; silently
             # degrading to disabled hides misconfiguration (wrong path,

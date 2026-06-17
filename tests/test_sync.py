@@ -4,11 +4,74 @@ from __future__ import annotations
 
 import pytest
 
+from cfdb.services import sync as sync_module
 from cfdb.services.sync import (
+    SyncTask,
     _enrich_hubmap_collections_and_subjects,
     _enrich_hubmap_files,
     _prune_non_public_hubmap_raw_records,
+    _sync_dccs,
 )
+from cfdb.indexes import data_index_specs
+
+
+class TestSyncDccsDataIndexing:
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_ensure_data_indexes_after_load(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test that a sync ensures the data indexes after loading.
+
+        Given:
+            A sync of one DCC with the per-DCC load and the applier mocked.
+        When:
+            ``_sync_dccs`` runs.
+        Then:
+            It should ensure ``data_index_specs()`` once, after the load
+            loop.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(sync_module, "_sync_encode", mocker.AsyncMock())
+        ensure_mock = mocker.patch.object(
+            sync_module, "ensure_indexes", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act
+        await _sync_dccs(task)
+
+        # Assert
+        ensure_mock.assert_awaited_once()
+        specs = ensure_mock.await_args.args[1]
+        assert [s.name for s in specs] == [s.name for s in data_index_specs()]
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_skip_indexing_when_no_dccs(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test that an empty sync does not build data indexes.
+
+        Given:
+            A sync task with no DCC names.
+        When:
+            ``_sync_dccs`` runs.
+        Then:
+            It should not call the index applier (nothing was loaded).
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        ensure_mock = mocker.patch.object(
+            sync_module, "ensure_indexes", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t2", dcc_names=[])
+
+        # Act
+        await _sync_dccs(task)
+
+        # Assert
+        ensure_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
