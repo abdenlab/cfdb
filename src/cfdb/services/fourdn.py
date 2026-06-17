@@ -127,6 +127,31 @@ def extract_experiment_accession(persistent_id: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def _parse_extra_files(extra_files_raw: list) -> list[dict]:
+    """Normalize 4DN ``extra_files`` entries for persistence.
+
+    Copies the ``href`` / ``md5sum`` / ``file_size`` / ``file_format``
+    fields from each raw entry, dropping any that are absent. The 4DN
+    portal API returns ``file_format`` as an embedded CV object carrying
+    the token under ``display_title``; store just that token (a string)
+    so persisted documents match the ``ExtraFile.file_format`` type and
+    the ``/index`` sidecar normalization. Entries that yield no fields
+    are dropped.
+    """
+    parsed_files: list[dict] = []
+    for ef in extra_files_raw:
+        parsed: dict = {}
+        for k in ("href", "md5sum", "file_size", "file_format"):
+            v = ef.get(k)
+            if k == "file_format" and isinstance(v, dict):
+                v = v.get("display_title")
+            if v is not None:
+                parsed[k] = v
+        if parsed:
+            parsed_files.append(parsed)
+    return parsed_files
+
+
 async def fetch_file_metadata_bulk() -> dict[str, dict]:
     """
     Fetch file metadata from the 4DN Search API for FileProcessed and FileFastq types.
@@ -224,19 +249,9 @@ async def fetch_file_metadata_bulk() -> dict[str, dict]:
                                 entry[key] = val
 
                     # Extra files (index files like .px2, .bai)
-                    extra_files_raw = item.get("extra_files", [])
-                    if extra_files_raw:
-                        extra_files = []
-                        for ef in extra_files_raw:
-                            parsed = {}
-                            for k in ("href", "md5sum", "file_size", "file_format"):
-                                v = ef.get(k)
-                                if v is not None:
-                                    parsed[k] = v
-                            if parsed:
-                                extra_files.append(parsed)
-                        if extra_files:
-                            entry["extra_files"] = extra_files
+                    extra_files = _parse_extra_files(item.get("extra_files", []))
+                    if extra_files:
+                        entry["extra_files"] = extra_files
 
                     if entry:
                         results[accession] = entry

@@ -31,6 +31,23 @@ class ExtraFile(BaseModel):
     file_size: Optional[int] = None
     file_format: Optional[str] = None
 
+    @field_validator("file_format", mode="before")
+    @classmethod
+    def _coerce_file_format_token(cls, value):
+        """Coerce a 4DN CV-object ``file_format`` to its string token.
+
+        The 4DN portal API represents ``extra_files[].file_format`` as an
+        embedded CV object carrying the token under ``display_title``, and
+        documents persisted by the sync may hold that dict. Extract the
+        token so the field deserializes as a string instead of raising —
+        matching the normalization the ``/index`` sidecar path applies on
+        read. Strings and ``None`` pass through unchanged; a dict without
+        ``display_title`` becomes ``None``.
+        """
+        if isinstance(value, dict):
+            return value.get("display_title")
+        return value
+
 
 class EnrichedFourdnFile(BaseModel):
     """4DN file-level metadata from the materializer and Search API."""
