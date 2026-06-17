@@ -21,6 +21,7 @@ import click
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from cfdb import api
+from cfdb.db import mongo_client_kwargs
 from cfdb.indexes import (
     all_index_specs,
     data_index_specs,
@@ -43,16 +44,11 @@ _SCOPES = {
 def _build_client() -> AsyncIOMotorClient:
     """Create a Motor client honoring the API's MongoDB env config.
 
-    Mirrors ``cfdb.api.main.create_mongodb_client`` (TLS + retry-writes)
-    without importing the FastAPI app, so the CLI stays lightweight.
+    Shares the connection kwargs with ``cfdb.api.main.create_mongodb_client``
+    via :func:`cfdb.db.mongo_client_kwargs` (TLS + retry-writes) without
+    importing the FastAPI app, so the CLI stays lightweight.
     """
-    kwargs: dict = {}
-    if not api.MONGODB_RETRY_WRITES:
-        kwargs["retryWrites"] = False
-    if api.MONGODB_TLS_ENABLED:
-        kwargs["tls"] = True
-        kwargs["tlsCAFile"] = api.MONGODB_CA_PATH
-    return AsyncIOMotorClient(api.DATABASE_URL, **kwargs)
+    return AsyncIOMotorClient(api.DATABASE_URL, **mongo_client_kwargs())
 
 
 async def run(scope: str) -> int:
