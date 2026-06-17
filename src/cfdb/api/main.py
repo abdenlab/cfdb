@@ -191,24 +191,27 @@ def _build_provisioner(profile: WorkflowProfile) -> Optional[EcsProvisioner]:
 async def _build_discovery(profile: WorkflowProfile) -> AsyncIterator[object]:
     """Build the wool-compatible discovery layer for ``profile``.
 
-    The ``ecs`` profile yields an :class:`EcsDiscovery` context — the
-    background ``ListTasks`` / ``DescribeTasks`` poller starts on
-    ``__aenter__`` and is cancelled on ``__aexit__``. The ``local``
-    and ``s3-cached`` profiles fall through to :class:`LanDiscovery`
-    over zeroconf/mDNS against a manually-started wool pool.
+    The ``ecs`` profile yields an :class:`EcsDiscovery`; the ``local``
+    and ``s3-cached`` profiles yield a :class:`LanDiscovery` over
+    zeroconf/mDNS against a manually-started wool pool.
 
-    Either branch yields a shape ``wool.WorkerPool`` accepts via its
-    ``discovery=`` arg so the lifespan wires it through without
-    branching at the call site.
+    Both branches yield the discovery object **un-entered**.
+    ``wool.WorkerPool.__aenter__`` enters whatever is passed to its
+    ``discovery=`` arg itself (``create_proxy`` ->
+    ``_enter_context(discovery)``), so the pool owns the discovery
+    lifecycle — its ``ListTasks`` / ``DescribeTasks`` poller starts when
+    the pool starts and is cancelled when the pool exits. Entering it
+    here as well would call ``EcsDiscovery.__aenter__`` twice and trip
+    its re-entry guard (the LAN profile already relied on this, which is
+    why only the ECS profile crashed on startup).
     """
     if profile.ecs is not None and profile.ecs.task_family is not None:
-        async with EcsDiscovery(
+        yield EcsDiscovery(
             cluster=profile.ecs.cluster,
             task_definition_family=profile.ecs.task_family,
             endpoint_url=profile.aws_endpoint_url,
             region_name=profile.aws_region,
-        ) as discovery:
-            yield discovery
+        )
         return
     yield LanDiscovery(api.WORKFLOW_POOL_NAMESPACE)
 
