@@ -332,6 +332,28 @@ class TestJobRecord:
         # Assert
         assert payload["status"] == status.value
 
+    @pytest.mark.parametrize("status", list(JobStatus))
+    def test_to_mongo_should_derive_active_from_status(self, status):
+        """Test that to_mongo stamps the active mutex discriminator.
+
+        Given:
+            Each JobStatus enum value.
+        When:
+            ``to_mongo`` is invoked.
+        Then:
+            ``payload["active"]`` should be True exactly for the active
+            statuses, so the boolean backing the partial-unique index
+            stays in lockstep with ACTIVE_STATUSES.
+        """
+        # Arrange
+        job = _make_job(status=status)
+
+        # Act
+        payload = job.to_mongo()
+
+        # Assert
+        assert payload["active"] is (status in ACTIVE_STATUSES)
+
     def test_to_mongo_should_isolate_artifact_cache_keys_dict_from_caller_mutations(
         self,
     ):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from click.testing import CliRunner
 
+from cfdb import api as cfg
 from cfdb import ensure_indexes as ei
 from cfdb.indexes import all_index_specs, data_index_specs, operational_index_specs
 
@@ -67,6 +68,65 @@ def test_main_should_default_to_all_scope(mocker):
     assert result.exit_code == 0
     passed_specs = ensure_mock.await_args.args[1]
     assert [s.name for s in passed_specs] == [s.name for s in all_index_specs()]
+
+
+@pytest.mark.asyncio
+async def test_run_should_build_a_tls_client_when_tls_enabled(mocker):
+    """Test run() honors the MongoDB TLS env config.
+
+    Given:
+        ``MONGODB_TLS_ENABLED`` set with a CA path and the applier mocked.
+    When:
+        ``run`` is awaited.
+    Then:
+        It should construct the Motor client with TLS + CA file, return
+        the ensured count, and close the client.
+    """
+    # Arrange
+    mocker.patch.object(cfg, "MONGODB_TLS_ENABLED", True)
+    mocker.patch.object(cfg, "MONGODB_CA_PATH", "/ca.pem")
+    mocker.patch.object(cfg, "MONGODB_RETRY_WRITES", False)
+    client = mocker.MagicMock()
+    factory = mocker.patch.object(ei, "AsyncIOMotorClient", return_value=client)
+    mocker.patch.object(ei, "ensure_indexes", mocker.AsyncMock(return_value=3))
+
+    # Act
+    count = await ei.run("operational")
+
+    # Assert
+    assert count == 3
+    _, kwargs = factory.call_args
+    assert kwargs.get("tls") is True
+    assert kwargs.get("tlsCAFile") == "/ca.pem"
+    assert kwargs.get("retryWrites") is False
+    client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_should_build_a_plain_client_when_tls_disabled(mocker):
+    """Test run() builds a plaintext client when TLS is off.
+
+    Given:
+        ``MONGODB_TLS_ENABLED`` false and the applier mocked.
+    When:
+        ``run`` is awaited.
+    Then:
+        It should construct the client without TLS options.
+    """
+    # Arrange
+    mocker.patch.object(cfg, "MONGODB_TLS_ENABLED", False)
+    mocker.patch.object(cfg, "MONGODB_RETRY_WRITES", False)
+    client = mocker.MagicMock()
+    factory = mocker.patch.object(ei, "AsyncIOMotorClient", return_value=client)
+    mocker.patch.object(ei, "ensure_indexes", mocker.AsyncMock(return_value=0))
+
+    # Act
+    await ei.run("all")
+
+    # Assert
+    _, kwargs = factory.call_args
+    assert "tls" not in kwargs
+    assert kwargs.get("retryWrites") is False
 
 
 def test_main_should_reject_unknown_scope(mocker):
