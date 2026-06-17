@@ -4,8 +4,42 @@ from __future__ import annotations
 
 import pytest
 
-from cfdb.api.gql.schema import schema
+from cfdb.api.gql.schema import from_pydantic, schema
+from cfdb.api.gql.types import FileMetadataType
+from cfdb.models import FileMetadataModel
 from cfdb.services import locks
+
+
+def test_from_pydantic_should_convert_nested_model_lists_and_leave_json_untouched():
+    """Test from_pydantic resolves Optional[List[Model]] and passes JSON through.
+
+    Given:
+        A dumped FileMetadataModel with a nested Optional[List[ExtraFile]]
+        (extra.fourdn.extra_files) and a JSON dict field
+        (collections[].extra.hubmap.metadata).
+    When:
+        from_pydantic builds the FileMetadataType.
+    Then:
+        It should convert the nested list items to the Strawberry type
+        (the #52 peel fix) while leaving the JSON dict field untouched.
+    """
+    # Arrange
+    payload = FileMetadataModel(
+        dcc={"dcc_abbreviation": "4DN_DCIC"},
+        collections=[
+            {"biosamples": [], "extra": {"hubmap": {"metadata": {"k": "v", "n": 1}}}}
+        ],
+        extra={"fourdn": {"extra_files": [{"href": "/x", "file_format": "pairs_px2"}]}},
+    ).model_dump()
+
+    # Act
+    result = from_pydantic(FileMetadataType, payload)
+
+    # Assert
+    extra_file = result.extra.fourdn.extra_files[0]
+    assert hasattr(type(extra_file), "__strawberry_definition__")
+    assert extra_file.file_format == "pairs_px2"
+    assert result.collections[0].extra.hubmap.metadata == {"k": "v", "n": 1}
 
 
 def _make_file_doc(local_id: str, submission: str = "hubmap") -> dict:
@@ -82,6 +116,54 @@ class TestFilesQuery:
         # Assert
         assert result.errors is None
         assert len(result.data["files"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_4dn_file_with_dict_shaped_extra_file_format(self, mock_db):
+        """Test the files query serializes 4DN extra_files with a CV-object format.
+
+        Given:
+            A 4DN file whose extra.fourdn.extra_files[0].file_format is a 4DN
+            CV object (a dict carrying the token under display_title) — the
+            shape that crashed the query.
+        When:
+            The GraphQL files query selects extra.fourdn.extraFiles.fileFormat.
+        Then:
+            It returns without errors and exposes the display_title token.
+        """
+        # Arrange
+        doc = _make_file_doc("4DNFITEST", submission="4dn")
+        doc["extra"] = {
+            "fourdn": {
+                "extra_files": [
+                    {
+                        "href": "/files/x.pairs_px2",
+                        "file_format": {
+                            "status": "released",
+                            "display_title": "pairs_px2",
+                        },
+                    }
+                ]
+            }
+        }
+        mock_db.files.docs = [doc]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files {
+                    localId
+                    extra { fourdn { extraFiles { href fileFormat } } }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        extra_file = result.data["files"][0]["extra"]["fourdn"]["extraFiles"][0]
+        assert extra_file["fileFormat"] == "pairs_px2"
+        assert extra_file["href"] == "/files/x.pairs_px2"
 
     @pytest.mark.asyncio
     async def test_returns_all_submissions_without_filtering(self, mock_db):

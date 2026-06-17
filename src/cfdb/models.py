@@ -1,8 +1,28 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, field_validator
+
+
+def coerce_4dn_cv_token(value: Any) -> Any:
+    """Coerce a 4DN controlled-vocabulary object to its string token.
+
+    The 4DN portal API represents fields like ``extra_files[].file_format``
+    as an embedded CV object carrying the human token under
+    ``display_title`` (e.g. ``{"display_title": "pairs_px2", ...}``).
+    Return that token when ``value`` is such a dict (``None`` if the dict
+    lacks ``display_title``); pass strings, ``None``, and any other type
+    through unchanged.
+
+    Single source of truth for this normalization, shared by the
+    ``ExtraFile`` read validator, the sync write path
+    (``services.fourdn.parse_extra_files``), and the ``/index`` sidecar
+    resolver (``api.routers.index``).
+    """
+    if isinstance(value, dict):
+        return value.get("display_title")
+    return value
 
 
 class ExtraFile(BaseModel):
@@ -30,6 +50,17 @@ class ExtraFile(BaseModel):
     md5sum: Optional[str] = None
     file_size: Optional[int] = None
     file_format: Optional[str] = None
+
+    @field_validator("file_format", mode="before")
+    @classmethod
+    def _coerce_file_format_token(cls, value):
+        """Coerce a dict-shaped 4DN ``file_format`` to its string token.
+
+        Documents persisted by the sync may hold the 4DN CV object rather
+        than a bare string; normalize on read so the field deserializes
+        instead of raising. See :func:`coerce_4dn_cv_token`.
+        """
+        return coerce_4dn_cv_token(value)
 
 
 class EnrichedFourdnFile(BaseModel):

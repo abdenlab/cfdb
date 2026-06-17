@@ -35,6 +35,7 @@ from cfdb.api.routers.cache_stream import (
     stream_upstream_url,
 )
 from cfdb.dcc_registry import get_all_dcc_names, get_dcc_config, normalize_dcc_name
+from cfdb.models import coerce_4dn_cv_token
 from cfdb.services import locks
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.urlsafe import UnsafeOutboundURL, validate_outbound_url
@@ -345,9 +346,7 @@ def _resolve_fourdn_sidecar(
     for candidate in extra_files:
         if not isinstance(candidate, dict):
             continue
-        raw_fmt = candidate.get("file_format")
-        if isinstance(raw_fmt, dict):
-            raw_fmt = raw_fmt.get("display_title")
+        raw_fmt = coerce_4dn_cv_token(candidate.get("file_format"))
         # Only a string carries a usable token; anything else (a dict with
         # no display_title, None, or an unexpected type) is a non-match,
         # never an AttributeError on .lower().
