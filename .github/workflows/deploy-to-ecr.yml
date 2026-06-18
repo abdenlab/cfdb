@@ -15,6 +15,15 @@ env:
   AWS_REGION: us-east-2
   MOVING_TAG: dev
 
+# Serialize deploys per ref so two close-together master merges can't
+# interleave their push and roll steps (one run pushing :dev while another
+# rolls the service onto a half-pushed image). cancel-in-progress is false:
+# a deploy in flight must finish — cancelling mid-push could leave :dev
+# pointing at a partial image.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     if: github.repository == 'abdenlab/cfdb'
@@ -26,6 +35,19 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # Fail fast before any build/push if the repo variables the deploy
+      # targets are unset, rather than discovering it at the "Roll API
+      # service" step after ECR has already been moved to new images.
+      - name: Pre-flight — required repo variables
+        env:
+          CLUSTER: ${{ vars.BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.BACKEND_SERVICE }}
+        run: |
+          [ -n "$CLUSTER" ] && [ -n "$SERVICE" ] || {
+            echo "::error::Set BACKEND_CLUSTER and BACKEND_SERVICE repo variables"
+            exit 1
+          }
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@50ac8dd1e1b10d09dac7b8727528b91bed831ac0 # v3.0.2
         with:
@@ -36,22 +58,24 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # v2.1.2
 
-      # Tag/push the API image to both the immutable :$SHA_TAG (traceable to a
-      # commit, used for SHA-based rollback) and the moving :$MOVING_TAG the
-      # backend task definition references. Rolling the API service re-pulls
-      # :$MOVING_TAG, shipping this commit's code.
-      - name: Build and push to ECR
+      # Build (do not push yet) the API image, tagging both the immutable
+      # :$SHA_TAG (traceable to a commit, used for SHA-based rollback) and the
+      # moving :$MOVING_TAG the backend task definition references. The actual
+      # pushes — for BOTH the API and the worker — are deferred until after the
+      # worker trivy scan passes (see "Push images to ECR" below), so a scan
+      # failure leaves ECR fully on the prior images.
+      - name: Build API image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: cfdb
         run: |
           SHA_TAG=${GITHUB_SHA::8}
+          echo "API_REGISTRY=$REGISTRY" >> "$GITHUB_ENV"
+          echo "API_REPOSITORY=$REPOSITORY" >> "$GITHUB_ENV"
           docker build --file Dockerfile.api \
             --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+$SHA_TAG \
             -t $REGISTRY/$REPOSITORY:$MOVING_TAG \
             -t $REGISTRY/$REPOSITORY:$SHA_TAG .
-          docker push $REGISTRY/$REPOSITORY:$MOVING_TAG
-          docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
       # Build the wool worker image (Dockerfile.wool), scan it, then push to
       # a separate ECR repository. Pinned to linux/amd64 because the image
@@ -60,7 +84,7 @@ jobs:
       #
       # This step only builds + tags the image (:$SHA_TAG for audit/rollback
       # and the moving :$MOVING_TAG the worker task def references); the
-      # "Push wool worker image" step below pushes both tags after the scan.
+      # "Push images to ECR" step below pushes both repos' tags after the scan.
       - name: Build wool worker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -85,14 +109,20 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
 
-      - name: Push wool worker image
+      # Push BOTH images only now that the worker scan has passed: the API
+      # image (built earlier) and the scanned worker image. Deferring both
+      # pushes behind the scan gate means a HIGH/CRITICAL finding leaves ECR
+      # fully on the prior images — neither repo is half-updated.
+      - name: Push images to ECR
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPOSITORY: cfdb-wool
+          WOOL_REPOSITORY: cfdb-wool
         run: |
           SHA_TAG=${GITHUB_SHA::8}
-          docker push $REGISTRY/$REPOSITORY:$MOVING_TAG
-          docker push $REGISTRY/$REPOSITORY:$SHA_TAG
+          docker push $API_REGISTRY/$API_REPOSITORY:$MOVING_TAG
+          docker push $API_REGISTRY/$API_REPOSITORY:$SHA_TAG
+          docker push $REGISTRY/$WOOL_REPOSITORY:$MOVING_TAG
+          docker push $REGISTRY/$WOOL_REPOSITORY:$SHA_TAG
 
       # Ship the new API code with the moving-tag pattern: the backend task
       # definition references :$MOVING_TAG, so forcing a new deployment
@@ -112,6 +142,14 @@ jobs:
             --service "$SERVICE" \
             --force-new-deployment
 
+      # Record which commit this deploy shipped: the moving :$MOVING_TAG now
+      # points at :$SHA_TAG, so the job summary/log ties the rolled service
+      # back to a specific commit for traceability and SHA-based rollback.
+      - name: Record deployed image
+        run: |
+          SHA_TAG=${GITHUB_SHA::8}
+          echo "Deployed cfdb:$SHA_TAG → :$MOVING_TAG" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Wait for API rollout
         env:
           CLUSTER: ${{ vars.BACKEND_CLUSTER }}
@@ -121,6 +159,44 @@ jobs:
             --region "$AWS_REGION" \
             --cluster "$CLUSTER" \
             --services "$SERVICE"
+
+      # Best-effort guard against the "bootstrap not done" failure mode: if the
+      # task definition still pins a :<sha> instead of the moving :$MOVING_TAG,
+      # this deploy reports green (push + update-service + wait all succeed) but
+      # ships nothing — the service re-pulled the old pinned image. Warn rather
+      # than fail: we cannot read the task definition directly (the cfdb-deploy
+      # role intentionally lacks ecs:DescribeTaskDefinition), so we inspect the
+      # image of a running task via list-tasks -> describe-tasks (both granted)
+      # and check it ends in :$MOVING_TAG. continue-on-error keeps a transient
+      # describe hiccup from failing an otherwise-good deploy.
+      - name: Verify live image is moving tag
+        continue-on-error: true
+        env:
+          CLUSTER: ${{ vars.BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.BACKEND_SERVICE }}
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --region "$AWS_REGION" \
+            --cluster "$CLUSTER" \
+            --service-name "$SERVICE" \
+            --desired-status RUNNING \
+            --query 'taskArns[0]' --output text)
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "::warning::No running task found; skipping live-image check"
+            exit 0
+          fi
+          IMAGE=$(aws ecs describe-tasks \
+            --region "$AWS_REGION" \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].image' --output text)
+          echo "Live API image: $IMAGE"
+          case "$IMAGE" in
+            *:"$MOVING_TAG")
+              echo "Live image references the moving :$MOVING_TAG tag." ;;
+            *)
+              echo "::warning::Live API image ($IMAGE) does not reference :$MOVING_TAG — the one-time task-definition bootstrap may not have been run, so this deploy may not have shipped new code. See the README CI auto-deploy bootstrap note." ;;
+          esac
 
       # No ECS step for the worker fleet: the worker task definition also
       # references :$MOVING_TAG, and the workers are ephemeral — the next
