@@ -85,7 +85,7 @@ from typing import Optional
 import aiohttp
 
 from cfdb.dcc_registry import get_dcc_config
-from cfdb.models import coerce_4dn_cv_token
+from cfdb.models import coerce_4dn_cv_token, coerce_scalar_to_str
 
 logger = logging.getLogger(__name__)
 
@@ -365,12 +365,92 @@ _EXPERIMENT_FIELDS = [
 # Fields that are objects with display_title to extract
 _DISPLAY_TITLE_FIELDS = {"experiment_type", "digestion_enzyme", "lab"}
 
+# Protocol fields the 4DN API sends as JSON numbers but the model declares
+# Optional[str]; stringify them at parse time so persisted data is clean at
+# rest (mirrors the EnrichedFourdnCollection read validator).
+_NUMERIC_PROTOCOL_FIELDS = {
+    "crosslinking_temperature",
+    "crosslinking_time",
+    "ligation_temperature",
+    "ligation_volume",
+    "ligation_time",
+    "digestion_temperature",
+    "digestion_time",
+    "average_fragment_size",
+}
+
 _EXPERIMENT_TYPES = [
     "ExperimentHiC",
     "ExperimentSeq",
     "ExperimentDamid",
     "ExperimentChiapet",
 ]
+
+
+def parse_experiment_metadata(item: dict) -> dict:
+    """Normalize a single 4DN experiment ``@graph`` item for persistence.
+
+    Extracts the display-title object fields, the ``targeted_factor`` BioFeature
+    titles, the experiment ``display_title``, and the scalar protocol fields,
+    dropping any that are absent or empty. The numeric protocol fields (e.g.
+    ``crosslinking_temperature``) are returned by the 4DN API as JSON numbers
+    but the model declares them ``Optional[str]``; stringify them via
+    :func:`coerce_scalar_to_str` so persisted documents match the
+    ``EnrichedFourdnCollection`` type. Returns the built entry (empty when the
+    item yields no fields).
+    """
+    entry: dict = {}
+
+    # Extract display_title from object fields
+    for field_name in _DISPLAY_TITLE_FIELDS:
+        obj = item.get(field_name)
+        if isinstance(obj, dict):
+            title = obj.get("display_title")
+            if title:
+                entry[field_name] = title
+
+    # Extract targeted_factor: array of BioFeature objects
+    targeted_factor_raw = item.get("targeted_factor")
+    if isinstance(targeted_factor_raw, list) and targeted_factor_raw:
+        titles = [
+            tf.get("display_title")
+            for tf in targeted_factor_raw
+            if isinstance(tf, dict) and tf.get("display_title")
+        ]
+        if titles:
+            entry["targeted_factor"] = titles
+
+    # Extract display_title as experiment name
+    display_title = item.get("display_title")
+    if display_title:
+        entry["display_title"] = display_title
+
+    # Extract scalar fields, stringifying the numeric protocol fields
+    for field_name in (
+        "crosslinking_method",
+        "crosslinking_temperature",
+        "crosslinking_time",
+        "ligation_temperature",
+        "ligation_volume",
+        "ligation_time",
+        "digestion_temperature",
+        "digestion_time",
+        "tagging_method",
+        "fragmentation_method",
+        "biotin_removed",
+        "library_prep_kit",
+        "average_fragment_size",
+        "fragment_size_range",
+        "status",
+        "date_created",
+    ):
+        val = item.get(field_name)
+        if val is not None and val != "":
+            if field_name in _NUMERIC_PROTOCOL_FIELDS:
+                val = coerce_scalar_to_str(val)
+            entry[field_name] = val
+
+    return entry
 
 
 async def fetch_experiment_metadata_bulk() -> dict[str, dict]:
@@ -434,55 +514,7 @@ async def fetch_experiment_metadata_bulk() -> dict[str, dict]:
                     if not accession:
                         continue
 
-                    entry: dict = {}
-
-                    # Extract display_title from object fields
-                    for field_name in _DISPLAY_TITLE_FIELDS:
-                        obj = item.get(field_name)
-                        if isinstance(obj, dict):
-                            title = obj.get("display_title")
-                            if title:
-                                entry[field_name] = title
-
-                    # Extract targeted_factor: array of BioFeature objects
-                    targeted_factor_raw = item.get("targeted_factor")
-                    if isinstance(targeted_factor_raw, list) and targeted_factor_raw:
-                        titles = [
-                            tf.get("display_title")
-                            for tf in targeted_factor_raw
-                            if isinstance(tf, dict) and tf.get("display_title")
-                        ]
-                        if titles:
-                            entry["targeted_factor"] = titles
-
-                    # Extract display_title as experiment name
-                    display_title = item.get("display_title")
-                    if display_title:
-                        entry["display_title"] = display_title
-
-                    # Extract scalar fields as-is
-                    for field_name in (
-                        "crosslinking_method",
-                        "crosslinking_temperature",
-                        "crosslinking_time",
-                        "ligation_temperature",
-                        "ligation_volume",
-                        "ligation_time",
-                        "digestion_temperature",
-                        "digestion_time",
-                        "tagging_method",
-                        "fragmentation_method",
-                        "biotin_removed",
-                        "library_prep_kit",
-                        "average_fragment_size",
-                        "fragment_size_range",
-                        "status",
-                        "date_created",
-                    ):
-                        val = item.get(field_name)
-                        if val is not None and val != "":
-                            entry[field_name] = val
-
+                    entry = parse_experiment_metadata(item)
                     if entry:
                         results[accession] = entry
 

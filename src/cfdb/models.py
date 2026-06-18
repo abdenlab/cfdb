@@ -25,6 +25,25 @@ def coerce_4dn_cv_token(value: Any) -> Any:
     return value
 
 
+def coerce_scalar_to_str(value: Any) -> Any:
+    """Coerce a non-None scalar to its string representation.
+
+    Several 4DN experiment protocol fields (e.g. ``crosslinking_temperature``)
+    are declared ``Optional[str]`` but the 4DN portal API sends them as JSON
+    numbers (``25.0``). Stringify any non-``None`` value so the field
+    deserializes instead of raising a ``string_type`` validation error; pass
+    ``None`` and already-string values through unchanged (a string is its own
+    ``str``).
+
+    Single source of truth for this normalization, shared by the
+    ``EnrichedFourdnCollection`` read validator and the sync write path
+    (``services.fourdn.fetch_experiment_metadata_bulk``).
+    """
+    if value is None:
+        return None
+    return str(value)
+
+
 class ExtraFile(BaseModel):
     """
     An associated index or auxiliary file from 4DN.
@@ -206,6 +225,31 @@ class EnrichedFourdnCollection(BaseModel):
     fragment_size_range: Optional[str] = None
     status: Optional[str] = None
     date_created: Optional[str] = None
+
+    @field_validator(
+        "crosslinking_temperature",
+        "crosslinking_time",
+        "ligation_temperature",
+        "ligation_volume",
+        "ligation_time",
+        "digestion_temperature",
+        "digestion_time",
+        "average_fragment_size",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_numeric_protocol_field(cls, value):
+        """Coerce a numeric 4DN protocol value to its string form.
+
+        These experiment protocol fields are typed ``Optional[str]`` but the
+        4DN portal API sends them as JSON numbers (e.g. ``25.0``), and
+        documents persisted by the sync may hold those floats. Stringify on
+        read so the field deserializes instead of raising — letting
+        already-persisted data self-heal without a re-sync. ``None`` and
+        existing strings pass through unchanged. See
+        :func:`coerce_scalar_to_str`.
+        """
+        return coerce_scalar_to_str(value)
 
 
 class EnrichedCollection(BaseModel):
