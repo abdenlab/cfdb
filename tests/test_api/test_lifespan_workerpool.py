@@ -23,7 +23,6 @@ from cfdb.api import main
 from cfdb.api import profile as profile_mod
 
 
-@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_lifespan_should_construct_worker_pool_with_quorum_zero(
     mocker, tmp_path
@@ -117,3 +116,56 @@ def test_worker_pool_signature_should_accept_quorum():
 
     # Assert
     assert "quorum" in params
+
+
+@pytest.mark.asyncio
+async def test_build_discovery_should_yield_ecs_discovery_un_entered(
+    mocker, tmp_path
+):
+    """Test that the ECS profile yields the discovery un-entered.
+
+    Given:
+        An ECS ``WorkflowProfile`` (so ``_build_discovery`` takes its
+        ``EcsDiscovery`` branch), with ``build_ecs_client`` stubbed so no
+        real boto3 client is constructed.
+    When:
+        ``_build_discovery`` is driven as an async context manager and the
+        yielded discovery is inspected.
+    Then:
+        The yielded ``EcsDiscovery`` is NOT yet entered — its background
+        poller has not started (``_poll_task is None``). wool's
+        ``WorkerProxy.__wool_reduce__`` rejects a *context-manager*
+        discovery instance, and ``wool.WorkerPool.__aenter__`` enters the
+        discovery itself; so ``_build_discovery`` MUST hand it over
+        un-entered or the pool would double-enter it and trip
+        ``EcsDiscovery``'s re-entry guard (the original Bug 2 startup
+        crash).
+    """
+    # Arrange
+    from cfdb.api import profile as profile_mod
+    from cfdb.workflows.discovery import EcsDiscovery
+
+    mocker.patch(
+        "cfdb.workflows.discovery.build_ecs_client",
+        return_value=object(),
+    )
+    ecs = profile_mod._EcsConfig(
+        cluster="cfdb-cluster",
+        task_definition="cfdb-worker",
+        task_family="cfdb-worker",
+        subnets=("subnet-1",),
+        security_groups=(),
+        assign_public_ip="DISABLED",
+    )
+    profile = profile_mod.WorkflowProfile(
+        kind="ecs",
+        cache_root=tmp_path / "cache",
+        workdir_root=tmp_path / "jobs",
+        ecs=ecs,
+    )
+
+    # Act & assert
+    async with main._build_discovery(profile) as discovery:
+        assert isinstance(discovery, EcsDiscovery)
+        # Un-entered: __aenter__ would have started the poll loop.
+        assert discovery._poll_task is None
