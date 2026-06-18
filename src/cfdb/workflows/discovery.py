@@ -111,6 +111,11 @@ class EcsDiscovery(Discovery):
 
         self._cluster = cluster
         self._task_definition_family = task_definition_family
+        #: Retained so ``__setstate__`` can rebuild the boto3 client on the
+        #: worker targeting the same endpoint/region as the API process.
+        #: Mirrors ``S3Cache._endpoint_url`` / ``S3Cache._region_name``.
+        self._endpoint_url = endpoint_url
+        self._region_name = region_name
         self._client = (
             client
             if client is not None
@@ -140,6 +145,70 @@ class EcsDiscovery(Discovery):
         #: regress ``_known``. Separate from ``_state_lock`` so
         #: subscriber registration is not blocked on the AWS
         #: round-trip held by an in-flight poll.
+        self._serialize_polls = asyncio.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Strip non-picklable runtime state for cloudpickle.
+
+        ``EcsDiscovery`` is dragged across the cloudpickle boundary into
+        the Wool worker process by ``WorkerProxy.__reduce__`` (which
+        serializes the caller's ``discovery``). The live boto3 ECS
+        client holds an ``ssl.SSLContext`` via its urllib3 connection
+        pools, which cloudpickle cannot serialize — the same problem
+        ``S3Cache`` already solves for its boto3 ``s3`` client. We
+        mirror it here: null ``_client`` (``__setstate__`` rebuilds it
+        via :func:`build_ecs_client`) and also drop the loop-bound
+        ``asyncio.Lock`` instances, the background ``_poll_task``, and
+        the live subscriber/known set — none of which mean anything on
+        the worker (it never polls or fans out events) and the locks
+        are bound to the API's event loop. ``__setstate__`` recreates
+        fresh transient state so the unpickled object is a valid,
+        inert discovery handle.
+        """
+        state = self.__dict__.copy()
+        state["_client"] = None
+        # Loop-bound / live-runtime fields — never carry across the
+        # boundary. Recreated fresh in ``__setstate__``.
+        for transient in (
+            "_state_lock",
+            "_serialize_polls",
+            "_poll_task",
+            "_subscribers",
+            "_known",
+        ):
+            state.pop(transient, None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore state, rebuild the boto3 client, and reset runtime fields.
+
+        Threads the originally-supplied ``endpoint_url`` / ``region_name``
+        back into :func:`build_ecs_client` so the worker targets the same
+        ECS control plane as the API. Transient fields stripped by
+        ``__getstate__`` (locks, poll task, subscriber/known set) are
+        recreated empty: the worker never enters the discovery context,
+        so these stay inert, but they must exist for the object to be
+        well-formed. The client rebuild is guarded on ``_client is None``
+        (mirroring ``S3Cache``); the pickle protocol always nulls it, so
+        the guard is a no-op there but keeps restoration idempotent.
+        """
+        self.__dict__.update(state)
+        # Guard mirrors ``S3Cache.__setstate__``: rebuild only when the
+        # client was stripped. Via the pickle protocol that is always the
+        # case (``__getstate__`` nulls ``_client``), so this is the normal
+        # path; the guard keeps ``__setstate__`` idempotent and avoids
+        # clobbering a client a non-pickle caller may have already placed
+        # in ``state``.
+        if self._client is None:
+            self._client = build_ecs_client(
+                endpoint_url=self._endpoint_url,
+                region_name=self._region_name,
+            )
+        self._subscribers = []
+        self._known = {}
+        self._poll_task = None
+        self._closed = False
+        self._state_lock = asyncio.Lock()
         self._serialize_polls = asyncio.Lock()
 
     async def __aenter__(self) -> "EcsDiscovery":
