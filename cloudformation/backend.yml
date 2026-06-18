@@ -15,7 +15,13 @@ Parameters:
     Description: Name of the workers stack (worker task def + S3 cache)
   ImageURI:
     Type: String
-    Description: ECR image URI for the CFDB API
+    Default: 605134458779.dkr.ecr.us-east-2.amazonaws.com/cfdb:dev
+    Description: >
+      ECR image URI for the CFDB API. Defaults to the moving :dev tag so
+      the CI moving-tag deploy (force-new-deployment re-pulls :dev) stays
+      the source of truth — a later infra `cloudformation deploy` that
+      reuses this default will not clobber the live image back to an old
+      SHA.
   WorkflowS3Prefix:
     Type: String
     Default: ""

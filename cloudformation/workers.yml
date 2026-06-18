@@ -12,7 +12,13 @@ Description: >
 Parameters:
   WorkerImageURI:
     Type: String
-    Description: ECR image URI for the cfdb wool worker (Dockerfile.wool)
+    Default: 605134458779.dkr.ecr.us-east-2.amazonaws.com/cfdb-wool:dev
+    Description: >
+      ECR image URI for the cfdb wool worker (Dockerfile.wool). Defaults to
+      the moving :dev tag so the next EcsProvisioner RunTask pulls the
+      freshly-pushed image and a later infra `cloudformation deploy` that
+      reuses this default does not clobber the worker image back to an old
+      SHA.
   WorkerCpu:
     Type: String
     Default: "1024"

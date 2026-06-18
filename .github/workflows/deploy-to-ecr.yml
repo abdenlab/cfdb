@@ -5,6 +5,16 @@ on:
     branches:
       - master
 
+# AWS_REGION pins the ECR/ECS region for every step; MOVING_TAG is the
+# environment-scoped, mutable tag the ECS task definitions reference. Each
+# image is pushed to both the immutable :<sha> tag (audit + rollback) and
+# this moving tag. Rolling the service re-pulls the moving tag, so shipping
+# code needs no RegisterTaskDefinition / CloudFormation / iam:PassRole — only
+# the cfdb-deploy role's existing ECR push + ecs:UpdateService permissions.
+env:
+  AWS_REGION: us-east-2
+  MOVING_TAG: dev
+
 jobs:
   build-and-deploy:
     if: github.repository == 'abdenlab/cfdb'
@@ -20,12 +30,16 @@ jobs:
         uses: aws-actions/configure-aws-credentials@50ac8dd1e1b10d09dac7b8727528b91bed831ac0 # v3.0.2
         with:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE }}
-          aws-region: us-east-2
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # v2.1.2
 
+      # Tag/push the API image to both the immutable :$SHA_TAG (traceable to a
+      # commit, used for SHA-based rollback) and the moving :$MOVING_TAG the
+      # backend task definition references. Rolling the API service re-pulls
+      # :$MOVING_TAG, shipping this commit's code.
       - name: Build and push to ECR
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -34,9 +48,9 @@ jobs:
           SHA_TAG=${GITHUB_SHA::8}
           docker build --file Dockerfile.api \
             --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+$SHA_TAG \
-            -t $REGISTRY/$REPOSITORY:latest \
+            -t $REGISTRY/$REPOSITORY:$MOVING_TAG \
             -t $REGISTRY/$REPOSITORY:$SHA_TAG .
-          docker push $REGISTRY/$REPOSITORY:latest
+          docker push $REGISTRY/$REPOSITORY:$MOVING_TAG
           docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
       # Build the wool worker image (Dockerfile.wool), scan it, then push to
@@ -44,11 +58,9 @@ jobs:
       # bundles UCSC's x86_64-only bigBedToBed. The cfdb-wool repository must
       # exist in ECR (created out of band, like the cfdb repository).
       #
-      # This step only builds + pushes the image; the "Deploy worker fleet"
-      # step below redeploys the workers stack with WorkerImageURI set to the
-      # :$SHA_TAG URI, which registers a new task-definition revision that
-      # EcsProvisioner launches on the next dispatch. :latest is pushed only
-      # as a convenience pointer; the task def pins the immutable :$SHA_TAG.
+      # This step only builds + tags the image (:$SHA_TAG for audit/rollback
+      # and the moving :$MOVING_TAG the worker task def references); the
+      # "Push wool worker image" step below pushes both tags after the scan.
       - name: Build wool worker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -58,7 +70,7 @@ jobs:
           echo "WOOL_IMAGE=$REGISTRY/$REPOSITORY:$SHA_TAG" >> "$GITHUB_ENV"
           docker build --platform linux/amd64 --file Dockerfile.wool \
             --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+$SHA_TAG \
-            -t $REGISTRY/$REPOSITORY:latest \
+            -t $REGISTRY/$REPOSITORY:$MOVING_TAG \
             -t $REGISTRY/$REPOSITORY:$SHA_TAG .
 
       # Fail the build on HIGH/CRITICAL OS/library vulnerabilities before the
@@ -79,53 +91,39 @@ jobs:
           REPOSITORY: cfdb-wool
         run: |
           SHA_TAG=${GITHUB_SHA::8}
-          docker push $REGISTRY/$REPOSITORY:latest
+          docker push $REGISTRY/$REPOSITORY:$MOVING_TAG
           docker push $REGISTRY/$REPOSITORY:$SHA_TAG
 
-      # Deploy the freshly-pushed images by redeploying the CloudFormation
-      # stacks with the SHA-pinned image URIs. This is the real deploy:
-      # `aws cloudformation deploy` registers a new task-definition revision
-      # for the changed image and rolls the service, so each merge to master
-      # ships new code for BOTH the API and the worker fleet in lockstep.
-      #
-      # CloudFormation reuses every other parameter's previous value, so only
-      # the image URI is overridden. `--no-fail-on-empty-changeset` lets a
-      # no-op redeploy (unchanged SHA) succeed instead of erroring. Immutable
-      # `:<sha>` pinning is kept (not `:latest`), so the running fleet is
-      # traceable to a commit and rollback is a redeploy of a prior SHA.
-      #
-      # Workers are deployed first because the backend stack imports the
-      # workers stack's exports.
-      #
-      # Requires the CI role (AWS_IAM_ROLE) to be able to deploy these stacks:
-      # cloudformation:*ChangeSet*/DescribeStacks/DescribeStackEvents/
-      # GetTemplate*, ecs:RegisterTaskDefinition/UpdateService/Describe*/
-      # DeregisterTaskDefinition, and iam:PassRole on the stacks' task and
-      # execution roles. See README "Deploying the CloudFormation stacks".
-      - name: Deploy worker fleet (CloudFormation)
+      # Ship the new API code with the moving-tag pattern: the backend task
+      # definition references :$MOVING_TAG, so forcing a new deployment
+      # launches fresh Fargate tasks that re-pull the tag we just pushed.
+      # This needs only ecs:UpdateService — no RegisterTaskDefinition,
+      # CloudFormation, or iam:PassRole — so it runs entirely on the
+      # cfdb-deploy role's existing permissions. CLUSTER/SERVICE come from
+      # repo variables (vars.BACKEND_CLUSTER / vars.BACKEND_SERVICE).
+      - name: Roll API service
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          WORKERS_STACK: ${{ secrets.WORKERS_STACK_NAME }}
+          CLUSTER: ${{ vars.BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.BACKEND_SERVICE }}
         run: |
-          SHA_TAG=${GITHUB_SHA::8}
-          aws cloudformation deploy \
-            --region us-east-2 \
-            --stack-name "$WORKERS_STACK" \
-            --template-file cloudformation/workers.yml \
-            --parameter-overrides WorkerImageURI=$REGISTRY/cfdb-wool:$SHA_TAG \
-            --capabilities CAPABILITY_IAM \
-            --no-fail-on-empty-changeset
+          aws ecs update-service \
+            --region "$AWS_REGION" \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --force-new-deployment
 
-      - name: Deploy API (CloudFormation)
+      - name: Wait for API rollout
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          BACKEND_STACK: ${{ secrets.BACKEND_STACK_NAME }}
+          CLUSTER: ${{ vars.BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.BACKEND_SERVICE }}
         run: |
-          SHA_TAG=${GITHUB_SHA::8}
-          aws cloudformation deploy \
-            --region us-east-2 \
-            --stack-name "$BACKEND_STACK" \
-            --template-file cloudformation/backend.yml \
-            --parameter-overrides ImageURI=$REGISTRY/cfdb:$SHA_TAG \
-            --capabilities CAPABILITY_IAM \
-            --no-fail-on-empty-changeset
+          aws ecs wait services-stable \
+            --region "$AWS_REGION" \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+
+      # No ECS step for the worker fleet: the worker task definition also
+      # references :$MOVING_TAG, and the workers are ephemeral — the next
+      # EcsProvisioner RunTask (issued by the API role at workflow dispatch)
+      # pulls the freshly-pushed image. Re-tagging :$MOVING_TAG above is the
+      # whole worker deploy; there is no long-running worker service to roll.
