@@ -85,7 +85,11 @@ from typing import Optional
 import aiohttp
 
 from cfdb.dcc_registry import get_dcc_config
-from cfdb.models import coerce_4dn_cv_token, coerce_scalar_to_str
+from cfdb.models import (
+    NUMERIC_PROTOCOL_FIELDS,
+    coerce_4dn_cv_token,
+    coerce_scalar_to_str,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,17 +371,9 @@ _DISPLAY_TITLE_FIELDS = {"experiment_type", "digestion_enzyme", "lab"}
 
 # Protocol fields the 4DN API sends as JSON numbers but the model declares
 # Optional[str]; stringify them at parse time so persisted data is clean at
-# rest (mirrors the EnrichedFourdnCollection read validator).
-_NUMERIC_PROTOCOL_FIELDS = {
-    "crosslinking_temperature",
-    "crosslinking_time",
-    "ligation_temperature",
-    "ligation_volume",
-    "ligation_time",
-    "digestion_temperature",
-    "digestion_time",
-    "average_fragment_size",
-}
+# rest (mirrors the EnrichedFourdnCollection read validator). Wrapped in a set
+# for O(1) membership checks; the canonical list lives in cfdb.models.
+_NUMERIC_PROTOCOL_FIELDS = set(NUMERIC_PROTOCOL_FIELDS)
 
 _EXPERIMENT_TYPES = [
     "ExperimentHiC",

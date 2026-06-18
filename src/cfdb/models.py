@@ -25,23 +25,55 @@ def coerce_4dn_cv_token(value: Any) -> Any:
     return value
 
 
+# The numeric 4DN experiment protocol fields the EnrichedFourdnCollection read
+# validator and the sync write path (services.fourdn.parse_experiment_metadata)
+# coerce from JSON numbers to their string form. This is the single source of
+# truth — both the validator registration below and the write path import it.
+#
+# Deliberately observation-scoped per issue #53: it lists only the fields the
+# 4DN portal API has been observed to send as JSON numbers. Sibling
+# Optional[str] protocol fields are intentionally excluded. ``fragment_size_range``
+# is a genuine range string upstream (e.g. "200-400") and must NOT be stringified;
+# ``biotin_removed`` is the most plausible next instance (likely a JSON boolean)
+# but has not been observed, so it stays out until it is. Widening this set would
+# remove the fail-loud behavior that the negative-scope tests assert.
+NUMERIC_PROTOCOL_FIELDS = (
+    "crosslinking_temperature",
+    "crosslinking_time",
+    "ligation_temperature",
+    "ligation_volume",
+    "ligation_time",
+    "digestion_temperature",
+    "digestion_time",
+    "average_fragment_size",
+)
+
+
 def coerce_scalar_to_str(value: Any) -> Any:
     """Coerce a non-None scalar to its string representation.
 
     Several 4DN experiment protocol fields (e.g. ``crosslinking_temperature``)
     are declared ``Optional[str]`` but the 4DN portal API sends them as JSON
-    numbers (``25.0``). Stringify any non-``None`` value so the field
+    numbers (``25.0``). Stringify ``int`` / ``float`` / ``str`` so the field
     deserializes instead of raising a ``string_type`` validation error; pass
     ``None`` and already-string values through unchanged (a string is its own
     ``str``).
 
+    Only scalar types are stringified. A non-scalar value (e.g. a ``list`` or
+    ``dict``) is returned UNCHANGED so pydantic rejects it with a clean
+    ``string_type`` error rather than having it masked as a Python ``repr``.
+    Note ``bool`` is an ``int`` subclass, so ``True``/``False`` stringify to
+    ``"True"``/``"False"`` — intended.
+
     Single source of truth for this normalization, shared by the
     ``EnrichedFourdnCollection`` read validator and the sync write path
-    (``services.fourdn.fetch_experiment_metadata_bulk``).
+    (``services.fourdn.parse_experiment_metadata``).
     """
     if value is None:
         return None
-    return str(value)
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    return value
 
 
 class ExtraFile(BaseModel):
@@ -226,17 +258,7 @@ class EnrichedFourdnCollection(BaseModel):
     status: Optional[str] = None
     date_created: Optional[str] = None
 
-    @field_validator(
-        "crosslinking_temperature",
-        "crosslinking_time",
-        "ligation_temperature",
-        "ligation_volume",
-        "ligation_time",
-        "digestion_temperature",
-        "digestion_time",
-        "average_fragment_size",
-        mode="before",
-    )
+    @field_validator(*NUMERIC_PROTOCOL_FIELDS, mode="before")
     @classmethod
     def _coerce_numeric_protocol_field(cls, value):
         """Coerce a numeric 4DN protocol value to its string form.
