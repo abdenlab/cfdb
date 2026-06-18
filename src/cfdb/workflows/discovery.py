@@ -151,8 +151,10 @@ class EcsDiscovery(Discovery):
         """Strip non-picklable runtime state for cloudpickle.
 
         ``EcsDiscovery`` is dragged across the cloudpickle boundary into
-        the Wool worker process by ``WorkerProxy.__reduce__`` (which
-        serializes the caller's ``discovery``). The live boto3 ECS
+        the Wool worker process by ``WorkerProxy.__wool_reduce__`` (wool's
+        internal reduce hook, which serializes the caller's ``discovery``;
+        the proxy itself is reduced only via wool's own pickler, never a
+        vanilla ``cloudpickle.dumps(proxy)``). The live boto3 ECS
         client holds an ``ssl.SSLContext`` via its urllib3 connection
         pools, which cloudpickle cannot serialize — the same problem
         ``S3Cache`` already solves for its boto3 ``s3`` client. We
@@ -168,13 +170,17 @@ class EcsDiscovery(Discovery):
         state = self.__dict__.copy()
         state["_client"] = None
         # Loop-bound / live-runtime fields — never carry across the
-        # boundary. Recreated fresh in ``__setstate__``.
+        # boundary. Recreated fresh in ``__setstate__``. ``_closed`` is
+        # stripped too, for symmetry with the other reset transients —
+        # ``__setstate__`` unconditionally resets it to False, so a
+        # stale True must not ride along in the pickled state.
         for transient in (
             "_state_lock",
             "_serialize_polls",
             "_poll_task",
             "_subscribers",
             "_known",
+            "_closed",
         ):
             state.pop(transient, None)
         return state
