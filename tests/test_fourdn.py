@@ -6,21 +6,8 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from cfdb.models import EnrichedFourdnCollection
+from cfdb.models import NUMERIC_PROTOCOL_FIELDS, EnrichedFourdnCollection
 from cfdb.services.fourdn import parse_experiment_metadata, parse_extra_files
-
-# The eight numeric protocol fields parse_experiment_metadata stringifies on the
-# sync write path (mirror of the EnrichedFourdnCollection read validator).
-_NUMERIC_PROTOCOL_FIELDS = (
-    "crosslinking_temperature",
-    "crosslinking_time",
-    "ligation_temperature",
-    "ligation_volume",
-    "ligation_time",
-    "digestion_temperature",
-    "digestion_time",
-    "average_fragment_size",
-)
 
 
 def test_parse_extra_files_should_store_token_when_file_format_is_cv_object():
@@ -464,7 +451,7 @@ def test_parse_experiment_metadata_feeds_enriched_fourdn_collection_cleanly():
 
 
 class TestParseExperimentMetadata:
-    @pytest.mark.parametrize("field_name", _NUMERIC_PROTOCOL_FIELDS)
+    @pytest.mark.parametrize("field_name", NUMERIC_PROTOCOL_FIELDS)
     @given(value=st.integers() | st.floats(allow_nan=False, allow_infinity=False))
     def test_pbt_001_each_numeric_field_stringified_in_output(
         self, field_name, value

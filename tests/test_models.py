@@ -4,6 +4,7 @@ from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from cfdb.models import (
+    NUMERIC_PROTOCOL_FIELDS,
     Biosample,
     Collection,
     EnrichedBiosample,
@@ -16,19 +17,6 @@ from cfdb.models import (
     Subject,
     coerce_4dn_cv_token,
     coerce_scalar_to_str,
-)
-
-# The eight numeric protocol fields the EnrichedFourdnCollection validator and
-# the sync write path coerce from JSON numbers to their string form.
-_NUMERIC_PROTOCOL_FIELDS = (
-    "crosslinking_temperature",
-    "crosslinking_time",
-    "ligation_temperature",
-    "ligation_volume",
-    "ligation_time",
-    "digestion_temperature",
-    "digestion_time",
-    "average_fragment_size",
 )
 
 
@@ -202,18 +190,39 @@ class TestCoerceScalarToStr:
         # Act, assert
         assert coerce_scalar_to_str(float("nan")) == "nan"
 
-    def test_passes_explicit_none_through_unchanged(self):
-        """Test that an explicitly passed None is preserved.
+    def test_passes_list_through_unchanged(self):
+        """Test that a list is returned unchanged rather than stringified.
 
         Given:
-            An explicit None value.
+            A list value on a coerced field.
         When:
             coerce_scalar_to_str is called.
         Then:
-            It should return None rather than the string "None".
+            It should return the list unchanged (not its repr), so pydantic
+            later rejects it with a clean string_type error.
         """
+        # Arrange
+        value = [1, 2, 3]
+
         # Act, assert
-        assert coerce_scalar_to_str(None) is None
+        assert coerce_scalar_to_str(value) is value
+
+    def test_passes_dict_through_unchanged(self):
+        """Test that a dict is returned unchanged rather than stringified.
+
+        Given:
+            A dict value on a coerced field.
+        When:
+            coerce_scalar_to_str is called.
+        Then:
+            It should return the dict unchanged (not its repr), so pydantic
+            later rejects it with a clean string_type error.
+        """
+        # Arrange
+        value = {"value": 25.0}
+
+        # Act, assert
+        assert coerce_scalar_to_str(value) is value
 
     @given(st.integers() | st.floats(allow_nan=False, allow_infinity=False))
     def test_pbt_001_stringifies_any_finite_number_to_str_of_it(self, value):
@@ -548,7 +557,82 @@ class TestEnrichedFourdnCollection:
         with pytest.raises(ValidationError):
             EnrichedFourdnCollection(digestion_enzyme=1.5)
 
-    @pytest.mark.parametrize("field_name", _NUMERIC_PROTOCOL_FIELDS)
+    def test_validator_registered_fields_match_canonical_constant(self):
+        """Test the coercion validator is registered on exactly the canonical set.
+
+        Given:
+            The EnrichedFourdnCollection numeric-coercion validator and the
+            canonical NUMERIC_PROTOCOL_FIELDS constant.
+        When:
+            The validator's registered field set is read from the model's
+            pydantic decorators.
+        Then:
+            It should equal set(NUMERIC_PROTOCOL_FIELDS), so drift between the
+            constant and the validator registration fails CI.
+        """
+        # Arrange
+        validators = (
+            EnrichedFourdnCollection.__pydantic_decorators__.field_validators
+        )
+        coercion_validator = validators["_coerce_numeric_protocol_field"]
+
+        # Act, assert
+        assert set(coercion_validator.info.fields) == set(NUMERIC_PROTOCOL_FIELDS)
+
+    def test_rejects_list_on_coerced_field(self):
+        """Test that a list on a coerced field raises rather than stringifying.
+
+        Given:
+            An EnrichedFourdnCollection constructed with digestion_time — a
+            coerced numeric field — set to a list.
+        When:
+            The model is instantiated.
+        Then:
+            It should raise a pydantic ValidationError, because the hardened
+            coercion passes non-scalars through unchanged for pydantic to
+            reject (rather than masking them as a Python repr string).
+        """
+        # Act, assert
+        with pytest.raises(ValidationError):
+            EnrichedFourdnCollection(digestion_time=[1, 2, 3])
+
+    def test_rejects_dict_on_coerced_field(self):
+        """Test that a dict on a coerced field raises rather than stringifying.
+
+        Given:
+            An EnrichedFourdnCollection constructed with crosslinking_temperature
+            — a coerced numeric field — set to a dict.
+        When:
+            The model is instantiated.
+        Then:
+            It should raise a pydantic ValidationError, because the hardened
+            coercion passes non-scalars through unchanged for pydantic to
+            reject (rather than masking them as a Python repr string).
+        """
+        # Act, assert
+        with pytest.raises(ValidationError):
+            EnrichedFourdnCollection(crosslinking_temperature={"value": 25.0})
+
+    def test_passes_fragment_size_range_string_through_unchanged(self):
+        """Test that fragment_size_range is left out of the coerced set.
+
+        Given:
+            An EnrichedFourdnCollection constructed with fragment_size_range
+            as a genuine range string (e.g. "200-400") — a sibling
+            Optional[str] field deliberately excluded from the coerced set.
+        When:
+            The model is instantiated.
+        Then:
+            It should keep the range string unchanged, locking the boundary of
+            the observation-scoped NUMERIC_PROTOCOL_FIELDS set.
+        """
+        # Act
+        result = EnrichedFourdnCollection(fragment_size_range="200-400")
+
+        # Assert
+        assert result.fragment_size_range == "200-400"
+
+    @pytest.mark.parametrize("field_name", NUMERIC_PROTOCOL_FIELDS)
     @given(value=st.floats(allow_nan=False, allow_infinity=False))
     def test_pbt_001_each_numeric_field_coerces_finite_float_to_str(
         self, field_name, value
