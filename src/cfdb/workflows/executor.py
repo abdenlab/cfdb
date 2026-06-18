@@ -106,10 +106,11 @@ _ERR_PREFIX_CAPACITY = "capacity:"
 _ERR_PREFIX_PROVISIONER = "provisioner:"
 
 #: Total wall-clock budget waiting for a leased worker to surface during
-#: dispatch. Sized for an ECS cold start (target ~30-90s on Fargate) so a
-#: ``NoWorkersAvailable`` at the moment of dispatch does not immediately
-#: fail the job — instead we poll the pool until a worker shows up or
-#: the budget expires.
+#: dispatch. Sized for an ECS Fargate cold start (image pull + health
+#: check, typically 1-3 min; see ``CFDB_WORKFLOW_DISPATCH_WAIT_S``,
+#: default 240s) so a ``NoWorkersAvailable`` at the moment of dispatch
+#: does not immediately fail the job — instead we poll the pool until a
+#: worker shows up or the budget expires.
 _DISPATCH_WAIT_SECONDS = float(WORKFLOW_DISPATCH_WAIT_S)
 
 #: Cadence at which we re-attempt the dispatch while waiting on capacity.
