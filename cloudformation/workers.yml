@@ -12,13 +12,16 @@ Description: >
 Parameters:
   WorkerImageURI:
     Type: String
+    # NOTE: this default is dev-account/region-specific (account 605134458779,
+    # region us-east-2). Override it for any other environment.
     Default: 605134458779.dkr.ecr.us-east-2.amazonaws.com/cfdb-wool:dev
     Description: >
       ECR image URI for the cfdb wool worker (Dockerfile.wool). Defaults to
       the moving :dev tag so the next EcsProvisioner RunTask pulls the
-      freshly-pushed image and a later infra `cloudformation deploy` that
-      reuses this default does not clobber the worker image back to an old
-      SHA.
+      freshly-pushed image. On a stack UPDATE, CloudFormation reuses the
+      parameter's previous value, so this default only governs a fresh
+      stack CREATE — a later infra `cloudformation deploy` will not clobber
+      the worker image back to an old SHA.
   WorkerCpu:
     Type: String
     Default: "1024"
