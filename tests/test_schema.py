@@ -166,6 +166,153 @@ class TestFilesQuery:
         assert extra_file["href"] == "/files/x.pairs_px2"
 
     @pytest.mark.asyncio
+    async def test_returns_4dn_file_with_float_collection_protocol_fields(
+        self, mock_db
+    ):
+        """Test the files query serializes 4DN float collection protocol fields.
+
+        Given:
+            A 4DN file whose collections[0].extra.fourdn carries float
+            protocol fields (the shape persisted by the sync that crashed the
+            query with a string_type validation error).
+        When:
+            The GraphQL files query selects only localId.
+        Then:
+            It returns without errors and the file is present (no data:null).
+        """
+        # Arrange
+        doc = _make_file_doc("4DNFIFLOAT", submission="4dn")
+        doc["collections"] = [
+            {
+                "biosamples": [],
+                "extra": {
+                    "fourdn": {
+                        "crosslinking_temperature": 25.0,
+                        "ligation_volume": 0.12,
+                        "digestion_time": 960.0,
+                    }
+                },
+            }
+        ]
+        mock_db.files.docs = [doc]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files {
+                    localId
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert len(result.data["files"]) == 1
+        assert result.data["files"][0]["localId"] == "4DNFIFLOAT"
+
+    @pytest.mark.asyncio
+    async def test_returns_float_collection_protocol_fields_as_strings(
+        self, mock_db
+    ):
+        """Test the files query exposes float protocol fields as string forms.
+
+        Given:
+            A 4DN file whose collections[0].extra.fourdn carries float
+            protocol fields.
+        When:
+            The GraphQL files query selects the nested protocol fields.
+        Then:
+            It returns without errors and each value is the string form.
+        """
+        # Arrange
+        doc = _make_file_doc("4DNFIFLOAT2", submission="4dn")
+        doc["collections"] = [
+            {
+                "biosamples": [],
+                "extra": {
+                    "fourdn": {
+                        "crosslinking_temperature": 25.0,
+                        "ligation_volume": 0.12,
+                        "digestion_time": 960.0,
+                    }
+                },
+            }
+        ]
+        mock_db.files.docs = [doc]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files {
+                    localId
+                    collections {
+                        extra {
+                            fourdn {
+                                crosslinkingTemperature
+                                ligationVolume
+                                digestionTime
+                            }
+                        }
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        fourdn = result.data["files"][0]["collections"][0]["extra"]["fourdn"]
+        assert fourdn["crosslinkingTemperature"] == "25.0"
+        assert fourdn["ligationVolume"] == "0.12"
+        assert fourdn["digestionTime"] == "960.0"
+
+    @pytest.mark.asyncio
+    async def test_returns_mixed_page_with_float_and_clean_docs(self, mock_db):
+        """Test a page mixing a float-protocol doc with clean docs returns all.
+
+        Given:
+            A page containing one 4DN file with float collection protocol
+            fields alongside two clean files (the blast-radius case where one
+            bad doc previously failed the whole page).
+        When:
+            The GraphQL files query selects localId.
+        Then:
+            It returns without errors and all three files are present.
+        """
+        # Arrange
+        float_doc = _make_file_doc("4DNFIMIX", submission="4dn")
+        float_doc["collections"] = [
+            {
+                "biosamples": [],
+                "extra": {"fourdn": {"digestion_time": 960.0}},
+            }
+        ]
+        mock_db.files.docs = [
+            float_doc,
+            _make_file_doc("clean1", "hubmap"),
+            _make_file_doc("clean2", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(page: 0, pageSize: 10) {
+                    localId
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        returned = {f["localId"] for f in result.data["files"]}
+        assert returned == {"4DNFIMIX", "clean1", "clean2"}
+
+    @pytest.mark.asyncio
     async def test_returns_all_submissions_without_filtering(self, mock_db):
         """Test the files query returns all DCCs when no filter is supplied.
 
