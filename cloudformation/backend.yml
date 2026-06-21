@@ -15,7 +15,16 @@ Parameters:
     Description: Name of the workers stack (worker task def + S3 cache)
   ImageURI:
     Type: String
-    Description: ECR image URI for the CFDB API
+    # NOTE: this default is dev-account/region-specific (account 605134458779,
+    # region us-east-2). Override it for any other environment.
+    Default: 605134458779.dkr.ecr.us-east-2.amazonaws.com/cfdb:dev
+    Description: >
+      ECR image URI for the CFDB API. Defaults to the moving :dev tag so
+      the CI moving-tag deploy (force-new-deployment re-pulls :dev) stays
+      the source of truth. On a stack UPDATE, CloudFormation reuses the
+      parameter's previous value, so this default only governs a fresh
+      stack CREATE — a later infra `cloudformation deploy` will not clobber
+      the live image back to an old SHA.
   WorkflowS3Prefix:
     Type: String
     Default: ""
@@ -271,6 +280,13 @@ Resources:
       - HTTPSListener
       - HTTPRedirectListener
     Properties:
+      # Explicit, deterministic service name so the CI deploy can target it
+      # via the BACKEND_SERVICE repo var without scraping the generated name.
+      # CAVEAT: introducing an explicit ServiceName on an existing
+      # CloudFormation-managed service forces a ONE-TIME replacement on the
+      # next deploy (the service is recreated under the new name), and the
+      # BACKEND_SERVICE repo var must then be set to "<stack>-service".
+      ServiceName: !Sub "${AWS::StackName}-service"
       Cluster: !Ref ECSCluster
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref DesiredCount
@@ -278,6 +294,16 @@ Resources:
       DeploymentConfiguration:
         MaximumPercent: 200
         MinimumHealthyPercent: 100
+        # Auto-roll a failed rollout back to the last-good task-def revision.
+        # CAVEAT with the moving :dev tag: that prior revision still
+        # references :dev, so an ECS rollback only reverts the task-def-level
+        # config (env, CPU, etc.) — it does NOT revert the code, because :dev
+        # has already moved to the new image. To actually revert code, pair
+        # this with the ECR re-tag rollback (re-tag the prior :<sha> onto :dev
+        # and force-new-deployment) described in the README.
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
       HealthCheckGracePeriodSeconds: 60
       EnableECSManagedTags: true
       NetworkConfiguration:
