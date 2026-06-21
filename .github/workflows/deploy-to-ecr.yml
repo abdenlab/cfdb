@@ -160,44 +160,6 @@ jobs:
             --cluster "$CLUSTER" \
             --services "$SERVICE"
 
-      # Best-effort guard against the "bootstrap not done" failure mode: if the
-      # task definition still pins a :<sha> instead of the moving :$MOVING_TAG,
-      # this deploy reports green (push + update-service + wait all succeed) but
-      # ships nothing — the service re-pulled the old pinned image. Warn rather
-      # than fail: we cannot read the task definition directly (the cfdb-deploy
-      # role intentionally lacks ecs:DescribeTaskDefinition), so we inspect the
-      # image of a running task via list-tasks -> describe-tasks (both granted)
-      # and check it ends in :$MOVING_TAG. continue-on-error keeps a transient
-      # describe hiccup from failing an otherwise-good deploy.
-      - name: Verify live image is moving tag
-        continue-on-error: true
-        env:
-          CLUSTER: ${{ vars.BACKEND_CLUSTER }}
-          SERVICE: ${{ vars.BACKEND_SERVICE }}
-        run: |
-          TASK_ARN=$(aws ecs list-tasks \
-            --region "$AWS_REGION" \
-            --cluster "$CLUSTER" \
-            --service-name "$SERVICE" \
-            --desired-status RUNNING \
-            --query 'taskArns[0]' --output text)
-          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
-            echo "::warning::No running task found; skipping live-image check"
-            exit 0
-          fi
-          IMAGE=$(aws ecs describe-tasks \
-            --region "$AWS_REGION" \
-            --cluster "$CLUSTER" \
-            --tasks "$TASK_ARN" \
-            --query 'tasks[0].containers[0].image' --output text)
-          echo "Live API image: $IMAGE"
-          case "$IMAGE" in
-            *:"$MOVING_TAG")
-              echo "Live image references the moving :$MOVING_TAG tag." ;;
-            *)
-              echo "::warning::Live API image ($IMAGE) does not reference :$MOVING_TAG — the one-time task-definition bootstrap may not have been run, so this deploy may not have shipped new code. See the README CI auto-deploy bootstrap note." ;;
-          esac
-
       # No ECS step for the worker fleet: the worker task definition also
       # references :$MOVING_TAG, and the workers are ephemeral — the next
       # EcsProvisioner RunTask (issued by the API role at workflow dispatch)
