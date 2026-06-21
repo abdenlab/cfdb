@@ -843,6 +843,11 @@ class TestEcsDiscoveryPickleAgainstMoto:
                 task_definition_family="worker",
                 client=client,
             )
+            # The ctor forbids client + region together, so set the rebuild
+            # region directly; __setstate__ passes it to build_ecs_client, so
+            # the rebuild resolves a region on a clean runner with no default
+            # AWS region in the environment (e.g. CI).
+            discovery._region_name = "us-east-1"
 
             # Act — dump + load must both happen inside mock_aws so the
             # __setstate__ rebuild can construct a fresh moto-backed client.
@@ -889,6 +894,10 @@ class TestEcsDiscoveryPickleAgainstMoto:
                 task_definition_family="worker",
                 client=client,
             )
+            # Set the rebuild region directly (the ctor forbids client +
+            # region together) so __setstate__'s build_ecs_client resolves a
+            # region on a clean runner with no default AWS region (e.g. CI).
+            discovery._region_name = "us-east-1"
             subscriber = discovery.subscribe()
             original_lock = discovery._state_lock
 
