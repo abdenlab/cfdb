@@ -323,9 +323,25 @@ async def lifespan(_: FastAPI):
                 # ecs profile launches one ephemeral worker per workflow,
                 # so concurrency is bounded by the AWS Fargate vCPU service
                 # quota, not an in-process lease.
+                #
+                # ``quorum=0`` disables wool's quorum readiness gate. The
+                # default (quorum=1, ~30s quorum_timeout) makes a cold-start
+                # dispatch — fired while the Fargate worker is still booting
+                # (image pull + health check, ~1-3 min) — blow the quorum
+                # wait and raise an un-retried ``TimeoutError`` out of
+                # ``WorkerPool.start``. cfdb's ``_open_stream_with_retry``
+                # only retries ``wool.NoWorkersAvailable``, so that
+                # ``TimeoutError`` fails the first request hard (and the
+                # provisioner's cancelled ``RunTask`` leaks an idle worker).
+                # With the gate off, a cold-start dispatch surfaces
+                # ``NoWorkersAvailable`` instead, which the executor already
+                # absorbs within its own ``_DISPATCH_WAIT_SECONDS`` budget —
+                # keeping the cold-start wait in one layer cfdb owns rather
+                # than duplicating it across wool's quorum wait too.
                 async with wool.WorkerPool(
                     discovery=discovery,
                     credentials=worker_credentials,
+                    quorum=0,
                 ):
                     # Snapshot the lifespan task's contextvars after the
                     # pool's ``__aenter__`` has populated wool's internals.

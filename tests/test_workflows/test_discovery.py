@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import uuid
 from typing import Any
 
+import cloudpickle
 import pytest
 import wool
+from wool.runtime.discovery.base import WorkerMetadata
 
 from cfdb.workflows.discovery import EcsDiscovery
 
@@ -549,3 +552,737 @@ class TestEcsDiscoveryAgainstMoto:
         assert ip is not None
         parts = ip.split(".")
         assert len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+class TestWoolReduceContract:
+    """Guard the wool reduce contract the discovery pickle fix relies on."""
+
+    def test_worker_proxy_should_expose_wool_reduce_hook(self):
+        """Test that ``wool.WorkerProxy`` still exposes ``__wool_reduce__``.
+
+        Given:
+            The installed ``wool.WorkerProxy``.
+        When:
+            It is introspected for the internal reduce hook.
+        Then:
+            ``__wool_reduce__`` exists — this is the hook that drags the
+            caller's ``discovery`` (an ``_EcsSubscriber`` wrapping the
+            ``EcsDiscovery``) across the dispatch boundary, so the whole
+            ``__getstate__`` / ``__setstate__`` pickle fix hinges on it.
+            A wool change to its reduce mechanism fails CI here rather
+            than silently breaking production while the direct-pickle
+            tests still pass.
+        """
+        # Act & assert
+        assert hasattr(wool.WorkerProxy, "__wool_reduce__")
+
+
+class TestEcsDiscoveryPickle:
+    """Cloudpickle round-trip behaviour of EcsDiscovery (issue #54 Bug 1).
+
+    wool's ``WorkerProxy.__wool_reduce__`` (its internal reduce hook,
+    exercised only by wool's own pickler — a vanilla
+    ``cloudpickle.dumps(proxy)`` is rejected) drags the caller's
+    ``discovery`` across the dispatch boundary, so ``EcsDiscovery`` MUST
+    serialize. Its live boto3 ECS client holds unpicklable transport
+    state (a thread lock under moto; an ssl.SSLContext once TLS is
+    configured) that cloudpickle cannot handle, so ``__getstate__`` nulls
+    it (and the other loop-bound runtime fields) and ``__setstate__``
+    rebuilds it via :func:`build_ecs_client`, mirroring ``S3Cache``.
+    """
+
+    def test___getstate___should_strip_client_and_loop_bound_fields(self):
+        """Test that __getstate__ nulls the boto3 client and drops live state.
+
+        Given:
+            An EcsDiscovery built with a dummy (picklable) ECS client.
+        When:
+            ``__getstate__`` is called.
+        Then:
+            ``_client`` is None and the loop-bound / live-runtime fields
+            (the two locks, the poll task, and the subscriber / known
+            sets) are absent from the pickled state, while the config
+            needed to rebuild the client (endpoint_url, region_name)
+            survives.
+        """
+        # Arrange
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+
+        # Act
+        state = discovery.__getstate__()
+
+        # Assert — the SSLContext-bearing client is gone...
+        assert state["_client"] is None
+        # ...as are the loop-bound locks, the poll task, and live state.
+        for transient in (
+            "_state_lock",
+            "_serialize_polls",
+            "_poll_task",
+            "_subscribers",
+            "_known",
+        ):
+            assert transient not in state
+        # ...but the boto rebuild config is retained.
+        assert "_endpoint_url" in state
+        assert "_region_name" in state
+
+    def test_cloudpickle_dumps_should_succeed_with_dummy_client(self):
+        """Test that an EcsDiscovery cloudpickle-serializes after __getstate__.
+
+        Given:
+            An EcsDiscovery built with a dummy ECS client (a real boto3
+            client cannot be constructed in this venv).
+        When:
+            ``cloudpickle.dumps`` is called on it.
+        Then:
+            Serialization succeeds — the boundary that wool's proxy
+            reduce-path exercises is no longer poisoned by the live
+            client.
+        """
+        # Arrange
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+
+        # Act
+        blob = cloudpickle.dumps(discovery)
+
+        # Assert
+        assert isinstance(blob, bytes) and blob
+
+    def test___setstate___should_rebuild_client_and_reset_runtime_state(
+        self, monkeypatch
+    ):
+        """Test that unpickling rebuilds the client and resets transient state.
+
+        Given:
+            An EcsDiscovery built with a DISTINCT original ECS client and
+            then serialized with cloudpickle, with ``build_ecs_client``
+            patched to return a fresh sentinel so unpickling does not
+            require a real boto3 ECS client (unbuildable in this venv).
+        When:
+            The blob is loaded back.
+        Then:
+            ``__setstate__`` rebuilds ``_client`` via ``build_ecs_client``
+            (so the restored client is the freshly-built sentinel, NOT the
+            original instance — a no-op ``__setstate__`` that left the
+            stripped ``None`` or somehow restored the original would fail
+            this assertion), threading the original endpoint_url /
+            region_name, and the transient runtime fields are recreated
+            empty (fresh locks, no poll task, empty subscriber and known
+            sets).
+        """
+        # Arrange — build with a distinct original client so the rebuild
+        # is observable. ``build_ecs_client`` is patched for the whole
+        # test (so __setstate__ doesn't reach for an unbuildable real
+        # client) and the boto kwargs are threaded via __dict__ rather
+        # than the ctor, which rejects client + endpoint/region together.
+        original_client = _FakeEcsClient()
+        rebuilt: dict[str, Any] = {}
+        sentinel = object()
+
+        def _fake_build(*, endpoint_url=None, region_name=None):
+            rebuilt["endpoint_url"] = endpoint_url
+            rebuilt["region_name"] = region_name
+            return sentinel
+
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client", _fake_build
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=original_client,
+            worker_port=4242,
+        )
+        # The ctor refuses client + endpoint/region together, so set the
+        # rebuild config directly to exercise the threading without that
+        # guard.
+        discovery._endpoint_url = "http://localstack:4566"
+        discovery._region_name = "us-east-2"
+        blob = cloudpickle.dumps(discovery)
+
+        # Act
+        restored = cloudpickle.loads(blob)
+
+        # Assert — the client was rebuilt via build_ecs_client (the
+        # restored client is the sentinel, NOT the original instance)...
+        assert restored._client is sentinel
+        assert restored._client is not original_client
+        assert rebuilt == {
+            "endpoint_url": "http://localstack:4566",
+            "region_name": "us-east-2",
+        }
+        # ...config survived the round-trip...
+        assert restored._cluster == "c"
+        assert restored._task_definition_family == "worker"
+        assert restored._worker_port == 4242
+        # ...and transient runtime state is fresh and inert.
+        assert restored._subscribers == []
+        assert restored._known == {}
+        assert restored._poll_task is None
+        assert restored._closed is False
+        assert isinstance(restored._state_lock, asyncio.Lock)
+        assert isinstance(restored._serialize_polls, asyncio.Lock)
+
+    def test___setstate___should_keep_existing_client_and_skip_rebuild(
+        self, monkeypatch
+    ):
+        """Test that __setstate__ preserves an already-present client.
+
+        Given:
+            A pickle state whose ``_client`` is already populated, with
+            ``build_ecs_client`` patched to a recording stub. (The pickle
+            protocol always nulls ``_client``, so a non-None client only
+            reaches ``__setstate__`` via a non-pickle caller; the state is
+            built by hand and the protocol method invoked directly to
+            exercise the guard that the pickle round-trip cannot reach.)
+        When:
+            ``__setstate__`` is applied to that state.
+        Then:
+            The existing client is preserved and ``build_ecs_client`` is
+            never called, so restoration is idempotent and never clobbers a
+            caller-supplied client.
+        """
+        # Arrange
+        build_calls = {"n": 0}
+
+        def _fake_build(*, endpoint_url=None, region_name=None):
+            build_calls["n"] += 1
+            return object()
+
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client", _fake_build
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+        existing_client = _FakeEcsClient()
+        state = discovery.__getstate__()
+        state["_client"] = existing_client
+
+        # Act
+        restored = EcsDiscovery.__new__(EcsDiscovery)
+        restored.__setstate__(state)
+
+        # Assert
+        assert restored._client is existing_client
+        assert build_calls["n"] == 0
+
+
+def _seeded_fake_client() -> _FakeEcsClient:
+    """Build a ``_FakeEcsClient`` seeded with one RUNNING + HEALTHY task."""
+    client = _FakeEcsClient()
+    task_id = uuid.uuid4().hex
+    arn = _task_arn(task_id)
+    client.task_arns = [arn]
+    task = _running_task(task_id)
+    task["taskArn"] = arn
+    client.tasks = [task]
+    return client
+
+
+class TestEcsDiscoveryPickleAgainstMoto:
+    """Cloudpickle round-trip against a REAL boto3 ECS client (issue #54 Bug 1).
+
+    The pure-unit pickle tests inject ``_FakeEcsClient``, which is itself
+    picklable — so they prove ``__getstate__`` runs but not that it is
+    *load-bearing*. The real boto3 ECS client holds unpicklable transport
+    state (a thread lock under moto; an ssl.SSLContext once TLS is
+    configured) via its urllib3 pools and is genuinely unpicklable; this
+    is the test that fails if ``__getstate__`` ever stops nulling
+    ``_client``. A real client can only be built inside
+    ``moto.mock_aws()`` (the venv lacks ``botocore[crt]`` for the default
+    credential chain), and ``cloudpickle.loads`` must also run inside the
+    context because ``__setstate__`` rebuilds the client via
+    :func:`build_ecs_client`.
+    """
+
+    def test_cloudpickle_roundtrip_should_succeed_with_real_boto3_client(self):
+        """Test that an EcsDiscovery over a real boto3 client round-trips.
+
+        Given:
+            A real boto3 ``ecs`` client built inside ``moto.mock_aws()``
+            (the raw client is unpicklable — cloudpickle chokes on its
+            unpicklable transport state: a thread lock under moto, an
+            ssl.SSLContext once TLS is configured), wrapped in an
+            EcsDiscovery.
+        When:
+            The discovery is ``cloudpickle.dumps``'d and ``loads``'d back
+            inside the same moto context.
+        Then:
+            The full round-trip succeeds — ``__getstate__`` strips the
+            unpicklable client and ``__setstate__`` rebuilds a fresh one
+            via :func:`build_ecs_client`. This is the load-bearing proof
+            the ``_FakeEcsClient`` tests cannot give.
+        """
+        import boto3
+        from moto import mock_aws
+
+        with mock_aws():
+            # Arrange — the raw client cannot be pickled. The concrete
+            # failure is a TypeError (cloudpickle wraps the unpicklable
+            # transport state — a thread lock under moto, an
+            # ssl.SSLContext once TLS is configured — and re-raises as
+            # TypeError/PicklingError). Narrow to those rather than a
+            # bare Exception so an unrelated error doesn't masquerade as
+            # "the client is unpicklable".
+            client = boto3.client("ecs", region_name="us-east-1")
+            with pytest.raises((TypeError, pickle.PicklingError)):
+                cloudpickle.dumps(client)
+            discovery = EcsDiscovery(
+                cluster="c",
+                task_definition_family="worker",
+                client=client,
+            )
+            # The ctor forbids client + region together, so set the rebuild
+            # region directly; __setstate__ passes it to build_ecs_client, so
+            # the rebuild resolves a region on a clean runner with no default
+            # AWS region in the environment (e.g. CI).
+            discovery._region_name = "us-east-1"
+
+            # Act — dump + load must both happen inside mock_aws so the
+            # __setstate__ rebuild can construct a fresh moto-backed client.
+            restored = cloudpickle.loads(cloudpickle.dumps(discovery))
+
+            # Assert — a real client survived the boundary.
+            assert restored._client is not None
+            assert restored._client is not client
+            assert restored._cluster == "c"
+            assert restored._task_definition_family == "worker"
+
+    def test_subscriber_roundtrip_should_rebuild_owner_client_and_lock(self):
+        """Test that the subscriber wool serializes round-trips over a real client.
+
+        Given:
+            A real boto3 ``ecs`` client built inside ``moto.mock_aws()``
+            and an EcsDiscovery whose ``subscribe()`` returns an
+            ``_EcsSubscriber`` wrapping the discovery as ``_owner``. The
+            subscriber — not the bare discovery — is the object wool's
+            ``WorkerProxy.__wool_reduce__`` actually drags across the
+            dispatch boundary, so this is the load-bearing real-path
+            shape, exercised here via a vanilla cloudpickle round-trip
+            (wool's own pickler reaches the same ``__getstate__`` /
+            ``__setstate__`` on ``_owner``).
+        When:
+            The subscriber is ``cloudpickle.dumps``'d and ``loads``'d back
+            inside the same moto context (both hops inside ``mock_aws()``
+            because ``__setstate__`` rebuilds the client via
+            ``build_ecs_client``).
+        Then:
+            The round-trip succeeds and the restored subscriber's
+            ``_owner`` is a functional discovery handle — its ``_client``
+            was rebuilt (not left None) and its ``_state_lock`` is a fresh
+            ``asyncio.Lock`` minted by ``__setstate__``, not the original.
+        """
+        import boto3
+        from moto import mock_aws
+
+        with mock_aws():
+            # Arrange
+            client = boto3.client("ecs", region_name="us-east-1")
+            discovery = EcsDiscovery(
+                cluster="c",
+                task_definition_family="worker",
+                client=client,
+            )
+            # Set the rebuild region directly (the ctor forbids client +
+            # region together) so __setstate__'s build_ecs_client resolves a
+            # region on a clean runner with no default AWS region (e.g. CI).
+            discovery._region_name = "us-east-1"
+            subscriber = discovery.subscribe()
+            original_lock = discovery._state_lock
+
+            # Act — dump + load both inside mock_aws so the __setstate__
+            # rebuild on _owner can construct a fresh moto-backed client.
+            restored = cloudpickle.loads(cloudpickle.dumps(subscriber))
+
+            # Assert — the wrapped owner came back whole.
+            owner = restored._owner
+            assert owner._client is not None
+            assert owner._client is not client
+            assert isinstance(owner._state_lock, asyncio.Lock)
+            assert owner._state_lock is not original_lock
+
+
+class TestEcsDiscoveryPickleUnpicklableClient:
+    """Round-trip resilience when the live client is deliberately unpicklable."""
+
+    def test_cloudpickle_dumps_should_succeed_with_unpicklable_client(self):
+        """Test that dumps succeeds even when the live client cannot pickle.
+
+        Given:
+            An EcsDiscovery whose injected client raises from
+            ``__reduce__`` (a stand-in for the real boto3 client's
+            unpicklable ``ssl.SSLContext``).
+        When:
+            ``cloudpickle.dumps`` is called on the discovery.
+        Then:
+            Serialization succeeds because ``__getstate__`` nulls
+            ``_client`` before cloudpickle ever tries to reduce it — so
+            the client's broken ``__reduce__`` is never reached.
+        """
+        # Arrange
+        class _Unpicklable:
+            def __reduce__(self):
+                raise RuntimeError("this client must never be pickled")
+
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_Unpicklable(),
+        )
+
+        # Act
+        blob = cloudpickle.dumps(discovery)
+
+        # Assert
+        assert isinstance(blob, bytes) and blob
+
+    @pytest.mark.asyncio
+    async def test_restored_discovery_should_poll_with_rebuilt_client(
+        self, monkeypatch
+    ):
+        """Test that a round-tripped discovery polls via its rebuilt client.
+
+        Given:
+            ``build_ecs_client`` patched to return a ``_FakeEcsClient``
+            seeded with one RUNNING + HEALTHY task, and an EcsDiscovery
+            cloudpickle round-tripped through that patch.
+        When:
+            ``poll_once`` is awaited and a subscriber is opened on the
+            restored instance.
+        Then:
+            The rebuilt client drives a real poll — one ``worker-added``
+            event is emitted — and the restored object's fresh locks and
+            subscriber machinery work together, proving the round-trip
+            yields a functional discovery handle, not just a field-shaped
+            husk.
+        """
+        # Arrange — patch build so __setstate__ gets a working fake client.
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: _seeded_fake_client(),
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+            worker_port=4242,
+        )
+        restored = cloudpickle.loads(cloudpickle.dumps(discovery))
+
+        # Act
+        events, resolved = await restored.poll_once()
+
+        # Assert — the rebuilt client produced a live worker-added event...
+        assert [e.type for e in events] == ["worker-added"]
+        assert len(resolved) == 1
+        # ...and the restored subscriber machinery (fresh locks) works.
+        sub = restored.subscribe()
+        first = await asyncio.wait_for(sub.__aiter__().__anext__(), timeout=1.0)
+        assert first.type == "worker-added"
+        assert first.metadata.address.endswith(":4242")
+
+    def test_cloudpickle_roundtrip_should_be_idempotent(self, monkeypatch):
+        """Test that two successive round-trips both succeed and stay stable.
+
+        Given:
+            ``build_ecs_client`` patched to a stub and an EcsDiscovery.
+        When:
+            ``loads(dumps(...))`` is applied twice in sequence.
+        Then:
+            The second round-trip succeeds, the config is stable across
+            both, and the transient runtime fields remain fresh — so a
+            once-pickled-then-unpickled object remains re-picklable
+            (``__getstate__``/``__setstate__`` are not single-shot).
+        """
+        # Arrange
+        sentinel = object()
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: sentinel,
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+            worker_port=4242,
+        )
+
+        # Act
+        once = cloudpickle.loads(cloudpickle.dumps(discovery))
+        twice = cloudpickle.loads(cloudpickle.dumps(once))
+
+        # Assert — config stable across both hops...
+        assert twice._cluster == "c"
+        assert twice._task_definition_family == "worker"
+        assert twice._worker_port == 4242
+        assert twice._client is sentinel
+        # ...transients fresh after the second hop.
+        assert twice._subscribers == []
+        assert twice._known == {}
+        assert twice._poll_task is None
+        assert isinstance(twice._state_lock, asyncio.Lock)
+        assert isinstance(twice._serialize_polls, asyncio.Lock)
+
+
+class TestEcsDiscoveryGetstateNonMutation:
+    """``__getstate__`` must not mutate the live source instance."""
+
+    def test___getstate___should_not_mutate_source_instance(self, monkeypatch):
+        """Test that pickling a live discovery leaves the source intact.
+
+        Given:
+            A live EcsDiscovery with a real client, populated ``_known``
+            and ``_subscribers``, and its locks.
+        When:
+            The instance is cloudpickle-dumped (driving ``__getstate__``).
+        Then:
+            The SOURCE instance still has its ``_client``, both locks, its
+            ``_known`` entry, and its subscriber — proving ``__getstate__``
+            copies ``self.__dict__`` rather than stripping fields off the
+            live object (which would break a still-running API poller).
+        """
+        # Arrange
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: _FakeEcsClient(),
+        )
+        client = _FakeEcsClient()
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=client,
+        )
+        # Populate live state so a stripping mutation would be observable.
+        sub = discovery.subscribe()
+        discovery._subscribers.append(sub)
+        marker = WorkerMetadata(
+            uid=uuid.uuid4(), address="10.0.0.5:4242", pid=0, version="0"
+        )
+        discovery._known[str(marker.uid)] = marker
+        state_lock = discovery._state_lock
+        serialize_polls = discovery._serialize_polls
+
+        # Act
+        cloudpickle.dumps(discovery)
+
+        # Assert — the live source is untouched.
+        assert discovery._client is client
+        assert discovery._state_lock is state_lock
+        assert discovery._serialize_polls is serialize_polls
+        assert discovery._known == {str(marker.uid): marker}
+        assert discovery._subscribers == [sub]
+
+
+class TestEcsDiscoveryPickleEdges:
+    """Completeness/edge coverage for the pickle round-trip (issue #54)."""
+
+    def test___setstate___should_preserve_poll_interval_and_version(
+        self, monkeypatch
+    ):
+        """Test that non-default ``_poll_interval`` / ``_version`` survive.
+
+        Given:
+            An EcsDiscovery built with a non-default ``poll_interval`` and
+            ``version``, with ``build_ecs_client`` stubbed.
+        When:
+            The instance is cloudpickle round-tripped.
+        Then:
+            Both ``_poll_interval`` and ``_version`` survive — config the
+            in-diff setstate test does not assert — confirming the full
+            config payload (not just cluster/family/port) crosses the
+            boundary.
+        """
+        # Arrange
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: object(),
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+            poll_interval=12.5,
+            version="cfdb-1.2.3",
+        )
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(discovery))
+
+        # Assert
+        assert restored._poll_interval == 12.5
+        assert restored._version == "cfdb-1.2.3"
+
+    def test___setstate___should_rebuild_with_none_endpoint_and_region(
+        self, monkeypatch
+    ):
+        """Test that a client-injected discovery rebuilds with None boto kwargs.
+
+        Given:
+            An EcsDiscovery built by injecting ``client=`` (so its
+            ``_endpoint_url`` and ``_region_name`` are both None — the
+            ctor forbids passing the boto kwargs alongside a client).
+        When:
+            The instance is cloudpickle round-tripped through a stubbed
+            ``build_ecs_client`` that records its kwargs.
+        Then:
+            ``build_ecs_client`` is called with ``endpoint_url=None`` and
+            ``region_name=None`` — the None/None rebuild branch, distinct
+            from the in-diff test that threads concrete localstack values.
+        """
+        # Arrange
+        captured: dict[str, Any] = {}
+
+        def _fake_build(*, endpoint_url=None, region_name=None):
+            captured["endpoint_url"] = endpoint_url
+            captured["region_name"] = region_name
+            return object()
+
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client", _fake_build
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+
+        # Act
+        cloudpickle.loads(cloudpickle.dumps(discovery))
+
+        # Assert
+        assert captured == {"endpoint_url": None, "region_name": None}
+
+    def test___setstate___should_reset_closed_flag_to_false(self, monkeypatch):
+        """Test that a ``_closed=True`` source restores with ``_closed=False``.
+
+        Given:
+            An EcsDiscovery whose ``_closed`` flag has been forced True
+            (as it would be after ``__aexit__`` ran), with
+            ``build_ecs_client`` stubbed.
+        When:
+            The instance is cloudpickle round-tripped.
+        Then:
+            The restored instance's ``_closed`` is False — ``__setstate__``
+            resets the shutdown latch so the unpickled handle is a fresh,
+            non-closed object rather than inheriting a stale closed state.
+        """
+        # Arrange
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: object(),
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+        discovery._closed = True
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(discovery))
+
+        # Assert
+        assert restored._closed is False
+
+    def test_two_loads_should_yield_independent_locks(self, monkeypatch):
+        """Test that two loads of one blob get distinct lock instances.
+
+        Given:
+            A single cloudpickle blob of an EcsDiscovery, with
+            ``build_ecs_client`` stubbed.
+        When:
+            The blob is loaded twice.
+        Then:
+            The two restored instances hold distinct ``asyncio.Lock``
+            objects — each ``__setstate__`` mints fresh locks, so two
+            workers unpickling the same dispatched discovery never share a
+            lock bound to a foreign event loop.
+        """
+        # Arrange
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: object(),
+        )
+        discovery = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+        blob = cloudpickle.dumps(discovery)
+
+        # Act
+        a = cloudpickle.loads(blob)
+        b = cloudpickle.loads(blob)
+
+        # Assert
+        assert a._state_lock is not b._state_lock
+        assert a._serialize_polls is not b._serialize_polls
+
+    def test_roundtrip_should_not_drift_from_a_freshly_constructed_instance(
+        self, monkeypatch
+    ):
+        """Test that a restored instance's field set matches a fresh one's.
+
+        Given:
+            A freshly-constructed EcsDiscovery and a cloudpickle
+            round-trip of an identically-constructed instance, with
+            ``build_ecs_client`` stubbed.
+        When:
+            The restored instance's ``__dict__`` keys are compared to the
+            fresh instance's.
+        Then:
+            The two field sets are identical AND no ``asyncio.Lock`` or
+            ``asyncio.Task`` instance survives in the restored
+            ``__dict__`` outside the freshly-minted ``_state_lock`` /
+            ``_serialize_polls`` — a drift sentinel so a future
+            loop-bound field added to ``__init__`` but not stripped in
+            ``__getstate__`` (or not reset in ``__setstate__``) fails CI
+            rather than silently riding a stale lock/task across the
+            worker boundary.
+        """
+        # Arrange
+        monkeypatch.setattr(
+            "cfdb.workflows.discovery.build_ecs_client",
+            lambda **_kwargs: object(),
+        )
+        fresh = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+        source = EcsDiscovery(
+            cluster="c",
+            task_definition_family="worker",
+            client=_FakeEcsClient(),
+        )
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(source))
+
+        # Assert — the field set has not drifted...
+        assert set(restored.__dict__) == set(fresh.__dict__)
+        # ...and no loop-bound lock/task survives beyond the two locks
+        # __setstate__ deliberately re-mints.
+        loop_bound = {"_state_lock", "_serialize_polls"}
+        for name, value in restored.__dict__.items():
+            if name in loop_bound:
+                continue
+            assert not isinstance(value, asyncio.Lock), (
+                f"{name} is an asyncio.Lock that survived the round-trip; "
+                "strip it in __getstate__ and reset it in __setstate__"
+            )
+            assert not isinstance(value, asyncio.Task), (
+                f"{name} is an asyncio.Task that survived the round-trip; "
+                "strip it in __getstate__ and reset it in __setstate__"
+            )
