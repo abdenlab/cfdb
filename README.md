@@ -554,6 +554,7 @@ Stream file contents from DCCs via HTTPS.
 | 403 | File requires authentication (consortium/protected access) or denied by upstream repository |
 | 404 | File not found, or HEAD probe of a not-yet-cached processed artifact (GET would dispatch) |
 | 416 | Range not satisfiable (out of bounds, or file size unknown so no range can be satisfied) |
+| 429 | Too many active preprocessing jobs — the active-workflow ceiling (`CFDB_WORKFLOW_MAX_ACTIVE`) is reached; `Retry-After` header set. Retry shortly. |
 | 501 | No supported access method (e.g., Globus-only files) |
 | 502 | Upstream service error |
 | 503 | Workflow subsystem shutting down (`Retry-After`) |
@@ -592,6 +593,7 @@ Stream index files (e.g., `.px2`, `.bai`) associated with DCC data files.
 | 403 | File requires consortium/protected access (HuBMAP) |
 | 404 | File not found, format has no index (CSV/TSV/bigWig), or HEAD probe of a not-yet-cached index |
 | 416 | Range not satisfiable |
+| 429 | Too many active preprocessing jobs — the active-workflow ceiling (`CFDB_WORKFLOW_MAX_ACTIVE`) is reached; `Retry-After` header set. Retry shortly. |
 | 502 | Upstream service error or malformed sidecar |
 | 503 | Workflow subsystem disabled (set `SYNC_DATA_DIR`) for a processable format, or shutting down (`Retry-After`) |
 
@@ -651,6 +653,13 @@ The preprocessed artifact is the default response. Clients that want the raw ups
 
 Cache keys are content-addressed using each file's upstream `md5`, so a byte change upstream (with the sync pipeline refreshing `md5`) invalidates the cache automatically.
 
+**Bounded concurrency, durable queuing, and admission control.** Dispatch is bounded on three cooperating layers so an unauthenticated burst on `/data` and `/index` can't oversubscribe the worker fleet or queue unbounded work:
+
+- **Per-worker backpressure** — each worker accepts at most `CFDB_WORKER_MAX_CONCURRENT_TASKS` tasks at once (default `1`), serializing the subprocess pipelines on a 1-vCPU worker. A worker at capacity rejects the dispatch and the API's priority load balancer rotates to the next worker.
+- **Priority (leaky-bucket) load balancing** — the API offers each task to discovered workers in a stable order, so load concentrates on the lowest-ordered workers and over-provisioned workers drain to idle and self-reap (via `CFDB_WORKER_MAX_LIFETIME_SECONDS`) instead of every worker carrying a thin perpetual slice.
+- **Durable queue + retry-to-deadline** — when no worker has capacity, the job is **not** failed and does **not** block the request: it stays `pending` and a durable, Mongo-backed scheduler re-attempts dispatch every `CFDB_WORKFLOW_RETRY_INTERVAL_S` (plus jitter) until a worker frees up or the `CFDB_WORKFLOW_DISPATCH_DEADLINE_S` deadline elapses (then it is failed with a `capacity:`-prefixed error). Because the queue lives in Mongo, an API restart resumes it. On the ECS profile, an overflow also requests one bounded worker spawn (the leaky bucket overflowing), inverting the old unconditional per-request spawn.
+- **Admission ceiling** — once `CFDB_WORKFLOW_MAX_ACTIVE` workflows are active (`pending` + `running`), further preprocessing requests are shed with `429 Retry-After` rather than queued, so the backlog itself is bounded. The readiness `/status` probes never dispatch and so never `429`.
+
 `/index` continues to serve upstream sidecars first when present (the 218 BED→beddb and 4 BED→tbi 4DN cases that publish under `extra.extra_files` or `extra.fourdn.extra_files`); the workflow path is dispatched only when no sidecar exists. Set `?raw=true` to bypass the workflow path entirely and return only the upstream sidecar (404 when none exists).
 
 Required environment variables:
@@ -659,10 +668,16 @@ Required environment variables:
 - `WORKFLOW_WORKER_COUNT` — local-dev only: how many workers the LAN pool (`python -m cfdb.workflows.worker_lan`) spawns and publishes (default `2`). The API itself no longer leases a fixed count — its `WorkerPool` admits every worker discovery surfaces. In the ECS profile one ephemeral worker is launched per workflow (via `EcsProvisioner` `RunTask`), so the **maximum concurrent worker count is bounded by the AWS Fargate vCPU service quota** for the account/region — raise it in Service Quotas; at 1 vCPU per worker it maps roughly 1:1 to concurrent workers. A burst of N distinct uncached files can launch up to ~N workers concurrently, subject to that quota.
 - `WORKFLOW_POOL_NAMESPACE` — wool discovery namespace shared by the API and the external worker pool (default `cfdb-workers`). Both processes must agree on this value or dispatch will hang waiting for workers.
 
+Bounded-concurrency control (issue #45):
+
+- `CFDB_WORKER_MAX_CONCURRENT_TASKS` — per-worker backpressure threshold: a worker rejects a dispatch (gRPC `RESOURCE_EXHAUSTED`, which the priority load balancer treats as transient and rotates past) once it already has this many tasks in flight (default `1`, to serialize the subprocess pipelines on a 1-vCPU worker; `0` disables backpressure). Set on the **worker** process.
+- `CFDB_WORKFLOW_MAX_ACTIVE` — admission ceiling on concurrently active workflows (`pending` + `running` jobs). Once this many are active, `/data` and `/index` shed new preprocessing requests with `429 Retry-After` before claiming the per-file mutex (default `1024`). Soft cap — a count-then-claim race may briefly overshoot. Set on the **API**.
+- `CFDB_WORKFLOW_RETRY_INTERVAL_S` — base cadence (plus a small random jitter) at which the durable retry scheduler re-attempts dispatch for a job awaiting worker capacity (default `120`, i.e. 2 min). A dispatch attempt that finds no free worker leaves the job `pending` and rescheduled rather than blocking the request. Set on the **API**.
+- `CFDB_WORKFLOW_DISPATCH_DEADLINE_S` — how long a job may wait for worker capacity (re-attempted on the retry cadence above) before the scheduler fails it with a `capacity:`-prefixed error (default `14400`, i.e. 4 h). Replaces the former single in-request `CFDB_WORKFLOW_DISPATCH_WAIT_S` wait — instead of blocking one request on a cold start, the job queues durably and is retried to this deadline. Set on the **API**.
+
 Optional tunables (with defaults):
 
 - `CFDB_WORKFLOW_DURATION_CAP_S` — per-workflow wall-clock cap (default `14400`, i.e. 4 h — sized for multi-hour preprocessing runs; lower it for fixture-bound dev).
-- `CFDB_WORKFLOW_DISPATCH_WAIT_S` — how long `ensure_workflow` waits for a free worker before giving up (default `240`, i.e. 4 min — sized for an ECS Fargate cold start: image pull + health check typically take 1-3 min, so a smaller budget can expire before a freshly-provisioned worker reports HEALTHY and hard-fail the first request. Lower it for fixture-bound dev where workers are already running).
 - `CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S` — cadence at which the wool routine emits heartbeat events during quiet stages so the API can refresh `JobRecord.updated_at` (default `300`). The stale-reclaim threshold below is sized as `2 × heartbeat + safety_margin`; lowering this knob without also lowering the threshold widens the false-reclaim window.
 - `CFDB_WORKFLOW_STALE_THRESHOLD_S` — `updated_at` age beyond which an active row is reclaimable (default `900`; sized as `2 × heartbeat_interval + safety_margin` so a single missed heartbeat does not falsely reclaim a healthy worker).
 - `CFDB_SAMTOOLS_THREADS` (default `1`), `CFDB_SORT_PARALLEL` (default `2`) — CPU/thread caps for `samtools sort/index` and GNU `sort` respectively.
