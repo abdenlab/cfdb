@@ -912,6 +912,82 @@ class TestEcsDiscoveryPickleAgainstMoto:
             assert isinstance(owner._state_lock, asyncio.Lock)
             assert owner._state_lock is not original_lock
 
+    @pytest.mark.asyncio
+    async def test_subscriber_roundtrip_should_succeed_when_queue_has_pending_getter(
+        self,
+    ):
+        """Test that a mid-consumption subscriber survives the wool reduce.
+
+        Given:
+            An ``_EcsSubscriber`` from ``EcsDiscovery.subscribe()`` over a
+            real boto3 ``ecs`` client (built inside ``moto.mock_aws()``)
+            driven into the live "being consumed" shape: a getter parked
+            on its queue (so the queue holds an ``_asyncio.Future``) and
+            the single-use ``_exhausted`` flag flipped, exactly as
+            ``_iter`` leaves it while the API's ``WorkerPool`` is parked on
+            ``await self._queue.get()``. The fresh, never-consumed
+            subscriber in the sibling test above does not reproduce the
+            production failure; this one does.
+        When:
+            The subscriber is ``cloudpickle.dumps``'d and ``loads``'d back
+            inside the same moto context (both hops inside ``mock_aws()``
+            because ``_owner.__setstate__`` rebuilds its client via
+            ``build_ecs_client``).
+        Then:
+            Serialization succeeds — without ``_EcsSubscriber.__getstate__``
+            it raises ``cannot pickle '_asyncio.Future'`` — and the restored
+            subscriber is a fresh, inert handle: an empty ``asyncio.Queue``,
+            ``_exhausted`` reset to False, the original ``_filter`` retained,
+            and an ``_owner`` whose ``_client`` was rebuilt (not left None).
+        """
+        import boto3
+        from moto import mock_aws
+
+        with mock_aws():
+            # Arrange — a real client, an EcsDiscovery, and a subscriber
+            # forced into the "being consumed" state: the single-use flag
+            # set and a getter parked on the queue so it holds an
+            # _asyncio.Future (the object cloudpickle chokes on today).
+            client = boto3.client("ecs", region_name="us-east-1")
+            discovery = EcsDiscovery(
+                cluster="c",
+                task_definition_family="worker",
+                client=client,
+            )
+            # The ctor forbids client + region together; set the rebuild
+            # region directly so __setstate__'s build_ecs_client resolves a
+            # region on a clean runner with no default AWS region (e.g. CI).
+            discovery._region_name = "us-east-1"
+            subscriber = discovery.subscribe(filter=lambda _meta: True)
+            subscriber._exhausted = True
+            getter = asyncio.ensure_future(subscriber._queue.get())
+            await asyncio.sleep(0)  # let the getter park inside queue.get()
+            assert not getter.done()  # precondition: a Future is parked
+            # The parked getter is registered as a pending Future in the
+            # queue's internal getter deque — the exact object cloudpickle
+            # rejects pre-fix.
+            assert subscriber._queue._getters
+
+            # Act — dump + load both inside mock_aws so the __setstate__
+            # rebuild on _owner can construct a fresh moto-backed client.
+            # Cancel the parked getter regardless of outcome so a pre-fix
+            # TypeError still leaves no dangling task.
+            try:
+                restored = cloudpickle.loads(cloudpickle.dumps(subscriber))
+            finally:
+                getter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await getter
+
+            # Assert — the restored subscriber is a fresh, inert handle...
+            assert isinstance(restored._queue, asyncio.Queue)
+            assert restored._queue.empty()
+            assert restored._exhausted is False
+            assert restored._filter is not None
+            # ...wrapping an owner whose client was rebuilt, not left None.
+            assert restored._owner._client is not None
+            assert restored._owner._client is not client
+
 
 class TestEcsDiscoveryPickleUnpicklableClient:
     """Round-trip resilience when the live client is deliberately unpicklable."""

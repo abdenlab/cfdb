@@ -538,6 +538,54 @@ class _EcsSubscriber:
         self._queue: asyncio.Queue[Optional[DiscoveryEvent]] = asyncio.Queue()
         self._exhausted = False
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Strip the live queue so the subscriber survives the wool reduce.
+
+        wool's ``WorkerProxy.__wool_reduce__`` reduces the *subscriber*
+        (the discovery rides along as ``_owner``), so ``_EcsSubscriber``
+        MUST cloudpickle — the same contract ``EcsDiscovery.__getstate__``
+        honors one level up. While the API's ``WorkerPool`` is consuming
+        the subscriber, ``_iter`` is parked on ``await self._queue.get()``,
+        so the queue's internal getter deque holds a pending
+        ``_asyncio.Future`` that cloudpickle cannot serialize (and the
+        queue is bound to the API's event loop besides). Drop ``_queue``
+        and the single-use ``_exhausted`` flag; ``__setstate__`` recreates
+        a fresh, empty queue. Under cfdb's single-level dispatch the worker
+        never consumes the restored subscriber, so an inert empty queue is
+        correct — only ``_owner`` (itself made picklable by
+        ``EcsDiscovery.__getstate__``) and ``_filter`` carry meaning across
+        the boundary. Any events still buffered in the queue (and the
+        ``None`` shutdown sentinel) are discarded by design: they are only
+        meaningful to the API-side iterator on the originating loop, never
+        to the restored copy.
+        """
+        state = self.__dict__.copy()
+        # Loop-bound / live-runtime fields — recreated fresh in
+        # ``__setstate__`` so a stale ``_exhausted`` flag or a queue
+        # carrying a pending getter never rides along in the pickled state.
+        state.pop("_queue", None)
+        state.pop("_exhausted", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore the subscriber with a fresh, inert queue.
+
+        Mirrors ``EcsDiscovery.__setstate__``: config (``_owner``,
+        ``_filter``) is restored from ``state`` while the live runtime
+        field stripped by ``__getstate__`` — the event queue — is
+        recreated empty and the single-use ``_exhausted`` flag is reset to
+        False, so the unpickled object is a well-formed, never-iterated
+        subscriber. Under cfdb's single-level dispatch the worker never
+        enters the discovery context or drives the iterator, so the fresh
+        queue simply stays empty. Unlike ``EcsDiscovery.__setstate__``'s
+        ``if self._client is None`` guard, the reset here is unconditional:
+        ``__getstate__`` always strips both fields, so they never arrive in
+        ``state`` and there is nothing to preserve.
+        """
+        self.__dict__.update(state)
+        self._queue = asyncio.Queue()
+        self._exhausted = False
+
     def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
         return self._iter()
 
