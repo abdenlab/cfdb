@@ -128,8 +128,11 @@ class TestTaskCountBackpressure:
         # Arrange
         hook = TaskCountBackpressure(1)
 
-        # Act & assert
+        # Act & assert — structural conformance, plus the bool-return
+        # contract wool actually depends on (BackpressureLike is satisfied
+        # by any callable, so the return-type check gives the test teeth).
         assert isinstance(hook, wool.BackpressureLike)
+        assert isinstance(hook(_ctx(active_task_count=0)), bool)
 
 
 class TestBackpressureFor:
@@ -163,3 +166,18 @@ class TestBackpressureFor:
         # Assert
         assert isinstance(hook, TaskCountBackpressure)
         assert hook.threshold == 2
+
+    def test_backpressure_for_should_raise_on_negative_threshold(self):
+        """Test that a negative threshold is rejected, not silently disabled.
+
+        Given:
+            A negative threshold.
+        When:
+            backpressure_for is called.
+        Then:
+            It should raise ValueError, so a negative value cannot
+            accidentally disable backpressure (only 0 disables it).
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match=">= 0"):
+            backpressure_for(-1)

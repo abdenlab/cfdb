@@ -97,6 +97,12 @@ async def test_lifespan_should_construct_worker_pool_with_quorum_zero(
     assert kwargs["quorum"] == 0
     assert kwargs["discovery"] is sentinel_discovery
     assert kwargs["credentials"] == "CREDS-SENTINEL"
+    # The priority/leaky-bucket balancer must be wired in (issue #45). This
+    # file exists to pin pool kwargs against silent regressions, so the
+    # load balancer belongs here alongside quorum/discovery/credentials.
+    from cfdb.workflows.loadbalancer import PriorityLoadBalancer
+
+    assert isinstance(kwargs["loadbalancer"], PriorityLoadBalancer)
 
 
 def test_worker_pool_signature_should_accept_quorum():

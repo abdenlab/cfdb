@@ -2,13 +2,16 @@
 
 Unlike wool's round-robin balancer, this one always offers a task to the
 discovered workers in the same stable order (sorted by
-``WorkerMetadata.uid``) on every dispatch. Combined with per-worker
-backpressure (one task per worker), load concentrates on the
-lowest-ordered workers and higher-ordered workers drain to idle — so an
-over-provisioned fleet sheds idle capacity (workers self-terminate on
-their max-lifetime) instead of every worker carrying a thin, perpetual
-slice of traffic. This is the "leaky bucket": fill the priority workers
-first and let the overflow spill to the next.
+``WorkerMetadata.uid``) on every dispatch. The order is arbitrary but
+reproducible — ``uid`` is a per-worker UUID, not a seniority or cost
+ranking; what matters is only that the same workers are offered work first
+on each dispatch. Combined with per-worker backpressure (one task per
+worker), load concentrates on the lowest-ordered workers and
+higher-ordered workers drain to idle — so an over-provisioned fleet sheds
+idle capacity (workers self-terminate on their max-lifetime) instead of
+every worker carrying a thin, perpetual slice of traffic. This is the
+"leaky bucket": fill the priority workers first and let the overflow spill
+to the next.
 
 It honors wool's load-balancer worker-health contract (see
 :class:`wool.LoadBalancerLike`): rotate to the next worker on

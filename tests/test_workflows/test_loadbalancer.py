@@ -237,3 +237,90 @@ class TestPriorityLoadBalancer:
         """
         # Act & assert
         assert isinstance(PriorityLoadBalancer(), wool.LoadBalancerLike)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_pick_same_priority_worker_across_dispatches(self):
+        """Test that the priority order is stable across repeated dispatches.
+
+        Given:
+            Three healthy workers and a single balancer + context reused
+            across two consecutive dispatches.
+        When:
+            Two tasks are dispatched in succession.
+        Then:
+            Both should go to the lowest-uid worker — the leaky-bucket
+            invariant, distinct from round-robin which advances each call.
+        """
+        # Arrange
+        conns = {
+            _FakeMeta("a"): _FakeConn("s-a"),
+            _FakeMeta("b"): _FakeConn("s-b"),
+            _FakeMeta("c"): _FakeConn("s-c"),
+        }
+        context = _FakeContext(conns)
+        balancer = PriorityLoadBalancer()
+
+        # Act
+        first = await balancer.dispatch(object(), context=context)
+        second = await balancer.dispatch(object(), context=context)
+
+        # Assert
+        assert first == "s-a"
+        assert second == "s-a"
+        assert conns[_FakeMeta("a")].calls == 2
+        assert conns[_FakeMeta("b")].calls == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_continue_in_order_after_evicting_first_worker(self):
+        """Test that evicting the first worker still tries the rest in order.
+
+        Given:
+            Three workers where the lowest-uid one fails with a non-transient
+            RpcError and the next accepts.
+        When:
+            A task is dispatched.
+        Then:
+            It should evict the first, dispatch to the second, and finish the
+            pass without error — pinning that iteration runs over a snapshot,
+            not the live worker map mutated by remove_worker.
+        """
+        # Arrange
+        broken = _FakeMeta("a")
+        conns = {
+            broken: _FakeConn(wool.RpcError(details="broken")),
+            _FakeMeta("b"): _FakeConn("s-b"),
+            _FakeMeta("c"): _FakeConn("s-c"),
+        }
+        context = _FakeContext(conns)
+
+        # Act
+        stream = await PriorityLoadBalancer().dispatch(object(), context=context)
+
+        # Assert
+        assert stream == "s-b"
+        assert context.removed == [broken]
+        assert conns[_FakeMeta("c")].calls == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_order_workers_by_string_form_of_uid(self):
+        """Test that workers are ordered by the string form of their uid.
+
+        Given:
+            Two workers with non-string uids (10 and 2) whose lexicographic
+            string order ("10" < "2") differs from numeric order.
+        When:
+            A task is dispatched.
+        Then:
+            It should pick the worker whose str(uid) sorts first ("10"),
+            pinning the str(uid) coercion that gives a total, orderable key
+            regardless of the uid's concrete type.
+        """
+        # Arrange
+        conns = {_FakeMeta(10): _FakeConn("s-10"), _FakeMeta(2): _FakeConn("s-2")}
+        context = _FakeContext(conns)
+
+        # Act
+        stream = await PriorityLoadBalancer().dispatch(object(), context=context)
+
+        # Assert
+        assert stream == "s-10"
