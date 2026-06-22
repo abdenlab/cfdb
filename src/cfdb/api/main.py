@@ -33,6 +33,7 @@ from cfdb.indexes import ensure_indexes, operational_index_specs
 from cfdb.workflows.credentials import build_worker_credentials
 from cfdb.workflows.discovery import EcsDiscovery
 from cfdb.workflows.executor import WoolExecutor
+from cfdb.workflows.loadbalancer import PriorityLoadBalancer
 from cfdb.workflows.processors.bam import BamIndexProcessor
 from cfdb.workflows.processors.registry import default_registry
 from cfdb.workflows.processors.tabix import TabixIntervalProcessor
@@ -342,6 +343,13 @@ async def lifespan(_: FastAPI):
                     discovery=discovery,
                     credentials=worker_credentials,
                     quorum=0,
+                    # Priority/leaky-bucket balancing: always offer a task to
+                    # discovered workers in the same stable order. With
+                    # per-worker backpressure (one task each), load fills the
+                    # lowest-ordered workers first and higher-ordered ones
+                    # drain to idle and self-reap, instead of every worker
+                    # carrying a thin perpetual slice (issue #45).
+                    loadbalancer=PriorityLoadBalancer(),
                 ):
                     # Snapshot the lifespan task's contextvars after the
                     # pool's ``__aenter__`` has populated wool's internals.
