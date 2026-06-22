@@ -32,6 +32,7 @@ Environment variables (CLI flags mirror them):
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import signal
 from typing import Optional
@@ -40,6 +41,8 @@ import click
 import wool
 from wool.runtime.discovery.lan import LanDiscovery
 
+from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
+from cfdb.workflows.backpressure import backpressure_for
 from cfdb.workflows.credentials import build_worker_credentials
 
 logger = logging.getLogger(__name__)
@@ -97,18 +100,31 @@ async def serve(
         except NotImplementedError:
             signal.signal(sig, _signal_handler_threaded)
 
+    # Bind per-worker backpressure onto the spawn factory so each spawned
+    # LocalWorker serializes its routines (mirrors the ECS worker_main
+    # wiring). ``functools.partial(..., backpressure=hook)`` keeps wool's
+    # ``declares_host`` True, so the pool still prescribes the bind host.
+    backpressure = backpressure_for(WORKER_MAX_CONCURRENT_TASKS)
+    worker_factory = (
+        functools.partial(wool.LocalWorker, backpressure=backpressure)
+        if backpressure is not None
+        else wool.LocalWorker
+    )
+
     pool = wool.WorkerPool(
         spawn=workers,
+        worker=worker_factory,
         discovery=LanDiscovery(namespace),
         credentials=credentials,
     )
     async with pool:
         logger.info(
-            "Published %d wool worker(s) under LAN namespace %r (mTLS %s) "
-            "— Ctrl-C to drain and exit",
+            "Published %d wool worker(s) under LAN namespace %r (mTLS %s, "
+            "max concurrent tasks %s) — Ctrl-C to drain and exit",
             workers,
             namespace,
             "enabled" if credentials is not None else "disabled",
+            WORKER_MAX_CONCURRENT_TASKS if backpressure is not None else "unbounded",
         )
         await stop_event.wait()
     return 0

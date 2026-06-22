@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Optional
 import click
 import wool
 
+from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
+from cfdb.workflows.backpressure import backpressure_for
 from cfdb.workflows.constants import DEFAULT_WORKER_PORT
 from cfdb.workflows.credentials import build_worker_credentials
 
@@ -136,16 +138,27 @@ async def serve(
         health_port, lambda: stop_event.is_set()
     )
 
+    # Per-worker backpressure: reject a dispatch once this worker already
+    # has CFDB_WORKER_MAX_CONCURRENT_TASKS routines in flight (default 1),
+    # so its subprocess pipelines serialize instead of oversubscribing the
+    # 1-vCPU task. ``None`` (threshold 0) keeps the unbounded prior behavior.
+    backpressure = backpressure_for(WORKER_MAX_CONCURRENT_TASKS)
+
     worker = wool.LocalWorker(
-        host="0.0.0.0", port=worker_port, credentials=credentials
+        host="0.0.0.0",
+        port=worker_port,
+        credentials=credentials,
+        backpressure=backpressure,
     )
     await worker.start()
     try:
         logger.info(
-            "Wool worker listening on port %d (health on %d, mTLS %s)",
+            "Wool worker listening on port %d (health on %d, mTLS %s, "
+            "max concurrent tasks %s)",
             worker_port,
             health_port,
             "enabled" if credentials is not None else "disabled",
+            WORKER_MAX_CONCURRENT_TASKS if backpressure is not None else "unbounded",
         )
         while True:
             # Check the self-termination path first. Max-lifetime is a
