@@ -81,6 +81,14 @@ class JobRecord(BaseModel):
             metadata as it was at claim time. Persisted on insert so a
             re-run / observer can reconstruct the dispatch context
             without re-reading the (possibly mutated) ``files`` document.
+        next_dispatch_at: When the durable retry scheduler should next
+            attempt to dispatch this (still-PENDING) job to a worker. Set
+            on claim and pushed forward each time an attempt finds no
+            capacity; ``None`` once the job is running or terminal. Drives
+            the scheduler's "due for dispatch" query.
+        dispatch_attempts: How many times dispatch has been deferred for
+            lack of worker capacity. Observability only — the failure
+            deadline is measured from ``submitted_at``, not this count.
     """
 
     model_config = ConfigDict(
@@ -107,18 +115,24 @@ class JobRecord(BaseModel):
     error: Annotated[str, StringConstraints(max_length=1024)] | None = None
     superseded_by: Annotated[str, StringConstraints(max_length=64)] | None = None
     file_meta_snapshot: dict[str, Any] | None = None
+    next_dispatch_at: datetime | None = None
+    dispatch_attempts: int = Field(default=0, ge=0)
 
-    @field_validator("submitted_at", "updated_at")
+    @field_validator("submitted_at", "updated_at", "next_dispatch_at")
     @classmethod
-    def _require_aware_datetime(cls, value: datetime) -> datetime:
+    def _require_aware_datetime(cls, value: datetime | None) -> datetime | None:
         """Reject naive datetimes.
 
         All internal producers go through ``lock._utcnow()`` which returns
         an aware UTC datetime; a naive value would either be a refactor
         regression or a malformed document. Caught here so the stale
-        cutoff comparison in ``claim_workflow`` can never raise
-        ``TypeError`` on a mismatched-naivety operand.
+        cutoff comparison in ``claim_workflow`` (and the scheduler's
+        ``next_dispatch_at`` comparison) can never raise ``TypeError`` on a
+        mismatched-naivety operand. ``next_dispatch_at`` is nullable, so a
+        ``None`` passes through untouched.
         """
+        if value is None:
+            return value
         if value.tzinfo is None:
             raise ValueError(
                 "JobRecord datetimes must be timezone-aware "
@@ -163,4 +177,6 @@ class JobRecord(BaseModel):
                 if self.file_meta_snapshot is not None
                 else None
             ),
+            "next_dispatch_at": self.next_dispatch_at,
+            "dispatch_attempts": self.dispatch_attempts,
         }

@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pymongo.write_concern import WriteConcern
 
@@ -133,7 +134,7 @@ def _record_from_mongo(doc: dict[str, Any]) -> JobRecord:
     here so the round-trip survives.
     """
     sanitized = {k: v for k, v in doc.items() if k != "_id"}
-    for field in ("submitted_at", "updated_at"):
+    for field in ("submitted_at", "updated_at", "next_dispatch_at"):
         value = sanitized.get(field)
         if isinstance(value, datetime) and value.tzinfo is None:
             sanitized[field] = value.replace(tzinfo=timezone.utc)
@@ -471,3 +472,66 @@ async def heartbeat_workflow(db, job_id: str) -> None:
         },
         {"$set": {"updated_at": _utcnow()}},
     )
+
+
+# --- Bounded-concurrency admission + durable dispatch retry (issue #45) ------
+
+
+async def count_active_workflows(db) -> int:
+    """Count workflows currently holding the mutex (pending + running).
+
+    Backs the admission ceiling in ``ensure_workflow``: once this reaches
+    ``CFDB_WORKFLOW_MAX_ACTIVE`` new requests are shed with 429. Soft by
+    nature — a count-then-insert race can briefly overshoot the cap, which
+    is acceptable for a flood guard.
+    """
+    jobs = _jobs(db)
+    return await jobs.count_documents({"status": {"$in": _ACTIVE_STATUS_VALUES}})
+
+
+async def reschedule_dispatch(db, job_id: str, *, next_at: datetime) -> None:
+    """Defer a still-PENDING job's next dispatch attempt to ``next_at``.
+
+    Called when a dispatch attempt finds no worker capacity: the job stays
+    PENDING and the durable scheduler re-attempts it at ``next_at``.
+    Fenced on PENDING so a job that has since gone RUNNING/terminal (a
+    racing attempt won the worker, or it was stale-reclaimed) is not
+    dragged back into the dispatch queue. Bumps ``dispatch_attempts`` for
+    observability.
+    """
+    jobs = _jobs(db)
+    await jobs.update_one(
+        {"job_id": job_id, "status": JobStatus.PENDING.value},
+        {
+            "$set": {"next_dispatch_at": next_at, "updated_at": _utcnow()},
+            "$inc": {"dispatch_attempts": 1},
+        },
+    )
+
+
+async def lease_due_dispatch(
+    db, *, now: datetime, next_at: datetime
+) -> Optional[JobRecord]:
+    """Atomically claim one PENDING job whose dispatch is due.
+
+    Selects a PENDING job with ``next_dispatch_at <= now`` and, in the same
+    operation, pushes its ``next_dispatch_at`` forward to ``next_at`` — so a
+    concurrent scheduler tick (or a second API replica) cannot lease the
+    same job, and a crash mid-attempt still leaves the job scheduled for a
+    later retry. Returns the leased job, or ``None`` when nothing is due.
+
+    The caller runs a dispatch attempt for the returned job; that attempt
+    either wins a worker (``mark_running``) or calls ``reschedule_dispatch``
+    again on overflow. Jobs with ``next_dispatch_at`` unset (``None``) are
+    never due, so they are not leased here.
+    """
+    jobs = _jobs(db)
+    doc = await jobs.find_one_and_update(
+        {
+            "status": JobStatus.PENDING.value,
+            "next_dispatch_at": {"$lte": now},
+        },
+        {"$set": {"next_dispatch_at": next_at, "updated_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return _record_from_mongo(doc) if doc is not None else None
