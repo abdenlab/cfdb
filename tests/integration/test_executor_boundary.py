@@ -127,8 +127,8 @@ class TestWoolExecutorPickleBoundary:
         assert final.status == JobStatus.FAILED
         assert final.error is not None
         # When the routine raises before yielding, wool propagates the
-        # exception across the boundary; the executor records
-        # ``str(exc)`` from the ``_open_stream_with_retry`` failure path.
+        # exception across the boundary; the executor records ``str(exc)``
+        # from ``_attempt_dispatch``'s stream-open failure path.
         # The exception class name is not part of the persisted error.
         assert "boom" in final.error
         # The scrub regex strips multi-segment absolute paths from the

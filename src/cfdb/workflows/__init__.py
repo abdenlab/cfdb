@@ -31,12 +31,6 @@ Runtime / lifecycle (consumed by the executor and lock modules):
   preprocessing runs (e.g., a ``samtools sort`` on a multi-GB BAM
   followed by ``samtools index``). Operators running on bounded fixtures
   in dev should lower this via env.
-- ``CFDB_WORKFLOW_DISPATCH_WAIT_S`` — how long ``ensure_workflow`` waits
-  for a wool worker to become available before giving up. Default ``240``
-  (4 min) — sized for an ECS Fargate cold start (image pull + health
-  check, typically 1-3 min). A smaller value risks exhausting the retry
-  budget before a freshly-provisioned worker reports HEALTHY; lower it
-  for fixture-bound dev where workers are already running.
 - ``CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S`` — how often the routine emits a
   heartbeat event during quiet periods so the API can refresh
   ``updated_at`` on the JobRecord. Default ``300`` (5 min).
@@ -134,24 +128,17 @@ SORT_PARALLEL: Final = _positive_int(
 # Runtime caps require ``minimum=1`` — zero values silently break the
 # corresponding loop or timeout (``asyncio.timeout(0)`` fires immediately,
 # ``HEARTBEAT_INTERVAL_S=0`` spins, ``STALE_THRESHOLD_S=0`` reclaims every
-# active job on every check, ``DISPATCH_WAIT_S=0`` makes every cold start
-# look like a hard failure).
+# active job on every check).
 WORKFLOW_DURATION_CAP_S: Final = _positive_int(
     "CFDB_WORKFLOW_DURATION_CAP_S",
     os.getenv("CFDB_WORKFLOW_DURATION_CAP_S", "14400"),
     minimum=1,
 )
-# Default sized for a Fargate cold start (image pull + health check,
-# ~1-3 min). With ``quorum=0`` a cold-start dispatch surfaces
-# ``NoWorkersAvailable``, which the executor retries inside this budget;
-# the old 60s default could expire before the just-launched worker
-# reports HEALTHY, hard-failing the first request. 240s covers the
-# cold-start window with headroom while staying env-overridable.
-WORKFLOW_DISPATCH_WAIT_S: Final = _positive_int(
-    "CFDB_WORKFLOW_DISPATCH_WAIT_S",
-    os.getenv("CFDB_WORKFLOW_DISPATCH_WAIT_S", "240"),
-    minimum=1,
-)
+# NOTE: the former ``CFDB_WORKFLOW_DISPATCH_WAIT_S`` (a single in-request
+# cold-start wait) was removed in the #45 restructure. A dispatch that
+# finds no capacity no longer blocks the request — the job queues durably
+# and the retry scheduler re-attempts it on ``CFDB_WORKFLOW_RETRY_INTERVAL_S``
+# until ``CFDB_WORKFLOW_DISPATCH_DEADLINE_S`` (both below).
 WORKFLOW_HEARTBEAT_INTERVAL_S: Final = _positive_int(
     "CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S",
     os.getenv("CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S", "300"),

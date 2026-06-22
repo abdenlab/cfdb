@@ -191,6 +191,13 @@ async def claim_workflow(
             submitted_at=now,
             updated_at=now,
             file_meta_snapshot=file_meta_snapshot,
+            # ``next_dispatch_at`` is intentionally left unset (None) on a
+            # fresh claim. ``ensure_workflow`` dispatches the first attempt
+            # inline; only if that attempt overflows (no worker capacity)
+            # does it set ``next_dispatch_at``, handing the job to the
+            # durable retry scheduler. A None value is never "due", so the
+            # scheduler can't double-dispatch a job whose inline attempt is
+            # still in flight.
         )
 
         # Attempt the insert first. If the partial-unique index admits it,

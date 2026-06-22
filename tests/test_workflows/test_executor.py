@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +22,19 @@ from cfdb.workflows.events import (
 )
 from cfdb.workflows.executor import (
     PIPELINE_VERSION,
+    AdmissionRejected,
     ExecutorDraining,
     WoolExecutor,
     WorkflowNotApplicable,
     extract_identity,
 )
 from cfdb.workflows.lock import get_job
-from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind, JobStatus
+from cfdb.workflows.models import (
+    ACTIVE_STATUSES,
+    ArtifactKind,
+    JobRecord,
+    JobStatus,
+)
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.registry import ProcessorRegistry
 from cfdb.workflows.provisioner import EcsProvisioner, RetryableProvisionerError
@@ -122,6 +130,42 @@ async def _wait_for_terminal(mock_db, job_id: str, timeout: float = 2.0) -> None
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"Job {job_id} did not reach terminal status")
+
+
+async def _seed_pending_job(
+    mock_db,
+    *,
+    submitted_at: datetime | None = None,
+    next_dispatch_at: datetime | None = None,
+    meta: dict[str, Any] | None = None,
+) -> JobRecord:
+    """Insert a PENDING job row directly and return its JobRecord.
+
+    Lets a test drive ``_attempt_dispatch`` / ``_drain_due_jobs`` against a
+    queued job without going through ``ensure_workflow`` (which would spawn
+    its own inline attempt). ``submitted_at`` controls the deadline clock;
+    ``next_dispatch_at`` controls scheduler due-ness.
+    """
+    meta = meta or _file_meta()
+    dcc, local_id, md5 = extract_identity(meta)
+    now = datetime.now(timezone.utc)
+    record = JobRecord(
+        job_id=str(uuid.uuid4()),
+        workflow_key=key_utils.workflow_key(
+            dcc=dcc, local_id=local_id, md5=md5, pipeline_version=PIPELINE_VERSION
+        ),
+        status=JobStatus.PENDING,
+        dcc=dcc,
+        local_id=local_id,
+        md5=md5,
+        pipeline_version=PIPELINE_VERSION,
+        submitted_at=submitted_at or now,
+        updated_at=now,
+        file_meta_snapshot=meta,
+        next_dispatch_at=next_dispatch_at,
+    )
+    await mock_db.jobs.insert_one(record.to_mongo())
+    return record
 
 
 class TestExtractIdentity:
@@ -862,22 +906,21 @@ def test_pipeline_version_should_be_positive():
     assert isinstance(PIPELINE_VERSION, int)
 
 
-class TestOpenStreamWithRetry:
+class TestOpenStreamOnce:
     @pytest.mark.asyncio
-    async def test_open_stream_with_retry_should_recover_after_one_no_workers_error(
+    async def test_open_stream_once_should_return_stream_on_first_event(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
     ):
-        """Test that ``NoWorkersAvailable`` triggers a retry that eventually wins.
+        """Test that a routine yielding an event returns a usable stream.
 
         Given:
-            An executor whose ``_run_processor_routine`` raises
-            ``wool.NoWorkersAvailable`` on its first ``__anext__`` then
-            yields events on the second attempt.
+            An executor whose ``_run_processor_routine`` yields a regular
+            event followed by a ``complete``.
         When:
-            ``_open_stream_with_retry`` is awaited.
+            ``_open_stream_once`` is awaited.
         Then:
-            It should return a stream that yields the second invocation's
-            events without re-raising.
+            It should return a stream that re-yields the first event plus
+            the rest, in a single dispatch attempt (no retry loop).
         """
         # Arrange
         _install_jobs_index(mock_db)
@@ -888,8 +931,55 @@ class TestOpenStreamWithRetry:
             mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
 
-        # Build two routines: one that immediately raises NoWorkersAvailable
-        # and one that yields a regular event followed by a complete.
+        attempts = {"count": 0}
+
+        async def working_stream():
+            attempts["count"] += 1
+            yield StageComplete(kind=ArtifactKind.INDEX, key=_INDEX_KEY)
+            yield Complete(artifacts={})
+
+        mocker.patch.object(
+            executor_module,
+            "_run_processor_routine",
+            lambda *_a, **_k: working_stream(),
+        )
+
+        # Act
+        stream = await executor._open_stream_once(
+            processor, _file_meta(), tmp_workdir / "wd"
+        )
+        events = [event async for event in stream]
+
+        # Assert — a single attempt, both events delivered.
+        assert attempts["count"] == 1
+        assert any(isinstance(e, StageComplete) for e in events)
+        assert any(isinstance(e, Complete) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_open_stream_once_should_propagate_no_workers_available(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that ``NoWorkersAvailable`` propagates without retrying.
+
+        Given:
+            An executor whose ``_run_processor_routine`` raises
+            ``wool.NoWorkersAvailable`` on its first ``__anext__``.
+        When:
+            ``_open_stream_once`` is awaited.
+        Then:
+            It should propagate the ``NoWorkersAvailable`` in a single
+            attempt — the durable retry scheduler, not an in-attempt loop,
+            owns retries now. The freshly-constructed stream is closed.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        processor = _StubProcessor()
+        registry.register(processor)
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+
         attempts = {"count": 0}
 
         async def failing_stream():
@@ -897,78 +987,18 @@ class TestOpenStreamWithRetry:
             raise wool.NoWorkersAvailable("simulated cold start")
             yield  # pragma: no cover
 
-        async def working_stream():
-            attempts["count"] += 1
-            yield StageComplete(kind=ArtifactKind.INDEX, key=_INDEX_KEY)
-            yield Complete(artifacts={})
-
-        streams = [failing_stream(), working_stream()]
-
-        def fake_routine(*_args, **_kwargs):
-            return streams.pop(0)
-
-        mocker.patch.object(executor_module, "_run_processor_routine", fake_routine)
-        # Patch sleep so retries don't slow the test down.
-        async def fast_sleep(_s):
-            return None
-
-        mocker.patch.object(executor_module.asyncio, "sleep", fast_sleep)
-
-        # Act
-        stream = await executor._open_stream_with_retry(
-            processor, _file_meta(), tmp_workdir / "wd"
+        mocker.patch.object(
+            executor_module,
+            "_run_processor_routine",
+            lambda *_a, **_k: failing_stream(),
         )
-        events = [event async for event in stream]
-
-        # Assert
-        assert attempts["count"] == 2
-        assert any(isinstance(e, Complete) for e in events)
-
-    @pytest.mark.asyncio
-    async def test_open_stream_with_retry_should_raise_when_deadline_expires(
-        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
-    ):
-        """Test that the retry loop eventually surfaces ``NoWorkersAvailable``.
-
-        Given:
-            An executor whose ``_run_processor_routine`` always raises
-            ``wool.NoWorkersAvailable``; the dispatch-wait budget is
-            patched to a tiny value so the deadline expires quickly.
-        When:
-            ``_open_stream_with_retry`` is awaited.
-        Then:
-            It should raise the last ``NoWorkersAvailable`` after the
-            dispatch budget is exhausted.
-        """
-        # Arrange
-        _install_jobs_index(mock_db)
-        registry = ProcessorRegistry()
-        processor = _StubProcessor()
-        registry.register(processor)
-        executor = WoolExecutor(
-            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
-        )
-
-        async def failing_stream():
-            raise wool.NoWorkersAvailable("still no workers")
-            yield  # pragma: no cover
-
-        def fake_routine(*_args, **_kwargs):
-            return failing_stream()
-
-        mocker.patch.object(executor_module, "_run_processor_routine", fake_routine)
-        mocker.patch.object(executor_module, "_DISPATCH_WAIT_SECONDS", 0.01)
-
-        async def fast_sleep(_s):
-            return None
-
-        mocker.patch.object(executor_module.asyncio, "sleep", fast_sleep)
 
         # Act & assert
         with pytest.raises(wool.NoWorkersAvailable):
-            await executor._open_stream_with_retry(
+            await executor._open_stream_once(
                 processor, _file_meta(), tmp_workdir / "wd"
             )
+        assert attempts["count"] == 1
 
 
 class TestStreamConsumerProgressEvents:
@@ -1121,7 +1151,7 @@ class TestExecutorDrainingHierarchy:
 
 class TestOpenStreamMalformedFirstEvent:
     @pytest.mark.asyncio
-    async def test_open_stream_with_retry_should_propagate_non_capacity_error(
+    async def test_open_stream_once_should_propagate_non_capacity_error(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
     ):
         """Test that a non-``NoWorkersAvailable`` first error propagates.
@@ -1130,11 +1160,11 @@ class TestOpenStreamMalformedFirstEvent:
             A routine whose first ``__anext__`` raises a generic
             ``RuntimeError`` (not a wool capacity error).
         When:
-            ``_open_stream_with_retry`` is awaited.
+            ``_open_stream_once`` is awaited.
         Then:
-            The exception should propagate to the caller — the retry
-            loop only handles ``NoWorkersAvailable``, every other class
-            is a real failure.
+            The exception should propagate to the caller —
+            ``_attempt_dispatch`` translates it into a FAILED job; only
+            ``NoWorkersAvailable`` is treated as overflow.
         """
         # Arrange
         _install_jobs_index(mock_db)
@@ -1156,7 +1186,7 @@ class TestOpenStreamMalformedFirstEvent:
 
         # Act & assert
         with pytest.raises(RuntimeError, match="not a capacity"):
-            await executor._open_stream_with_retry(
+            await executor._open_stream_once(
                 processor, _file_meta(), tmp_workdir / "wd"
             )
 
@@ -1197,128 +1227,28 @@ class TestEnsureWorkflowSnapshotsFileMeta:
 
 class TestWoolExecutorWithProvisioner:
     @pytest.mark.asyncio
-    async def test_ensure_workflow_should_request_worker_when_provisioner_set(
+    async def test_attempt_should_not_request_provisioner_when_worker_available(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
     ):
-        """Test that a fresh claim dispatches a provisioner request.
+        """Test that the provisioner is left idle when a worker accepts.
 
         Given:
-            A WoolExecutor wired with a stub EcsProvisioner.
+            A WoolExecutor wired with a stub EcsProvisioner and an
+            in-process worker (no_wool_dispatch) that accepts the task.
         When:
-            ``ensure_workflow`` is awaited on a previously-unseen file.
+            ``ensure_workflow`` dispatches the inline attempt and it wins
+            a worker.
         Then:
-            The provisioner's ``request`` should be awaited exactly once
-            with ``dedup_key`` set to the workflow mutex key for the file.
+            ``provisioner.request`` should NOT be awaited — spawn-on-
+            overflow means scale-up only happens when no worker accepts,
+            inverting the old unconditional pre-dispatch spawn (the cost
+            leak).
         """
         # Arrange
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
         registry.register(_StubProcessor())
         provisioner = mocker.AsyncMock(spec=EcsProvisioner)
-        provisioner.request.return_value = ["arn:fake:task/abc"]
-        executor = WoolExecutor(
-            mock_db,
-            tmp_cache,
-            registry,
-            workdir_root=tmp_workdir,
-            provisioner=provisioner,
-        )
-        meta = _file_meta()
-        dcc, local_id, md5 = extract_identity(meta)
-        expected_key = key_utils.workflow_key(
-            dcc=dcc, local_id=local_id, md5=md5, pipeline_version=PIPELINE_VERSION
-        )
-
-        # Act
-        record, _ = await executor.ensure_workflow(meta)
-        await _wait_for_terminal(mock_db, record.job_id)
-
-        # Assert
-        provisioner.request.assert_awaited_once_with(dedup_key=expected_key)
-
-    @pytest.mark.asyncio
-    async def test_ensure_workflow_should_skip_provisioner_when_attaching_to_existing_job(
-        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
-    ):
-        """Test that the provisioner is only invoked on fresh claims.
-
-        Given:
-            An executor with a stub provisioner and a blocking processor
-            so the first claim stays active when the second call arrives.
-        When:
-            ``ensure_workflow`` is awaited twice for the same file_meta.
-        Then:
-            ``provisioner.request`` should be awaited exactly once — the
-            attach path must not double-spend a Fargate worker against
-            an already-claimed workflow.
-        """
-        # Arrange
-        _install_jobs_index(mock_db)
-        release = asyncio.Event()
-
-        class _BlockingProcessor(_StubProcessor):
-            async def run(self, file_meta, workdir, cache_root):
-                self.run_calls += 1
-                await release.wait()
-                for kind, key in self.artifacts.items():
-                    yield StageComplete(kind=ArtifactKind(kind), key=key)
-                yield Complete(artifacts=dict(self.artifacts))
-
-        registry = ProcessorRegistry()
-        registry.register(_BlockingProcessor())
-        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
-        provisioner.request.return_value = ["arn:fake:task/abc"]
-        executor = WoolExecutor(
-            mock_db,
-            tmp_cache,
-            registry,
-            workdir_root=tmp_workdir,
-            provisioner=provisioner,
-        )
-
-        # Act
-        record_a, fresh_a = await executor.ensure_workflow(_file_meta())
-        record_b, fresh_b = await executor.ensure_workflow(_file_meta())
-        release.set()
-        await _wait_for_terminal(mock_db, record_a.job_id)
-
-        # Assert
-        assert fresh_a is True
-        assert fresh_b is False
-        assert record_a.job_id == record_b.job_id
-        provisioner.request.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_ensure_workflow_should_fall_through_when_retryable_provisioner_raises(
-        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
-    ):
-        """Test that a retryable provisioner failure falls through to dispatch.
-
-        Given:
-            A provisioner whose ``request`` raises
-            ``RetryableProvisionerError`` (capacity / ENI exhaustion /
-            throttling) AND a wool pool that can still dispatch to an
-            existing worker (the no_wool_dispatch fixture runs the
-            routine in-process).
-        When:
-            ``ensure_workflow`` is awaited.
-        Then:
-            The retryable error should be logged but not fail the
-            workflow — the Wool pool routes to any available worker
-            via discovery, so an existing idle worker can service the
-            job even when ECS quota blocks a fresh launch. The
-            ``capacity:`` prefix is reserved for the case where
-            dispatch also exhausts its budget (see
-            ``test_ensure_workflow_should_record_capacity_failure_when_dispatch_also_fails``).
-        """
-        # Arrange
-        _install_jobs_index(mock_db)
-        registry = ProcessorRegistry()
-        registry.register(_StubProcessor())
-        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
-        provisioner.request.side_effect = RetryableProvisionerError(
-            "ClientError: capacity-unavailable"
-        )
         executor = WoolExecutor(
             mock_db,
             tmp_cache,
@@ -1334,41 +1264,33 @@ class TestWoolExecutorWithProvisioner:
         # Assert
         final = await get_job(mock_db, record.job_id)
         assert final is not None
-        provisioner.request.assert_awaited_once()
-        # Provisioner failure was swallowed; in-process dispatch
-        # succeeded, so the workflow completes despite the
-        # retryable provisioner error.
         assert final.status == JobStatus.COMPLETED
-        assert final.error is None
+        provisioner.request.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_ensure_workflow_should_record_capacity_failure_when_dispatch_also_fails(
+    async def test_attempt_should_request_provisioner_on_overflow(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
     ):
-        """Test that the capacity: prefix fires when dispatch also exhausts.
+        """Test that overflow requests one bounded worker spawn and reschedules.
 
         Given:
-            A provisioner whose ``request`` raises
-            ``RetryableProvisionerError`` AND a dispatch path that
-            exhausts its budget with ``wool.NoWorkersAvailable``.
+            A WoolExecutor wired with a stub provisioner and a queued job
+            whose dispatch attempt finds no worker capacity
+            (``_open_stream_once`` raises ``NoWorkersAvailable``).
         When:
-            ``ensure_workflow`` is awaited.
+            ``_attempt_dispatch`` runs.
         Then:
-            The workflow should reach ``FAILED`` with the
-            ``capacity:`` prefix — the wire contract clients parse to
-            decide whether to resubmit. Per C26 the origin of the
-            prefix shifted from the provisioner-failure branch to the
-            dispatch-budget-exhausted branch, but the on-wire shape
-            is unchanged.
+            ``provisioner.request`` should be awaited once with the job's
+            workflow key, and the job should stay PENDING with
+            ``next_dispatch_at`` set and ``dispatch_attempts`` bumped —
+            queued durably for a later retry, not failed.
         """
         # Arrange
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
-        registry.register(_StubProcessor())
+        processor = _StubProcessor()
+        registry.register(processor)
         provisioner = mocker.AsyncMock(spec=EcsProvisioner)
-        provisioner.request.side_effect = RetryableProvisionerError(
-            "ClientError: capacity-unavailable"
-        )
         executor = WoolExecutor(
             mock_db,
             tmp_cache,
@@ -1376,50 +1298,93 @@ class TestWoolExecutorWithProvisioner:
             workdir_root=tmp_workdir,
             provisioner=provisioner,
         )
-        # Force the dispatch path to also fail with
-        # ``wool.NoWorkersAvailable``; the C26 stream-open branch
-        # translates that to the ``capacity:`` prefix.
+        record = await _seed_pending_job(mock_db)
         mocker.patch.object(
             executor,
-            "_open_stream_with_retry",
-            side_effect=wool.NoWorkersAvailable("pool empty after budget"),
+            "_open_stream_once",
+            new=mocker.AsyncMock(side_effect=wool.NoWorkersAvailable("empty")),
         )
 
         # Act
-        record, _ = await executor.ensure_workflow(_file_meta())
-        await _wait_for_terminal(mock_db, record.job_id)
+        await executor._attempt_dispatch(record, processor, _file_meta())
+
+        # Assert
+        provisioner.request.assert_awaited_once_with(dedup_key=record.workflow_key)
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.PENDING
+        assert final.next_dispatch_at is not None
+        assert final.dispatch_attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_overflow_should_swallow_retryable_provisioner_error(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that a retryable provisioner error is swallowed, job reschedules.
+
+        Given:
+            A provisioner whose ``request`` raises
+            ``RetryableProvisionerError`` on an overflowed dispatch.
+        When:
+            ``_attempt_dispatch`` runs.
+        Then:
+            The error should be swallowed (best-effort scale-up) and the
+            job should stay PENDING, rescheduled for a later attempt — not
+            failed.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        processor = _StubProcessor()
+        registry.register(processor)
+        provisioner = mocker.AsyncMock(spec=EcsProvisioner)
+        provisioner.request.side_effect = RetryableProvisionerError("capacity")
+        executor = WoolExecutor(
+            mock_db,
+            tmp_cache,
+            registry,
+            workdir_root=tmp_workdir,
+            provisioner=provisioner,
+        )
+        record = await _seed_pending_job(mock_db)
+        mocker.patch.object(
+            executor,
+            "_open_stream_once",
+            new=mocker.AsyncMock(side_effect=wool.NoWorkersAvailable("empty")),
+        )
+
+        # Act
+        await executor._attempt_dispatch(record, processor, _file_meta())
 
         # Assert
         final = await get_job(mock_db, record.job_id)
         assert final is not None
-        assert final.status == JobStatus.FAILED
-        assert final.error is not None
-        assert final.error.startswith("capacity: "), (
-            f"expected 'capacity: ' prefix, got {final.error!r}"
-        )
-        assert "pool empty" in final.error
+        assert final.status == JobStatus.PENDING
+        assert final.next_dispatch_at is not None
 
     @pytest.mark.asyncio
-    async def test_ensure_workflow_should_record_provisioner_prefix_for_generic_exception(
+    async def test_overflow_should_swallow_generic_provisioner_error(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
     ):
-        """Test that non-retryable provisioner failures use the 'provisioner: ' prefix.
+        """Test that a generic provisioner error doesn't fail the queued job.
 
         Given:
             A provisioner whose ``request`` raises a generic
-            ``RuntimeError`` (a misconfiguration or unexpected boto
-            failure, not a retryable transient).
+            ``RuntimeError`` (misconfiguration / unexpected boto failure)
+            on an overflowed dispatch.
         When:
-            ``ensure_workflow`` is awaited.
+            ``_attempt_dispatch`` runs.
         Then:
-            The job should reach ``FAILED`` with an error string that
-            starts with ``"provisioner: "`` so clients can distinguish
-            "retry me later" from "the provisioner crashed".
+            The error should be logged and swallowed and the job should
+            stay PENDING (rescheduled) rather than failing — the
+            provisioner is a best-effort scale-up hint on overflow, not a
+            dispatch gate; the dispatch deadline bounds the retry loop.
         """
         # Arrange
         _install_jobs_index(mock_db)
         registry = ProcessorRegistry()
-        registry.register(_StubProcessor())
+        processor = _StubProcessor()
+        registry.register(processor)
         provisioner = mocker.AsyncMock(spec=EcsProvisioner)
         provisioner.request.side_effect = RuntimeError("misconfigured cluster")
         executor = WoolExecutor(
@@ -1429,17 +1394,279 @@ class TestWoolExecutorWithProvisioner:
             workdir_root=tmp_workdir,
             provisioner=provisioner,
         )
+        record = await _seed_pending_job(mock_db)
+        mocker.patch.object(
+            executor,
+            "_open_stream_once",
+            new=mocker.AsyncMock(side_effect=wool.NoWorkersAvailable("empty")),
+        )
 
         # Act
-        record, _ = await executor.ensure_workflow(_file_meta())
+        await executor._attempt_dispatch(record, processor, _file_meta())
+
+        # Assert
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.PENDING
+        assert final.next_dispatch_at is not None
+
+
+class TestWoolExecutorAdmission:
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_reject_at_ceiling(
+        self, mock_db, tmp_cache, tmp_workdir, mocker
+    ):
+        """Test that ensure_workflow sheds load once the active ceiling is hit.
+
+        Given:
+            One active workflow already in the jobs collection and the
+            admission ceiling pinned to 1.
+        When:
+            ``ensure_workflow`` is awaited for another file.
+        Then:
+            It should raise ``AdmissionRejected`` carrying the observed
+            active count, the ceiling, and a positive ``retry_after`` hint
+            — before claiming the mutex, so a flood is shed at the door.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        mocker.patch.object(executor_module, "_MAX_ACTIVE_WORKFLOWS", 1)
+        await _seed_pending_job(mock_db)  # one active workflow
+
+        # Act & assert
+        with pytest.raises(AdmissionRejected) as excinfo:
+            await executor.ensure_workflow(_file_meta())
+        assert excinfo.value.active == 1
+        assert excinfo.value.ceiling == 1
+        assert excinfo.value.retry_after_seconds >= 1
+
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_admit_below_ceiling(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that ensure_workflow claims normally below the ceiling.
+
+        Given:
+            An admission ceiling of 5 and no active workflows.
+        When:
+            ``ensure_workflow`` is awaited.
+        Then:
+            It should claim and dispatch the job to completion — the
+            ceiling only sheds load once it is reached.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        mocker.patch.object(executor_module, "_MAX_ACTIVE_WORKFLOWS", 5)
+
+        # Act
+        record, fresh = await executor.ensure_workflow(_file_meta())
+        await _wait_for_terminal(mock_db, record.job_id)
+
+        # Assert
+        assert fresh is True
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.COMPLETED
+
+
+class TestWoolExecutorDispatchDeadline:
+    @pytest.mark.asyncio
+    async def test_attempt_should_fail_capacity_when_deadline_exceeded(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch, mocker
+    ):
+        """Test that a job past its dispatch deadline is failed ``capacity:``.
+
+        Given:
+            A queued job submitted long ago (older than a tiny patched
+            dispatch deadline).
+        When:
+            ``_attempt_dispatch`` runs.
+        Then:
+            The job should be failed with the ``capacity:`` prefix without
+            attempting dispatch — the deadline bounds the durable retry
+            loop so a job can't queue forever.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        processor = _StubProcessor()
+        registry.register(processor)
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        mocker.patch.object(executor_module, "_DISPATCH_DEADLINE_SECONDS", 1.0)
+        old = datetime.now(timezone.utc) - timedelta(seconds=10000)
+        record = await _seed_pending_job(mock_db, submitted_at=old)
+        open_spy = mocker.patch.object(
+            executor, "_open_stream_once", new=mocker.AsyncMock()
+        )
+
+        # Act
+        await executor._attempt_dispatch(record, processor, _file_meta())
+
+        # Assert
+        open_spy.assert_not_awaited()  # never tried to dispatch
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.FAILED
+        assert (final.error or "").startswith("capacity:")
+
+
+class TestWoolExecutorScheduler:
+    @pytest.mark.asyncio
+    async def test_drain_due_jobs_should_dispatch_a_due_queued_job(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
+    ):
+        """Test that the scheduler tick dispatches a due rescheduled job.
+
+        Given:
+            A queued job whose ``next_dispatch_at`` is in the past (an
+            earlier attempt overflowed) and a registered processor.
+        When:
+            One scheduler tick (``_drain_due_jobs``) runs.
+        Then:
+            The job should be leased, dispatched to the in-process worker,
+            and reach COMPLETED — the durable retry path picking up a
+            previously-overflowed job.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        due = datetime.now(timezone.utc) - timedelta(seconds=1)
+        record = await _seed_pending_job(mock_db, next_dispatch_at=due)
+
+        # Act
+        await executor._drain_due_jobs()
         await _wait_for_terminal(mock_db, record.job_id)
 
         # Assert
         final = await get_job(mock_db, record.job_id)
         assert final is not None
-        assert final.status == JobStatus.FAILED
-        assert final.error is not None
-        assert final.error.startswith("provisioner: "), (
-            f"expected 'provisioner: ' prefix, got {final.error!r}"
+        assert final.status == JobStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_drain_due_jobs_should_ignore_not_yet_due_jobs(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
+    ):
+        """Test that a queued job whose retry time is in the future is skipped.
+
+        Given:
+            A queued job whose ``next_dispatch_at`` is in the future.
+        When:
+            One scheduler tick runs.
+        Then:
+            The job should be left PENDING and undispatched — only due
+            jobs are leased, so a not-yet-due retry isn't run early.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        processor = _StubProcessor()
+        registry.register(processor)
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
         )
-        assert "misconfigured cluster" in final.error
+        future = datetime.now(timezone.utc) + timedelta(seconds=3600)
+        record = await _seed_pending_job(mock_db, next_dispatch_at=future)
+
+        # Act
+        await executor._drain_due_jobs()
+
+        # Assert
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.PENDING
+        assert processor.run_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_scheduler_loop_should_survive_a_tick_exception(
+        self, mock_db, tmp_cache, tmp_workdir, mocker
+    ):
+        """Test that an exception in one tick doesn't kill the scheduler.
+
+        Given:
+            A scheduler whose lease query raises on its first call then
+            returns nothing, with a tiny retry interval.
+        When:
+            ``start_scheduler`` runs the loop across several ticks.
+        Then:
+            The scheduler task should still be alive and have ticked again
+            after the exception — a transient Mongo blip must not silently
+            stop the dispatch driver.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        calls = {"n": 0}
+
+        async def flaky_lease(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient mongo blip")
+            return None
+
+        mocker.patch.object(executor_module, "lease_due_dispatch", flaky_lease)
+        mocker.patch.object(executor_module, "_RETRY_INTERVAL_SECONDS", 0.01)
+
+        # Act
+        executor.start_scheduler()
+        try:
+            await asyncio.sleep(0.1)
+            # Assert — survived the first-tick exception and ticked again.
+            assert executor._scheduler_task is not None
+            assert not executor._scheduler_task.done()
+            assert calls["n"] >= 2
+        finally:
+            await executor.drain(timeout=1.0)
+
+
+class TestWoolExecutorStartScheduler:
+    @pytest.mark.asyncio
+    async def test_drain_should_cancel_the_scheduler(
+        self, mock_db, tmp_cache, tmp_workdir
+    ):
+        """Test that drain stops the durable scheduler task.
+
+        Given:
+            An executor whose scheduler has been started.
+        When:
+            ``drain`` runs.
+        Then:
+            The scheduler task should be cancelled and cleared, so it stops
+            dispatching before the wool pool closes on shutdown.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        executor.start_scheduler()
+        task = executor._scheduler_task
+        assert task is not None
+
+        # Act
+        await executor.drain(timeout=1.0)
+
+        # Assert
+        assert task.cancelled() or task.done()
+        assert executor._scheduler_task is None
