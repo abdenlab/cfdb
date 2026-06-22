@@ -103,6 +103,10 @@ async def test_lifespan_should_construct_worker_pool_with_quorum_zero(
     from cfdb.workflows.loadbalancer import PriorityLoadBalancer
 
     assert isinstance(kwargs["loadbalancer"], PriorityLoadBalancer)
+    # The durable retry scheduler must be started inside the pool context
+    # (issue #45) so it inherits wool's dispatch contextvars; pin it here
+    # alongside the other load-bearing lifespan wiring.
+    fake_executor.start_scheduler.assert_called_once()
 
 
 def test_worker_pool_signature_should_accept_quorum():

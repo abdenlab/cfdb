@@ -19,7 +19,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from cfdb import api
 from cfdb.services import drs
 from cfdb.workflows.cache import CacheBackend
-from cfdb.workflows.executor import ExecutorDraining, WorkflowNotApplicable
+from cfdb.workflows.executor import (
+    AdmissionRejected,
+    ExecutorDraining,
+    WorkflowNotApplicable,
+)
 from cfdb.workflows.models import ArtifactKind
 
 logger = logging.getLogger(__name__)
@@ -274,6 +278,18 @@ async def serve_workflow_artifact_or_dispatch(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service is shutting down; please retry",
             headers={"Retry-After": "30"},
+        )
+    except AdmissionRejected as exc:
+        # The active-workflow ceiling is hit — shed this request with a
+        # 429 so the client backs off rather than queuing unbounded work.
+        # NOT a WorkflowNotApplicable subclass, so it must be caught
+        # explicitly (before that handler) to avoid falling through to
+        # direct upstream streaming, which would bypass the bounded
+        # pipeline entirely.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many active preprocessing jobs; please retry shortly",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
         )
     except WorkflowNotApplicable:
         # Race: processor accepted this file, but executor disagreed.

@@ -330,15 +330,16 @@ async def lifespan(_: FastAPI):
                 # dispatch — fired while the Fargate worker is still booting
                 # (image pull + health check, ~1-3 min) — blow the quorum
                 # wait and raise an un-retried ``TimeoutError`` out of
-                # ``WorkerPool.start``. cfdb's ``_open_stream_with_retry``
-                # only retries ``wool.NoWorkersAvailable``, so that
+                # ``WorkerPool.start``. cfdb's dispatch attempt only treats
+                # ``wool.NoWorkersAvailable`` as "no capacity", so that
                 # ``TimeoutError`` fails the first request hard (and the
                 # provisioner's cancelled ``RunTask`` leaks an idle worker).
                 # With the gate off, a cold-start dispatch surfaces
-                # ``NoWorkersAvailable`` instead, which the executor already
-                # absorbs within its own ``_DISPATCH_WAIT_SECONDS`` budget —
-                # keeping the cold-start wait in one layer cfdb owns rather
-                # than duplicating it across wool's quorum wait too.
+                # ``NoWorkersAvailable`` instead, which the executor absorbs
+                # by leaving the job PENDING and re-attempting it on the
+                # durable retry scheduler's cadence — keeping the cold-start
+                # wait in one layer cfdb owns rather than duplicating it
+                # across wool's quorum wait too.
                 async with wool.WorkerPool(
                     discovery=discovery,
                     credentials=worker_credentials,
@@ -362,6 +363,13 @@ async def lifespan(_: FastAPI):
                         provisioner=provisioner,
                     )
                     executor_handle = api.executor
+                    # Start the durable retry scheduler — the single dispatch
+                    # driver — here, inside the pool context, so the created
+                    # task inherits wool's dispatch contextvars (same as
+                    # request-spawned tasks via ``attach_wool_context``).
+                    # ``_drain_executor`` cancels it on teardown before the
+                    # pool closes.
+                    api.executor.start_scheduler()
                     log.info(
                         "Workflow subsystem enabled: profile=%s cache=%s "
                         "workdir=%s discovery=%s provisioner=%s "
