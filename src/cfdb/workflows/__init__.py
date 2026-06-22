@@ -44,6 +44,28 @@ Runtime / lifecycle (consumed by the executor and lock modules):
   RUNNING/PENDING row is considered stale and reclaimable. Default ``900``
   (15 min) — sized as ``2 × heartbeat_interval + safety_margin`` so a
   single missed heartbeat does not falsely reclaim a healthy worker.
+
+Concurrency / admission (bounded-concurrency control, issue #45):
+
+- ``CFDB_WORKER_MAX_CONCURRENT_TASKS`` — per-worker backpressure
+  threshold: a worker rejects a dispatch (gRPC ``RESOURCE_EXHAUSTED``,
+  which the load balancer treats as transient and rotates past) once it
+  already has this many tasks in flight. Default ``1`` (serialize the
+  subprocess pipelines on a 1-vCPU worker); ``0`` disables backpressure
+  (unbounded — the prior behavior). Enforced worker-side via a
+  ``wool.BackpressureLike`` hook.
+- ``CFDB_WORKFLOW_MAX_ACTIVE`` — admission ceiling on concurrently active
+  workflows (``pending`` + ``running`` jobs). ``ensure_workflow`` returns
+  ``429 Retry-After`` once this many are active, shedding load before
+  claiming the per-file mutex. Default ``1024``. Soft cap
+  (count-then-insert may briefly overshoot).
+- ``CFDB_WORKFLOW_DISPATCH_DEADLINE_S`` — how long a job may wait for
+  worker capacity (re-dispatched on the retry cadence below) before it is
+  marked ``failed``. Default ``14400`` (4 h).
+- ``CFDB_WORKFLOW_RETRY_INTERVAL_S`` — base cadence at which the durable
+  retry scheduler re-attempts dispatch for a queued job awaiting
+  capacity; a small random jitter is added per attempt. Default ``120``
+  (2 min).
 """
 
 from __future__ import annotations
@@ -153,3 +175,36 @@ if WORKFLOW_STALE_THRESHOLD_S < 2 * WORKFLOW_HEARTBEAT_INTERVAL_S:
         f"({WORKFLOW_HEARTBEAT_INTERVAL_S}s) to avoid false stale-reclaim "
         "of healthy workers between heartbeats."
     )
+
+# --- Bounded-concurrency control (issue #45) --------------------------------
+
+# Per-worker backpressure threshold. ``minimum=0`` because 0 is a valid
+# "disable backpressure" sentinel — the worker wiring passes
+# ``backpressure=None`` when 0, restoring the unbounded prior behavior.
+WORKER_MAX_CONCURRENT_TASKS: Final = _positive_int(
+    "CFDB_WORKER_MAX_CONCURRENT_TASKS",
+    os.getenv("CFDB_WORKER_MAX_CONCURRENT_TASKS", "1"),
+    minimum=0,
+)
+# Admission ceiling on concurrently active (pending + running) workflows.
+# ``ensure_workflow`` returns 429 once this many are active. ``minimum=1``
+# because 0 would reject every request.
+WORKFLOW_MAX_ACTIVE: Final = _positive_int(
+    "CFDB_WORKFLOW_MAX_ACTIVE",
+    os.getenv("CFDB_WORKFLOW_MAX_ACTIVE", "1024"),
+    minimum=1,
+)
+# How long a job may wait for worker capacity before being failed.
+# ``minimum=1`` — 0 would fail every queued job on its first attempt.
+WORKFLOW_DISPATCH_DEADLINE_S: Final = _positive_int(
+    "CFDB_WORKFLOW_DISPATCH_DEADLINE_S",
+    os.getenv("CFDB_WORKFLOW_DISPATCH_DEADLINE_S", "14400"),
+    minimum=1,
+)
+# Base cadence for the durable retry scheduler's re-dispatch attempts;
+# per-attempt jitter is layered on top. ``minimum=1`` — 0 would busy-spin.
+WORKFLOW_RETRY_INTERVAL_S: Final = _positive_int(
+    "CFDB_WORKFLOW_RETRY_INTERVAL_S",
+    os.getenv("CFDB_WORKFLOW_RETRY_INTERVAL_S", "120"),
+    minimum=1,
+)
