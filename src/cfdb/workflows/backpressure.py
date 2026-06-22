@@ -51,6 +51,13 @@ def backpressure_for(threshold: int) -> TaskCountBackpressure | None:
     ``threshold == 0`` disables backpressure: the worker wiring passes
     ``backpressure=None`` to wool, restoring unbounded admission (the prior
     behavior). Any positive value yields a :class:`TaskCountBackpressure`
-    that rejects once the worker has that many tasks in flight.
+    that rejects once the worker has that many tasks in flight. A negative
+    threshold is rejected rather than silently disabling backpressure, so
+    the helper's contract is total.
     """
+    if threshold < 0:
+        raise ValueError(
+            f"backpressure threshold must be >= 0; got {threshold} "
+            "(0 disables backpressure, a positive value sets the limit)"
+        )
     return TaskCountBackpressure(threshold) if threshold > 0 else None

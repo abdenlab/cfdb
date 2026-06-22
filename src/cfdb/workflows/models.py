@@ -82,10 +82,12 @@ class JobRecord(BaseModel):
             re-run / observer can reconstruct the dispatch context
             without re-reading the (possibly mutated) ``files`` document.
         next_dispatch_at: When the durable retry scheduler should next
-            attempt to dispatch this (still-PENDING) job to a worker. Set
-            on claim and pushed forward each time an attempt finds no
-            capacity; ``None`` once the job is running or terminal. Drives
-            the scheduler's "due for dispatch" query.
+            attempt to dispatch this (still-PENDING) job to a worker.
+            Unset (``None``) on claim and on a running/terminal job; set
+            and pushed forward by the retry scheduler each time a dispatch
+            attempt finds no capacity. Drives the scheduler's "due for
+            dispatch" query, which matches only rows whose
+            ``next_dispatch_at`` is set and in the past.
         dispatch_attempts: How many times dispatch has been deferred for
             lack of worker capacity. Observability only — the failure
             deadline is measured from ``submitted_at``, not this count.

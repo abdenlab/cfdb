@@ -500,13 +500,19 @@ async def reschedule_dispatch(db, job_id: str, *, next_at: datetime) -> None:
     observability.
     """
     jobs = _jobs(db)
-    await jobs.update_one(
+    result = await jobs.update_one(
         {"job_id": job_id, "status": JobStatus.PENDING.value},
         {
             "$set": {"next_dispatch_at": next_at, "updated_at": _utcnow()},
             "$inc": {"dispatch_attempts": 1},
         },
     )
+    if getattr(result, "matched_count", 0) == 0:
+        logger.debug(
+            "reschedule_dispatch no-op for job %s — row no longer PENDING "
+            "(won a worker, terminated, or was stale-reclaimed)",
+            job_id,
+        )
 
 
 async def lease_due_dispatch(
@@ -524,7 +530,21 @@ async def lease_due_dispatch(
     either wins a worker (``mark_running``) or calls ``reschedule_dispatch``
     again on overflow. Jobs with ``next_dispatch_at`` unset (``None``) are
     never due, so they are not leased here.
+
+    Due jobs are leased oldest-first (``next_dispatch_at`` ascending) so
+    sustained overflow cannot starve the longest-waiting job toward its
+    deadline. ``next_at`` MUST be strictly in the future relative to
+    ``now``: the single-claim guarantee depends on the leased row's
+    ``next_dispatch_at`` moving out of the ``<= now`` window, so an
+    equal/past value would let a concurrent tick re-lease the same job
+    before the attempt resolves.
     """
+    if next_at <= now:
+        raise ValueError(
+            f"lease_due_dispatch requires next_at ({next_at}) strictly after "
+            f"now ({now}); an equal/past value would let a concurrent tick "
+            "immediately re-lease the same job"
+        )
     jobs = _jobs(db)
     doc = await jobs.find_one_and_update(
         {
@@ -532,6 +552,7 @@ async def lease_due_dispatch(
             "next_dispatch_at": {"$lte": now},
         },
         {"$set": {"next_dispatch_at": next_at, "updated_at": now}},
+        sort=[("next_dispatch_at", 1)],
         return_document=ReturnDocument.AFTER,
     )
     return _record_from_mongo(doc) if doc is not None else None
