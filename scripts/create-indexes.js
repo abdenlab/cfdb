@@ -221,6 +221,17 @@ ensureIndex(
     { name: "status_updated_at" }
 );
 
+// Serves the durable retry scheduler's due-dispatch lease
+// (workflows.lock.lease_due_dispatch): { status: "pending",
+// next_dispatch_at: { $lte: now } } sorted by next_dispatch_at asc. The
+// status equality prefix plus the next_dispatch_at range/sort are both
+// index-served, so the per-tick poll is not a scan of all PENDING rows.
+ensureIndex(
+    db.jobs,
+    { status: 1, next_dispatch_at: 1 },
+    { name: "status_next_dispatch_at" }
+);
+
 // TTL index on terminal job rows. Without this, every stale-reclaim
 // transition leaves a permanent ``failed`` document and the collection
 // grows unbounded for any frequently-touched workflow_key. The partial
