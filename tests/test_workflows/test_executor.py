@@ -132,6 +132,19 @@ async def _wait_for_terminal(mock_db, job_id: str, timeout: float = 2.0) -> None
     raise AssertionError(f"Job {job_id} did not reach terminal status")
 
 
+async def _wait_for_status(
+    mock_db, job_id: str, status: JobStatus, timeout: float = 2.0
+) -> None:
+    """Poll the job record until it reaches ``status`` (or time out)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        record = await get_job(mock_db, job_id)
+        if record is not None and record.status == status:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"Job {job_id} did not reach status {status}")
+
+
 async def _seed_pending_job(
     mock_db,
     *,
@@ -1409,6 +1422,64 @@ class TestWoolExecutorWithProvisioner:
         assert final is not None
         assert final.status == JobStatus.PENDING
         assert final.next_dispatch_at is not None
+
+
+class TestWoolExecutorMarkRunningOnAcceptance:
+    @pytest.mark.asyncio
+    async def test_attempt_should_mark_running_before_first_processor_event(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
+    ):
+        """Test that a job is marked RUNNING the instant a worker accepts it.
+
+        Given:
+            A processor that blocks before yielding any real event (standing
+            in for a slow upstream download, which is the processor's first
+            action before its first stage event).
+        When:
+            ``ensure_workflow`` dispatches the inline attempt and a worker
+            accepts it.
+        Then:
+            The job should reach RUNNING while the processor is still blocked
+            — driven by the routine's leading "worker accepted" heartbeat,
+            not the first processor event. This is the invariant that keeps a
+            job from lingering PENDING (and being re-leased / double-
+            dispatched onto the same workdir) for the whole download.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        release = asyncio.Event()
+
+        class _BlockBeforeFirstEvent(_StubProcessor):
+            async def run(self, file_meta, workdir, cache_root):
+                self.run_calls += 1
+                await release.wait()  # block before the first real event
+                yield Complete(artifacts={})
+
+        registry = ProcessorRegistry()
+        registry.register(_BlockBeforeFirstEvent())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+
+        # Act
+        record, _ = await executor.ensure_workflow(_file_meta())
+        try:
+            # Would time out (job stuck PENDING) if mark_running waited for
+            # the first processor event rather than the acceptance heartbeat.
+            await _wait_for_status(mock_db, record.job_id, JobStatus.RUNNING)
+            running = await get_job(mock_db, record.job_id)
+            release.set()
+            await _wait_for_terminal(mock_db, record.job_id)
+        finally:
+            release.set()
+            await executor.drain(timeout=2.0)
+
+        # Assert
+        assert running is not None
+        assert running.status == JobStatus.RUNNING
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.COMPLETED
 
 
 class TestWoolExecutorAdmission:

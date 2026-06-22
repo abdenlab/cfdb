@@ -263,6 +263,20 @@ async def _run_processor_routine(
     converted to an :class:`~cfdb.workflows.events.Error` event so the API
     consumer can record a clean terminal state.
 
+    The routine yields an immediate :class:`~cfdb.workflows.events.Heartbeat`
+    as its very first event — the instant a worker *accepts* the dispatch,
+    before the (potentially slow) upstream download. This is the dispatcher's
+    "worker accepted" signal: ``_attempt_dispatch`` marks the job RUNNING on
+    the first event, so a job leaves the leasable PENDING set the moment a
+    worker takes it rather than only after the first processor event lands.
+    Without this, a long download (which happens before the processor's
+    first event) keeps the job PENDING, and the durable scheduler would
+    re-lease it and double-dispatch onto the same workdir once the retry
+    interval elapsed. A rejected dispatch (worker backpressure) raises
+    ``NoWorkersAvailable`` before the routine body runs, so this leading
+    heartbeat fires only on acceptance — cleanly distinguishing accepted
+    from overflowed.
+
     Arguments are cloudpickle-serializable: ``processor`` is a stateless
     class instance, ``file_meta`` is a plain dict (B1 strips Mongo's
     ``_id``), ``workdir_str`` crosses as a string, and ``cache`` is the
@@ -277,6 +291,11 @@ async def _run_processor_routine(
     """
     workdir = Path(workdir_str)
     workdir.mkdir(parents=True, exist_ok=True)
+    # "Worker accepted" signal — see the docstring. Emitted before the
+    # processor runs so the dispatcher marks the job RUNNING the instant a
+    # worker takes it (before the download), closing the re-lease /
+    # double-dispatch window. A rejected dispatch never reaches here.
+    yield Heartbeat()
     inner = processor.run(file_meta, workdir, cache).__aiter__()
     next_task: Optional[asyncio.Task] = None
     try:
