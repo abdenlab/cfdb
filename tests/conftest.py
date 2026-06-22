@@ -173,6 +173,10 @@ def _apply_update(doc: dict, update: dict, *, is_insert: bool = False) -> bool:
                 if v not in existing:
                     existing.append(v)
                     changed = True
+        elif op == "$inc":
+            for k, v in fields.items():
+                _set_nested(doc, k, (_resolve(doc, k) or 0) + v)
+                changed = True
         else:
             raise NotImplementedError(f"FakeCollection update op: {op}")
     return changed
@@ -267,12 +271,19 @@ class FakeCollection:
         *,
         upsert: bool = False,
         return_document=None,
+        sort: list | None = None,
         **_kwargs,
     ) -> dict | None:
-        for d in self.docs:
-            if _match(d, query):
-                _apply_update(d, update, is_insert=False)
-                return dict(d)
+        candidates = [d for d in self.docs if _match(d, query)]
+        if sort:
+            # Single-key sort is all the production queries use; honoring it
+            # lets tests exercise ordered claims (e.g. oldest-due-first).
+            field, direction = sort[0]
+            candidates.sort(key=lambda d: d.get(field), reverse=direction < 0)
+        if candidates:
+            d = candidates[0]
+            _apply_update(d, update, is_insert=False)
+            return dict(d)
         if upsert:
             seed: dict = {}
             for k, v in query.items():
