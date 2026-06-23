@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from cfdb.workflows import lock
 from cfdb.workflows.models import ArtifactKind, JobRecord, JobStatus
@@ -806,6 +808,65 @@ class TestRecordFromMongo:
         # Assert
         assert record.submitted_at.tzinfo is timezone.utc
         assert record.updated_at.tzinfo is timezone.utc
+
+    @given(
+        submitted=st.datetimes(timezones=st.just(timezone.utc)),
+        updated=st.datetimes(timezones=st.just(timezone.utc)),
+        next_dispatch=st.one_of(
+            st.none(), st.datetimes(timezones=st.just(timezone.utc))
+        ),
+    )
+    def test_record_from_mongo_should_roundtrip_aware_and_naive_datetimes(
+        self, submitted, updated, next_dispatch
+    ):
+        """Test that the to_mongo/_record_from_mongo datetime round-trip is total.
+
+        Given:
+            A JobRecord with arbitrary aware-UTC ``submitted_at`` /
+            ``updated_at`` and an aware-or-``None`` ``next_dispatch_at``,
+            serialized via ``to_mongo`` and then rendered naive — the BSON
+            Date round-trip some Motor / mongomock-motor variants produce.
+        When:
+            ``_record_from_mongo`` hydrates the doc back into a JobRecord.
+        Then:
+            Every datetime instant is preserved and re-attached to UTC, and
+            a ``None`` ``next_dispatch_at`` survives as ``None`` — the third
+            nullable datetime threads the round-trip without loss.
+        """
+        # Arrange
+        record = JobRecord(
+            job_id="job-rt",
+            workflow_key=f"encode/x/{FIXTURE_MD5}/v1",
+            status=JobStatus.PENDING,
+            dcc="encode",
+            local_id="x",
+            md5=FIXTURE_MD5,
+            pipeline_version=1,
+            submitted_at=submitted,
+            updated_at=updated,
+            next_dispatch_at=next_dispatch,
+        )
+        doc = record.to_mongo()
+        # Simulate the BSON Date round-trip: strip tzinfo on stored dates,
+        # which is the naive rendering ``_record_from_mongo`` must repair.
+        for field in ("submitted_at", "updated_at", "next_dispatch_at"):
+            value = doc.get(field)
+            if isinstance(value, datetime):
+                doc[field] = value.astimezone(timezone.utc).replace(tzinfo=None)
+
+        # Act
+        hydrated = lock._record_from_mongo(doc)
+
+        # Assert
+        assert hydrated.submitted_at == submitted
+        assert hydrated.updated_at == updated
+        assert hydrated.submitted_at.tzinfo is timezone.utc
+        assert hydrated.updated_at.tzinfo is timezone.utc
+        if next_dispatch is None:
+            assert hydrated.next_dispatch_at is None
+        else:
+            assert hydrated.next_dispatch_at == next_dispatch
+            assert hydrated.next_dispatch_at.tzinfo is timezone.utc
 
 
 class TestClaimWorkflowSupersededByChain:

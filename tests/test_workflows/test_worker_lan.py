@@ -204,3 +204,35 @@ def test_backpressure_bound_factory_should_still_declare_host():
 
     # Act & assert
     assert declares_host(factory) is True
+
+
+def test_backpressure_bound_factory_should_survive_cloudpickle():
+    """Test that the backpressure-bound spawn factory round-trips cloudpickle.
+
+    Given:
+        The ``functools.partial(LocalWorker, backpressure=TaskCountBackpressure(1))``
+        factory ``worker_lan.serve`` hands to ``WorkerPool(spawn=…)`` — the
+        exact composite object wool serializes into each spawned worker
+        subprocess.
+    When:
+        It is cloudpickled and reloaded.
+    Then:
+        The reconstructed partial still carries a backpressure hook with the
+        same threshold, so per-worker backpressure survives the spawn
+        boundary rather than silently reverting to unbounded admission.
+    """
+    # Arrange
+    import functools
+
+    import cloudpickle
+    import wool
+
+    from cfdb.workflows.backpressure import TaskCountBackpressure
+
+    factory = functools.partial(wool.LocalWorker, backpressure=TaskCountBackpressure(1))
+
+    # Act
+    restored = cloudpickle.loads(cloudpickle.dumps(factory))
+
+    # Assert
+    assert restored.keywords["backpressure"].threshold == 1

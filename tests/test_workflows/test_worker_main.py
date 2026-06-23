@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from cfdb.workflows import worker_main
@@ -183,3 +184,84 @@ class TestMainCli:
         # Assert
         assert exit_code == 0
         assert captured["tls_ca"] == "/cli/ca.pem"
+
+
+class _StopServe(Exception):
+    """Sentinel raised from the mocked ``worker.start`` to halt ``serve``.
+
+    ``serve`` constructs the worker (with its backpressure kwarg) immediately
+    before ``await worker.start()``, so raising here exits the coroutine right
+    after the construction under test without entering the run loop, the
+    signal-wait, or the health/drain teardown.
+    """
+
+
+def _arrange_serve(mocker) -> object:
+    """Patch ``serve``'s collaborators and return the ``LocalWorker`` spy."""
+    mocker.patch.object(worker_main, "build_worker_credentials", return_value=None)
+    mocker.patch.object(
+        worker_main, "_start_health_server", mocker.AsyncMock(return_value=mocker.Mock())
+    )
+    worker_instance = mocker.Mock()
+    worker_instance.start = mocker.AsyncMock(side_effect=_StopServe)
+    worker_instance.stop = mocker.AsyncMock()
+    return mocker.patch.object(
+        worker_main.wool, "LocalWorker", return_value=worker_instance
+    )
+
+
+class TestServeBackpressureWiring:
+    @pytest.mark.asyncio
+    async def test_serve_should_wire_taskcount_backpressure_when_threshold_positive(
+        self, mocker, monkeypatch
+    ):
+        """Test that a positive task ceiling becomes a TaskCountBackpressure.
+
+        Given:
+            ``WORKER_MAX_CONCURRENT_TASKS`` set to 1 and ``wool.LocalWorker``
+            spied so ``serve`` halts right after constructing the worker.
+        When:
+            ``serve`` is run.
+        Then:
+            The worker is constructed with a ``backpressure`` hook whose
+            threshold is 1, so the ECS worker entrypoint actually serializes
+            its subprocess pipelines.
+        """
+        # Arrange
+        monkeypatch.setattr(worker_main, "WORKER_MAX_CONCURRENT_TASKS", 1)
+        local_worker = _arrange_serve(mocker)
+
+        # Act
+        with pytest.raises(_StopServe):
+            await worker_main.serve(worker_port=0, health_port=0)
+
+        # Assert
+        backpressure = local_worker.call_args.kwargs["backpressure"]
+        assert backpressure is not None
+        assert backpressure.threshold == 1
+
+    @pytest.mark.asyncio
+    async def test_serve_should_disable_backpressure_when_threshold_zero(
+        self, mocker, monkeypatch
+    ):
+        """Test that a zero task ceiling wires ``backpressure=None``.
+
+        Given:
+            ``WORKER_MAX_CONCURRENT_TASKS`` set to 0 (the disable sentinel)
+            and ``wool.LocalWorker`` spied.
+        When:
+            ``serve`` is run.
+        Then:
+            The worker is constructed with ``backpressure=None``, restoring
+            the unbounded admission behavior.
+        """
+        # Arrange
+        monkeypatch.setattr(worker_main, "WORKER_MAX_CONCURRENT_TASKS", 0)
+        local_worker = _arrange_serve(mocker)
+
+        # Act
+        with pytest.raises(_StopServe):
+            await worker_main.serve(worker_port=0, health_port=0)
+
+        # Assert
+        assert local_worker.call_args.kwargs["backpressure"] is None

@@ -10,11 +10,16 @@ Wool + real tools + real cache, see ``test_processor_e2e.py``.
 from __future__ import annotations
 
 import asyncio
+import functools
 
 import pytest
+import wool
 
+from cfdb.workflows import executor as executor_module
+from cfdb.workflows.backpressure import TaskCountBackpressure
 from cfdb.workflows.cache import LocalFsCache
 from cfdb.workflows.executor import WoolExecutor
+from cfdb.workflows.loadbalancer import PriorityLoadBalancer
 from cfdb.workflows.lock import get_job
 from cfdb.workflows.models import ACTIVE_STATUSES, JobStatus
 from cfdb.workflows.processors.registry import ProcessorRegistry
@@ -181,8 +186,11 @@ class TestWoolExecutorPickleBoundary:
         assert final.status == JobStatus.FAILED
         assert final.error is not None
         assert "runtime cap" in final.error.lower()
-        # Workdir is cleaned up regardless of failure mode.
-        assert not (executor._workdir_root / record.job_id).exists()
+        # Workdir is cleaned up regardless of failure mode. Assert against
+        # the workdir ROOT, not ``root / job_id``: the per-attempt workdir is
+        # ``root / f"{job_id}-{uuid}"`` (B1), so a bare-``job_id`` path is
+        # never created and asserting its absence would be vacuously true.
+        assert list(executor._workdir_root.iterdir()) == []
         # The internal bookkeeping sets are drained after the await.
         assert len(executor._pending_tasks) == 0
         assert len(executor._finalize_tasks) == 0
@@ -273,3 +281,91 @@ class TestWoolExecutorPickleBoundary:
             d for d in mock_db.jobs.docs if d["workflow_key"] == rec_a.workflow_key
         ]
         assert len(records_for_key) == 1
+
+
+class TestProductionPoolConfiguration:
+    @pytest.mark.asyncio
+    async def test_ensure_workflow_should_distribute_and_reschedule_across_priority_pool(
+        self, mock_db, tmp_path, monkeypatch
+    ):
+        """Test the production pool config over the real pickle boundary.
+
+        Given:
+            A two-worker ``wool.WorkerPool`` wired exactly as production —
+            ``PriorityLoadBalancer`` plus a ``TaskCountBackpressure(1)``-bound
+            spawn factory — the durable retry scheduler running, and three
+            distinct slow workflows that each hold their worker busy for the
+            whole test.
+        When:
+            All three are dispatched via ``ensure_workflow`` and the system
+            is allowed to settle.
+        Then:
+            Exactly two reach RUNNING concurrently (one per worker — proving
+            the load balancer distributes across both over the cloudpickle /
+            gRPC boundary), and the third is left PENDING with a
+            ``next_dispatch_at``: the priority balancer rotates past both
+            ``RESOURCE_EXHAUSTED`` rejections, surfaces ``NoWorkersAvailable``,
+            and the durable scheduler keeps it queued rather than dropping or
+            double-running it.
+        """
+        # Arrange — fast retries so an early overflow (a worker not yet
+        # surfaced at pool startup) is healed by the scheduler promptly.
+        monkeypatch.setattr(executor_module, "_RETRY_INTERVAL_SECONDS", 0.2)
+        monkeypatch.setattr(executor_module, "_RETRY_JITTER_MAX_SECONDS", 0.1)
+        _install_jobs_index(mock_db)
+        cache = LocalFsCache(tmp_path / "cache")
+        registry = ProcessorRegistry()
+        registry.register(StubProcessor(sleep_seconds=30.0))
+        executor = WoolExecutor(
+            mock_db, cache, registry, workdir_root=tmp_path / "jobs"
+        )
+        metas = [{**stub_file_meta(), "local_id": f"ENCFF-{i}"} for i in range(3)]
+        pool = wool.WorkerPool(
+            spawn=2,
+            worker=functools.partial(
+                wool.LocalWorker, backpressure=TaskCountBackpressure(1)
+            ),
+            loadbalancer=PriorityLoadBalancer(),
+        )
+
+        async def _settled() -> tuple[int, int]:
+            running = pending_resched = 0
+            for meta in metas:
+                # job_id isn't known until ensure_workflow returns; match on
+                # the workflow_key the records carry instead.
+                for doc in mock_db.jobs.docs:
+                    if doc["local_id"] != meta["local_id"]:
+                        continue
+                    if doc["status"] == JobStatus.RUNNING.value:
+                        running += 1
+                    elif (
+                        doc["status"] == JobStatus.PENDING.value
+                        and doc.get("next_dispatch_at") is not None
+                    ):
+                        pending_resched += 1
+            return running, pending_resched
+
+        # Act / Assert
+        try:
+            async with pool:
+                executor.start_scheduler()
+                for meta in metas:
+                    await executor.ensure_workflow(meta)
+
+                # Backpressure(1) on two workers caps concurrent RUNNING at
+                # two, so the steady state is (2 running, 1 overflowed). The
+                # long-running stubs hold that state for the whole poll.
+                deadline = asyncio.get_event_loop().time() + 25.0
+                running = pending_resched = 0
+                while asyncio.get_event_loop().time() < deadline:
+                    running, pending_resched = await _settled()
+                    if running == 2 and pending_resched == 1:
+                        break
+                    await asyncio.sleep(0.2)
+
+                assert running == 2, f"expected 2 RUNNING (one per worker), got {running}"
+                assert pending_resched == 1, (
+                    f"expected 1 overflowed+rescheduled job, got {pending_resched}"
+                )
+        finally:
+            await executor.drain(timeout=15.0)

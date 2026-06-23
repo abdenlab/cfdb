@@ -530,9 +530,10 @@ async def wool_pool():
 
     Function-scoped so every test gets a clean pool — prevents any
     cross-test state bleeding through worker process memory. The
-    executor's ``_dispatch_with_retry`` covers the brief window
-    between pool startup and LocalDiscovery surfacing the worker,
-    so no explicit sleep is needed here.
+    executor opens a single dispatch attempt and, on overflow,
+    reschedules the job onto its durable retry scheduler — so the brief
+    window between pool startup and the worker being surfaced needs no
+    explicit sleep here.
     """
     async with wool.WorkerPool(spawn=1):
         yield

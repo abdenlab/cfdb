@@ -1438,15 +1438,17 @@ class TestConsumeAndFinalizeHeartbeatLoss:
             It is compared against the heartbeat interval and the orphan
             sweep's stale threshold.
         Then:
-            It should be at least one heartbeat interval (a single transient
-            write failure must not abort) and strictly below the stale
-            threshold (a Mongo-blind consumer must give up before the sweep
-            would revive its row).
+            It should be strictly more than one heartbeat interval (a single
+            transient write failure must not abort — the strict
+            ``STALE > 2*HEARTBEAT`` startup invariant guarantees the margin,
+            issue #45 review A7) and strictly below the stale threshold (a
+            Mongo-blind consumer must give up before the sweep would revive
+            its row).
         """
         # Assert
         assert (
             executor_module._HEARTBEAT_LOSS_ABORT_S
-            >= executor_module._HEARTBEAT_INTERVAL_S
+            > executor_module._HEARTBEAT_INTERVAL_S
         )
         assert (
             executor_module._HEARTBEAT_LOSS_ABORT_S
@@ -1818,7 +1820,7 @@ class TestWoolExecutorDispatchDeadline:
 
 class TestWoolExecutorScheduler:
     @pytest.mark.asyncio
-    async def test_drain_due_jobs_should_dispatch_a_due_queued_job(
+    async def test__drain_due_jobs_should_dispatch_a_due_queued_job(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
     ):
         """Test that the scheduler tick dispatches a due rescheduled job.
@@ -1853,7 +1855,7 @@ class TestWoolExecutorScheduler:
         assert final.status == JobStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_drain_due_jobs_should_ignore_not_yet_due_jobs(
+    async def test__drain_due_jobs_should_ignore_not_yet_due_jobs(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
     ):
         """Test that a queued job whose retry time is in the future is skipped.
@@ -1887,7 +1889,7 @@ class TestWoolExecutorScheduler:
         assert processor.run_calls == 0
 
     @pytest.mark.asyncio
-    async def test_recover_orphans_should_requeue_and_dispatch_a_stale_running_job(
+    async def test__recover_orphans_should_requeue_and_dispatch_a_stale_running_job(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
     ):
         """Test that a RUNNING job orphaned by a crash is recovered autonomously.
@@ -1929,7 +1931,7 @@ class TestWoolExecutorScheduler:
         assert final.status == JobStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_recover_orphans_should_leave_a_fresh_running_job_alone(
+    async def test__recover_orphans_should_leave_a_fresh_running_job_alone(
         self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
     ):
         """Test that a healthy in-flight RUNNING job is not reclaimed.
@@ -1963,7 +1965,7 @@ class TestWoolExecutorScheduler:
         assert job.status == JobStatus.RUNNING
 
     @pytest.mark.asyncio
-    async def test_scheduler_loop_should_survive_a_tick_exception(
+    async def test__scheduler_loop_should_survive_a_tick_exception(
         self, mock_db, tmp_cache, tmp_workdir, mocker
     ):
         """Test that an exception in one tick doesn't kill the scheduler.
@@ -2006,6 +2008,54 @@ class TestWoolExecutorScheduler:
             assert calls["n"] >= 2
         finally:
             await executor.drain(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test__drain_due_jobs_should_lease_at_most_the_per_tick_cap(
+        self, mock_db, tmp_cache, tmp_workdir, mocker
+    ):
+        """Test that one tick leases no more than the per-tick cap.
+
+        Given:
+            More due queued jobs than ``_MAX_DISPATCHES_PER_TICK`` (the cap
+            monkeypatched low) and a stubbed ``_spawn_attempt`` so the tick
+            only counts dispatches.
+        When:
+            One scheduler tick (``_drain_due_jobs``) runs.
+        Then:
+            Exactly the cap's worth of attempts are spawned and the
+            remainder is left leasable for a subsequent tick — the
+            thundering-herd guard bounds the per-tick fan-out so a large
+            backlog can't spawn thousands of concurrent attempts at once.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        mocker.patch.object(executor_module, "_MAX_DISPATCHES_PER_TICK", 2)
+        due = datetime.now(timezone.utc) - timedelta(seconds=1)
+        for i in range(5):  # cap (2) + 3 remainder, each a distinct workflow
+            await _seed_pending_job(
+                mock_db,
+                meta={**_file_meta(), "local_id": f"ENCFF{i:03d}"},
+                next_dispatch_at=due,
+            )
+        spawn = mocker.patch.object(executor, "_spawn_attempt")
+
+        # Act — a single tick.
+        await executor._drain_due_jobs()
+
+        # Assert — capped at the per-tick limit...
+        assert spawn.call_count == 2
+        # ...with the remainder still due and leasable on the next tick.
+        leftover = await executor_module.lease_due_dispatch(
+            mock_db,
+            now=datetime.now(timezone.utc),
+            next_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        )
+        assert leftover is not None
 
 
 class TestWoolExecutorStartScheduler:
