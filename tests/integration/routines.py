@@ -53,10 +53,10 @@ class StubProcessor(Processor):
       workflow to race against.
     - ``sleep_between_yields``: a delay inserted AFTER each
       ``stage_complete`` yield. Used by the runtime-cap test: a quick
-      first event lets ``_open_stream_with_retry`` return so the
-      executor's ``asyncio.timeout(cap)`` block is entered, then the
-      between-yields delay outlasts the cap so the wait for the next
-      event triggers the cap.
+      first event lets ``_open_stream_once`` return (and the executor mark
+      the job RUNNING) so the ``asyncio.timeout(cap)`` block is entered,
+      then the between-yields delay outlasts the cap so the wait for the
+      next event triggers the cap.
     - ``unpicklable_field``: any value assigned to ``self.unpicklable_field``
       to deliberately poison cloudpickle. Used by the boundary tests
       that need to verify a pickling failure surfaces as a clean

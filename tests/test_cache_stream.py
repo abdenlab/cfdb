@@ -17,7 +17,11 @@ from cfdb.api.routers.cache_stream import (
     stream_cache_entry,
 )
 from cfdb.workflows.cache import LocalFsCache
-from cfdb.workflows.executor import ExecutorDraining, WorkflowNotApplicable
+from cfdb.workflows.executor import (
+    AdmissionRejected,
+    ExecutorDraining,
+    WorkflowNotApplicable,
+)
 from cfdb.workflows.models import ArtifactKind, JobRecord, JobStatus
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.registry import ProcessorRegistry
@@ -491,6 +495,48 @@ class TestServeWorkflowArtifactOrDispatch:
             )
         assert exc_info.value.status_code == 503
         assert "Retry-After" in exc_info.value.headers
+
+    @pytest.mark.asyncio
+    async def test_should_raise_429_when_admission_rejected(
+        self, mocker, tmp_path
+    ):
+        """Test that ``AdmissionRejected`` is translated to 429 with Retry-After.
+
+        Given:
+            Cache miss + GET + an executor that raises ``AdmissionRejected``
+            (the active-workflow ceiling is hit).
+        When:
+            The helper is awaited.
+        Then:
+            It should raise ``HTTPException(429)`` carrying the exception's
+            ``retry_after_seconds`` as the ``Retry-After`` header — so a
+            flood backs off rather than falling through to direct streaming
+            (which would bypass the bounded pipeline).
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(
+            api,
+            "executor",
+            _RecordingExecutor(
+                exc=AdmissionRejected(active=12, ceiling=12, retry_after_seconds=7)
+            ),
+        )
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await serve_workflow_artifact_or_dispatch(
+                _file_doc(),
+                ArtifactKind.DATA,
+                _Request(),
+                None,
+                head_404_detail="missing",
+            )
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.headers["Retry-After"] == "7"
 
     @pytest.mark.asyncio
     async def test_should_return_none_on_workflow_not_applicable_race(

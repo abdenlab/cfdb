@@ -643,5 +643,8 @@ class TestProcessorE2E:
         # The path-scrub regex strips multi-segment absolute paths so a
         # ``/<seg>/<seg>`` shape MUST NOT survive into persisted text.
         assert re.search(r"/[A-Za-z][A-Za-z0-9_.-]*/[A-Za-z]", final.error) is None
-        # Workdir is cleaned up regardless of failure mode.
-        assert not (integration_executor._workdir_root / record.job_id).exists()
+        # Workdir is cleaned up regardless of failure mode. Assert against
+        # the workdir ROOT, not ``root / job_id``: the per-attempt workdir is
+        # ``root / f"{job_id}-{uuid}"`` (B1), so a bare-``job_id`` path is
+        # never created and asserting its absence would be vacuously true.
+        assert list(integration_executor._workdir_root.iterdir()) == []

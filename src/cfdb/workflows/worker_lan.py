@@ -17,21 +17,26 @@ namespace the API uses (``WORKFLOW_POOL_NAMESPACE``)::
     python -m cfdb.workflows.worker_lan --namespace cfdb-workers --workers 2
 
 SIGINT (Ctrl-C) or SIGTERM drains the pool and exits. With no pool
-running, ``/data`` and ``/index`` requests for processable formats hang
-on the dispatch retry budget before failing with ``NoWorkersAvailable``.
+running, ``/data`` and ``/index`` requests for processable formats do not
+hang or surface ``NoWorkersAvailable`` to the client: the job is claimed
+and queued PENDING (the request returns ``202``), and the API's durable
+retry scheduler re-attempts dispatch every ``CFDB_WORKFLOW_RETRY_INTERVAL_S``
+until a worker appears or the ``CFDB_WORKFLOW_DISPATCH_DEADLINE_S`` deadline
+elapses (then the job is failed ``capacity:``).
 
 Environment variables (CLI flags mirror them):
 
 * ``WORKFLOW_POOL_NAMESPACE`` — LAN discovery namespace the pool
   publishes under (default ``cfdb-workers``). MUST match the API's value.
 * ``WORKFLOW_WORKER_COUNT`` — number of workers to spawn and publish
-  (default ``2``). Size it at least as high as the API's lease count or
-  the API blocks waiting for workers.
+  (default ``2``). The API admits every worker discovery surfaces (there is
+  no fixed lease count), so size this to the local concurrency you want.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import signal
 from typing import Optional
@@ -40,6 +45,8 @@ import click
 import wool
 from wool.runtime.discovery.lan import LanDiscovery
 
+from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
+from cfdb.workflows.backpressure import backpressure_for
 from cfdb.workflows.credentials import build_worker_credentials
 
 logger = logging.getLogger(__name__)
@@ -97,18 +104,31 @@ async def serve(
         except NotImplementedError:
             signal.signal(sig, _signal_handler_threaded)
 
+    # Bind per-worker backpressure onto the spawn factory so each spawned
+    # LocalWorker serializes its routines (mirrors the ECS worker_main
+    # wiring). ``functools.partial(..., backpressure=hook)`` keeps wool's
+    # ``declares_host`` True, so the pool still prescribes the bind host.
+    backpressure = backpressure_for(WORKER_MAX_CONCURRENT_TASKS)
+    worker_factory = (
+        functools.partial(wool.LocalWorker, backpressure=backpressure)
+        if backpressure is not None
+        else wool.LocalWorker
+    )
+
     pool = wool.WorkerPool(
         spawn=workers,
+        worker=worker_factory,
         discovery=LanDiscovery(namespace),
         credentials=credentials,
     )
     async with pool:
         logger.info(
-            "Published %d wool worker(s) under LAN namespace %r (mTLS %s) "
-            "— Ctrl-C to drain and exit",
+            "Published %d wool worker(s) under LAN namespace %r (mTLS %s, "
+            "max concurrent tasks %s) — Ctrl-C to drain and exit",
             workers,
             namespace,
             "enabled" if credentials is not None else "disabled",
+            WORKER_MAX_CONCURRENT_TASKS if backpressure is not None else "unbounded",
         )
         await stop_event.wait()
     return 0

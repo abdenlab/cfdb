@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pymongo.write_concern import WriteConcern
 
@@ -133,7 +134,7 @@ def _record_from_mongo(doc: dict[str, Any]) -> JobRecord:
     here so the round-trip survives.
     """
     sanitized = {k: v for k, v in doc.items() if k != "_id"}
-    for field in ("submitted_at", "updated_at"):
+    for field in ("submitted_at", "updated_at", "next_dispatch_at"):
         value = sanitized.get(field)
         if isinstance(value, datetime) and value.tzinfo is None:
             sanitized[field] = value.replace(tzinfo=timezone.utc)
@@ -190,6 +191,13 @@ async def claim_workflow(
             submitted_at=now,
             updated_at=now,
             file_meta_snapshot=file_meta_snapshot,
+            # ``next_dispatch_at`` is intentionally left unset (None) on a
+            # fresh claim. ``ensure_workflow`` dispatches the first attempt
+            # inline; only if that attempt overflows (no worker capacity)
+            # does it set ``next_dispatch_at``, handing the job to the
+            # durable retry scheduler. A None value is never "due", so the
+            # scheduler can't double-dispatch a job whose inline attempt is
+            # still in flight.
         )
 
         # Attempt the insert first. If the partial-unique index admits it,
@@ -471,3 +479,142 @@ async def heartbeat_workflow(db, job_id: str) -> None:
         },
         {"$set": {"updated_at": _utcnow()}},
     )
+
+
+# --- Bounded-concurrency admission + durable dispatch retry (issue #45) ------
+
+
+async def count_active_workflows(db) -> int:
+    """Count workflows currently holding the mutex (pending + running).
+
+    Backs the admission ceiling in ``ensure_workflow``: once this reaches
+    ``CFDB_WORKFLOW_MAX_ACTIVE`` new requests are shed with 429. Soft by
+    nature — a count-then-insert race can briefly overshoot the cap, which
+    is acceptable for a flood guard.
+
+    Counts on the canonical ``active`` boolean discriminator (the single
+    source of truth every other jobs read/write/index keys off), not the
+    derived ``status $in ACTIVE_STATUSES`` view, so the ceiling and the
+    mutex stay in lockstep even if the two ever drift.
+    """
+    jobs = _jobs(db)
+    return await jobs.count_documents({"active": True})
+
+
+async def reschedule_dispatch(db, job_id: str, *, next_at: datetime) -> None:
+    """Defer a still-PENDING job's next dispatch attempt to ``next_at``.
+
+    Called when a dispatch attempt finds no worker capacity: the job stays
+    PENDING and the durable scheduler re-attempts it at ``next_at``.
+    Fenced on PENDING so a job that has since gone RUNNING/terminal (a
+    racing attempt won the worker, or it was stale-reclaimed) is not
+    dragged back into the dispatch queue. Bumps ``dispatch_attempts`` for
+    observability.
+    """
+    jobs = _jobs(db)
+    result = await jobs.update_one(
+        {"job_id": job_id, "status": JobStatus.PENDING.value},
+        {
+            "$set": {"next_dispatch_at": next_at, "updated_at": _utcnow()},
+            "$inc": {"dispatch_attempts": 1},
+        },
+    )
+    if getattr(result, "matched_count", 0) == 0:
+        logger.debug(
+            "reschedule_dispatch no-op for job %s — row no longer PENDING "
+            "(won a worker, terminated, or was stale-reclaimed)",
+            job_id,
+        )
+
+
+async def lease_due_dispatch(
+    db, *, now: datetime, next_at: datetime
+) -> Optional[JobRecord]:
+    """Atomically claim one PENDING job whose dispatch is due.
+
+    Selects a PENDING job with ``next_dispatch_at <= now`` and, in the same
+    operation, pushes its ``next_dispatch_at`` forward to ``next_at`` — so a
+    concurrent scheduler tick (or a second API replica) cannot lease the
+    same job, and a crash mid-attempt still leaves the job scheduled for a
+    later retry. Returns the leased job, or ``None`` when nothing is due.
+
+    The caller runs a dispatch attempt for the returned job; that attempt
+    either wins a worker (``mark_running``) or calls ``reschedule_dispatch``
+    again on overflow. Jobs with ``next_dispatch_at`` unset (``None``) are
+    never due, so they are not leased here.
+
+    Due jobs are leased oldest-first (``next_dispatch_at`` ascending) so
+    sustained overflow cannot starve the longest-waiting job toward its
+    deadline. ``next_at`` MUST be strictly in the future relative to
+    ``now``: the single-claim guarantee depends on the leased row's
+    ``next_dispatch_at`` moving out of the ``<= now`` window, so an
+    equal/past value would let a concurrent tick re-lease the same job
+    before the attempt resolves.
+    """
+    if next_at <= now:
+        raise ValueError(
+            f"lease_due_dispatch requires next_at ({next_at}) strictly after "
+            f"now ({now}); an equal/past value would let a concurrent tick "
+            "immediately re-lease the same job"
+        )
+    jobs = _jobs(db)
+    doc = await jobs.find_one_and_update(
+        {
+            "status": JobStatus.PENDING.value,
+            "next_dispatch_at": {"$lte": now},
+        },
+        {"$set": {"next_dispatch_at": next_at, "updated_at": now}},
+        sort=[("next_dispatch_at", 1)],
+        return_document=ReturnDocument.AFTER,
+    )
+    return _record_from_mongo(doc) if doc is not None else None
+
+
+async def requeue_orphaned_dispatch(
+    db, *, now: datetime, stale_before: datetime
+) -> int:
+    """Re-queue jobs orphaned by an API/worker crash so they re-dispatch.
+
+    The durable scheduler only leases ``PENDING`` jobs whose
+    ``next_dispatch_at`` is set and due, so two states survive a restart
+    that it would never pick up on its own:
+
+    - ``RUNNING`` rows whose API consumer died mid-stream (no heartbeat
+      since), and
+    - ``PENDING`` rows with ``next_dispatch_at`` unset — a fresh claim whose
+      inline first attempt never got to reschedule before the crash.
+
+    Both are reset to ``PENDING`` with ``next_dispatch_at = now`` so the next
+    scheduler tick leases them. Gated on ``updated_at < stale_before`` (the
+    same staleness threshold :func:`claim_workflow` uses) so a healthy
+    in-flight job — which keeps ``updated_at`` fresh via heartbeats — is
+    never falsely reclaimed. Returns the number of rows requeued.
+
+    Unlike ``claim_workflow``'s stale-reclaim, which fails the stale row so a
+    *new* claimant can supersede it, this revives the same row: there is no
+    new claimant, so the goal is to recover the in-flight work itself.
+    Partial-commit recovery means the re-dispatched job reuses any stages
+    already committed to cache.
+    """
+    jobs = _jobs(db)
+    result = await jobs.update_many(
+        {
+            "active": True,
+            "updated_at": {"$lt": stale_before},
+            "$or": [
+                {"status": JobStatus.RUNNING.value},
+                {"status": JobStatus.PENDING.value, "next_dispatch_at": None},
+            ],
+        },
+        {
+            "$set": {
+                "status": JobStatus.PENDING.value,
+                # PENDING is active; re-assert defensively so the
+                # discriminator can never drift from the status.
+                "active": True,
+                "next_dispatch_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    return getattr(result, "modified_count", 0)

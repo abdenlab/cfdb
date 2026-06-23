@@ -23,10 +23,18 @@ def _resolve(doc: dict, key: str):
 def _match(doc: dict, query: dict) -> bool:
     """Minimal MongoDB query matcher supporting a small operator subset."""
     for key, cond in query.items():
+        # AND $and/$or with the rest of the top-level keys rather than
+        # short-circuiting the whole match, so a query that mixes them with
+        # sibling field conditions (e.g. {active, updated_at, $or}) is
+        # evaluated faithfully regardless of key order.
         if key == "$and":
-            return all(_match(doc, sub) for sub in cond)
+            if not all(_match(doc, sub) for sub in cond):
+                return False
+            continue
         if key == "$or":
-            return any(_match(doc, sub) for sub in cond)
+            if not any(_match(doc, sub) for sub in cond):
+                return False
+            continue
 
         value = _resolve(doc, key)
 
@@ -173,6 +181,10 @@ def _apply_update(doc: dict, update: dict, *, is_insert: bool = False) -> bool:
                 if v not in existing:
                     existing.append(v)
                     changed = True
+        elif op == "$inc":
+            for k, v in fields.items():
+                _set_nested(doc, k, (_resolve(doc, k) or 0) + v)
+                changed = True
         else:
             raise NotImplementedError(f"FakeCollection update op: {op}")
     return changed
@@ -267,12 +279,19 @@ class FakeCollection:
         *,
         upsert: bool = False,
         return_document=None,
+        sort: list | None = None,
         **_kwargs,
     ) -> dict | None:
-        for d in self.docs:
-            if _match(d, query):
-                _apply_update(d, update, is_insert=False)
-                return dict(d)
+        candidates = [d for d in self.docs if _match(d, query)]
+        if sort:
+            # Single-key sort is all the production queries use; honoring it
+            # lets tests exercise ordered claims (e.g. oldest-due-first).
+            field, direction = sort[0]
+            candidates.sort(key=lambda d: d.get(field), reverse=direction < 0)
+        if candidates:
+            d = candidates[0]
+            _apply_update(d, update, is_insert=False)
+            return dict(d)
         if upsert:
             seed: dict = {}
             for k, v in query.items():
@@ -311,10 +330,10 @@ class FakeCollection:
         for d in self.docs:
             if _match(d, query):
                 matched += 1
-                for k, v in update.get("$set", {}).items():
-                    if d.get(k) != v:
-                        d[k] = v
-                        modified += 1
+                # Row-level modified count, matching real Mongo semantics
+                # (number of documents changed, not number of field writes).
+                if _apply_update(d, update, is_insert=False):
+                    modified += 1
         return _UpdateResult(matched, modified)
 
     async def update_one(self, query: dict, update: dict, **kwargs) -> _UpdateResult:

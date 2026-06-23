@@ -134,6 +134,16 @@ def operational_index_specs() -> list[IndexSpec]:
         ),
         IndexSpec("jobs", [("job_id", 1)], name="job_id_unique", unique=True),
         IndexSpec("jobs", [("status", 1), ("updated_at", 1)], name="status_updated_at"),
+        # Serves the durable retry scheduler's due-dispatch lease
+        # (workflows.lock.lease_due_dispatch): {status: pending,
+        # next_dispatch_at: {$lte: now}} sorted by next_dispatch_at asc.
+        # The status equality prefix + next_dispatch_at range/sort are
+        # both index-served, so the per-tick poll is not a PENDING scan.
+        IndexSpec(
+            "jobs",
+            [("status", 1), ("next_dispatch_at", 1)],
+            name="status_next_dispatch_at",
+        ),
         # TTL on terminal rows so the collection doesn't grow unbounded.
         # The partial filter excludes active rows (active=True) so an
         # in-flight job is never reaped. 7 days gives operators a window

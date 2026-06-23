@@ -309,6 +309,85 @@ class TestJobRecord:
         assert payload["superseded_by"] == "job-xyz"
         assert payload["progress"] == "indexing"
 
+    def test___init___should_default_dispatch_scheduling_fields(self):
+        """Test that the dispatch-scheduling fields default sanely.
+
+        Given:
+            A JobRecord built without dispatch-scheduling overrides.
+        When:
+            It is constructed.
+        Then:
+            next_dispatch_at should default to None and dispatch_attempts
+            to 0.
+        """
+        # Act
+        job = _make_job()
+
+        # Assert
+        assert job.next_dispatch_at is None
+        assert job.dispatch_attempts == 0
+
+    def test___init___should_reject_naive_next_dispatch_at(self):
+        """Test that a naive next_dispatch_at is rejected.
+
+        Given:
+            A naive next_dispatch_at (no tzinfo).
+        When:
+            A JobRecord is constructed with it.
+        Then:
+            It should raise ValidationError — the scheduler's
+            next_dispatch_at comparison requires aware UTC.
+        """
+        # Arrange
+        naive = datetime(2026, 4, 21, 13, 0, 0)
+
+        # Act & assert
+        with pytest.raises(ValidationError, match="timezone-aware"):
+            _make_job(next_dispatch_at=naive)
+
+    def test___init___should_accept_aware_next_dispatch_at(self):
+        """Test that an aware next_dispatch_at validates and round-trips.
+
+        Given:
+            An aware UTC next_dispatch_at.
+        When:
+            A JobRecord is constructed with it.
+        Then:
+            It should validate and preserve the value (None remains the
+            nullable default elsewhere).
+        """
+        # Arrange
+        when = datetime(2026, 4, 21, 13, 0, 0, tzinfo=timezone.utc)
+
+        # Act
+        job = _make_job(next_dispatch_at=when)
+
+        # Assert
+        assert job.next_dispatch_at == when
+
+    def test_to_mongo_should_serialize_dispatch_scheduling_fields(self):
+        """Test that to_mongo persists next_dispatch_at and dispatch_attempts.
+
+        Given:
+            A JobRecord with an aware next_dispatch_at and a non-zero
+            dispatch_attempts.
+        When:
+            to_mongo is invoked.
+        Then:
+            Both fields should appear in the dump with their values
+            preserved verbatim.
+        """
+        # Arrange
+        when = datetime(2026, 4, 21, 13, 0, 0, tzinfo=timezone.utc)
+        job = _make_job(next_dispatch_at=when, dispatch_attempts=3)
+
+        # Act
+        payload = job.to_mongo()
+
+        # Assert
+        assert payload["next_dispatch_at"] == when
+        assert payload["dispatch_attempts"] == 3
+
     @pytest.mark.parametrize(
         "status",
         list(JobStatus),

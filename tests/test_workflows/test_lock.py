@@ -5,12 +5,42 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from cfdb.workflows import lock
-from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind, JobStatus
+from cfdb.workflows.models import ArtifactKind, JobRecord, JobStatus
 from tests.test_workflows import FIXTURE_MD5
 
 PIPELINE_VERSION = 1
+
+
+def _insert_job(
+    mock_db,
+    *,
+    workflow_key: str,
+    status: JobStatus,
+    next_dispatch_at: datetime | None = None,
+    dispatch_attempts: int = 0,
+    updated_at: datetime | None = None,
+) -> JobRecord:
+    """Insert a crafted job doc into the fake collection and return it."""
+    now = datetime.now(timezone.utc)
+    record = JobRecord(
+        job_id=f"job-{workflow_key}",
+        workflow_key=workflow_key,
+        status=status,
+        dcc="encode",
+        local_id="x",
+        md5=FIXTURE_MD5,
+        pipeline_version=PIPELINE_VERSION,
+        submitted_at=now,
+        updated_at=updated_at or now,
+        next_dispatch_at=next_dispatch_at,
+        dispatch_attempts=dispatch_attempts,
+    )
+    mock_db.jobs.docs.append(record.to_mongo())
+    return record
 
 
 def _install_jobs_index(mock_db) -> None:
@@ -18,9 +48,11 @@ def _install_jobs_index(mock_db) -> None:
     mock_db.jobs.create_index(
         {"workflow_key": 1},
         unique=True,
-        partialFilterExpression={
-            "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-        },
+        # Match production: the mutex partial-unique index filters on the
+        # ``active`` boolean discriminator (DocumentDB rejects ``$in`` inside
+        # a partialFilterExpression). Keying the fake on ``active`` lets the
+        # unit layer catch an ``active``/``status`` lockstep drift.
+        partialFilterExpression={"active": True},
     )
 
 
@@ -777,6 +809,65 @@ class TestRecordFromMongo:
         assert record.submitted_at.tzinfo is timezone.utc
         assert record.updated_at.tzinfo is timezone.utc
 
+    @given(
+        submitted=st.datetimes(timezones=st.just(timezone.utc)),
+        updated=st.datetimes(timezones=st.just(timezone.utc)),
+        next_dispatch=st.one_of(
+            st.none(), st.datetimes(timezones=st.just(timezone.utc))
+        ),
+    )
+    def test_record_from_mongo_should_roundtrip_aware_and_naive_datetimes(
+        self, submitted, updated, next_dispatch
+    ):
+        """Test that the to_mongo/_record_from_mongo datetime round-trip is total.
+
+        Given:
+            A JobRecord with arbitrary aware-UTC ``submitted_at`` /
+            ``updated_at`` and an aware-or-``None`` ``next_dispatch_at``,
+            serialized via ``to_mongo`` and then rendered naive — the BSON
+            Date round-trip some Motor / mongomock-motor variants produce.
+        When:
+            ``_record_from_mongo`` hydrates the doc back into a JobRecord.
+        Then:
+            Every datetime instant is preserved and re-attached to UTC, and
+            a ``None`` ``next_dispatch_at`` survives as ``None`` — the third
+            nullable datetime threads the round-trip without loss.
+        """
+        # Arrange
+        record = JobRecord(
+            job_id="job-rt",
+            workflow_key=f"encode/x/{FIXTURE_MD5}/v1",
+            status=JobStatus.PENDING,
+            dcc="encode",
+            local_id="x",
+            md5=FIXTURE_MD5,
+            pipeline_version=1,
+            submitted_at=submitted,
+            updated_at=updated,
+            next_dispatch_at=next_dispatch,
+        )
+        doc = record.to_mongo()
+        # Simulate the BSON Date round-trip: strip tzinfo on stored dates,
+        # which is the naive rendering ``_record_from_mongo`` must repair.
+        for field in ("submitted_at", "updated_at", "next_dispatch_at"):
+            value = doc.get(field)
+            if isinstance(value, datetime):
+                doc[field] = value.astimezone(timezone.utc).replace(tzinfo=None)
+
+        # Act
+        hydrated = lock._record_from_mongo(doc)
+
+        # Assert
+        assert hydrated.submitted_at == submitted
+        assert hydrated.updated_at == updated
+        assert hydrated.submitted_at.tzinfo is timezone.utc
+        assert hydrated.updated_at.tzinfo is timezone.utc
+        if next_dispatch is None:
+            assert hydrated.next_dispatch_at is None
+        else:
+            assert hydrated.next_dispatch_at == next_dispatch
+            assert hydrated.next_dispatch_at.tzinfo is timezone.utc
+
 
 class TestClaimWorkflowSupersededByChain:
     @pytest.mark.asyncio
@@ -875,3 +966,465 @@ class TestGetJob:
         assert hydrated is not None
         assert hydrated.job_id == record.job_id
         assert hydrated.workflow_key == record.workflow_key
+
+
+class TestCountActiveWorkflows:
+    @pytest.mark.asyncio
+    async def test_count_active_workflows_should_count_pending_and_running(
+        self, mock_db
+    ):
+        """Test that the admission count includes only active jobs.
+
+        Given:
+            Two pending, one running, and two terminal job rows.
+        When:
+            count_active_workflows is awaited.
+        Then:
+            It should return 3 — pending + running only, excluding the
+            terminal rows.
+        """
+        # Arrange
+        _insert_job(mock_db, workflow_key="a", status=JobStatus.PENDING)
+        _insert_job(mock_db, workflow_key="b", status=JobStatus.PENDING)
+        _insert_job(mock_db, workflow_key="c", status=JobStatus.RUNNING)
+        _insert_job(mock_db, workflow_key="d", status=JobStatus.COMPLETED)
+        _insert_job(mock_db, workflow_key="e", status=JobStatus.FAILED)
+
+        # Act
+        count = await lock.count_active_workflows(mock_db)
+
+        # Assert
+        assert count == 3
+
+    @pytest.mark.asyncio
+    async def test_count_active_workflows_should_return_zero_when_empty(self, mock_db):
+        """Test that an empty collection counts as zero active workflows.
+
+        Given:
+            A jobs collection with no rows.
+        When:
+            count_active_workflows is awaited.
+        Then:
+            It should return 0.
+        """
+        # Act
+        count = await lock.count_active_workflows(mock_db)
+
+        # Assert
+        assert count == 0
+
+
+class TestRescheduleDispatch:
+    @pytest.mark.asyncio
+    async def test_reschedule_dispatch_should_defer_pending_and_bump_attempts(
+        self, mock_db
+    ):
+        """Test that rescheduling a pending job advances its retry time.
+
+        Given:
+            A pending job with no next_dispatch_at and zero attempts.
+        When:
+            reschedule_dispatch is awaited with a future next_at.
+        Then:
+            It should set next_dispatch_at to that time and increment
+            dispatch_attempts.
+        """
+        # Arrange
+        _insert_job(mock_db, workflow_key="a", status=JobStatus.PENDING)
+        next_at = datetime.now(timezone.utc) + timedelta(seconds=120)
+
+        # Act
+        await lock.reschedule_dispatch(mock_db, "job-a", next_at=next_at)
+
+        # Assert
+        doc = mock_db.jobs.docs[0]
+        assert doc["next_dispatch_at"] == next_at
+        assert doc["dispatch_attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_reschedule_dispatch_should_be_noop_when_not_pending(self, mock_db):
+        """Test that rescheduling a non-pending job changes nothing.
+
+        Given:
+            A running job (it already won a worker).
+        When:
+            reschedule_dispatch is awaited for it.
+        Then:
+            It should leave next_dispatch_at and dispatch_attempts untouched,
+            because the update is fenced on PENDING.
+        """
+        # Arrange
+        _insert_job(mock_db, workflow_key="a", status=JobStatus.RUNNING)
+        next_at = datetime.now(timezone.utc) + timedelta(seconds=120)
+
+        # Act
+        await lock.reschedule_dispatch(mock_db, "job-a", next_at=next_at)
+
+        # Assert
+        doc = mock_db.jobs.docs[0]
+        assert doc["next_dispatch_at"] is None
+        assert doc["dispatch_attempts"] == 0
+
+
+class TestLeaseDueDispatch:
+    @pytest.mark.asyncio
+    async def test_lease_due_dispatch_should_claim_due_job_and_push_forward(
+        self, mock_db
+    ):
+        """Test that a due pending job is leased and its next attempt deferred.
+
+        Given:
+            A pending job whose next_dispatch_at is in the past.
+        When:
+            lease_due_dispatch is awaited with now past that time and a
+            future next_at.
+        Then:
+            It should return the job and push its next_dispatch_at forward to
+            next_at so a later tick won't re-lease it.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.PENDING,
+            next_dispatch_at=now - timedelta(seconds=1),
+        )
+        next_at = now + timedelta(seconds=120)
+
+        # Act
+        leased = await lock.lease_due_dispatch(mock_db, now=now, next_at=next_at)
+
+        # Assert
+        assert leased is not None
+        assert leased.workflow_key == "a"
+        assert mock_db.jobs.docs[0]["next_dispatch_at"] == next_at
+
+    @pytest.mark.asyncio
+    async def test_lease_due_dispatch_should_not_re_lease_within_lease_window(
+        self, mock_db
+    ):
+        """Test that a freshly-leased job is not immediately re-leasable.
+
+        Given:
+            One due pending job that has just been leased (its
+            next_dispatch_at pushed into the future).
+        When:
+            lease_due_dispatch is awaited again at the same now.
+        Then:
+            It should return None — the single-claim guard, so two ticks or
+            replicas cannot double-dispatch one job.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.PENDING,
+            next_dispatch_at=now - timedelta(seconds=1),
+        )
+        next_at = now + timedelta(seconds=120)
+        first = await lock.lease_due_dispatch(mock_db, now=now, next_at=next_at)
+
+        # Act
+        second = await lock.lease_due_dispatch(mock_db, now=now, next_at=next_at)
+
+        # Assert
+        assert first is not None
+        assert second is None
+
+    @pytest.mark.asyncio
+    async def test_lease_due_dispatch_should_skip_unscheduled_job(self, mock_db):
+        """Test that a job with next_dispatch_at unset is never leased.
+
+        Given:
+            A pending job whose next_dispatch_at is None (freshly claimed,
+            not yet deferred by the scheduler).
+        When:
+            lease_due_dispatch is awaited.
+        Then:
+            It should return None — an unscheduled job is not due.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db, workflow_key="a", status=JobStatus.PENDING, next_dispatch_at=None
+        )
+
+        # Act
+        leased = await lock.lease_due_dispatch(
+            mock_db, now=now, next_at=now + timedelta(seconds=120)
+        )
+
+        # Assert
+        assert leased is None
+
+    @pytest.mark.asyncio
+    async def test_lease_due_dispatch_should_skip_future_and_running_jobs(
+        self, mock_db
+    ):
+        """Test that not-yet-due and non-pending jobs are not leased.
+
+        Given:
+            A pending job due in the future and a running job already past
+            its time.
+        When:
+            lease_due_dispatch is awaited.
+        Then:
+            It should return None — the future job is not due and the running
+            job is not pending.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="future",
+            status=JobStatus.PENDING,
+            next_dispatch_at=now + timedelta(seconds=60),
+        )
+        _insert_job(
+            mock_db,
+            workflow_key="running",
+            status=JobStatus.RUNNING,
+            next_dispatch_at=now - timedelta(seconds=60),
+        )
+
+        # Act
+        leased = await lock.lease_due_dispatch(
+            mock_db, now=now, next_at=now + timedelta(seconds=120)
+        )
+
+        # Assert
+        assert leased is None
+
+    @pytest.mark.asyncio
+    async def test_lease_due_dispatch_should_lease_oldest_due_job_first(self, mock_db):
+        """Test that the longest-waiting due job is leased first.
+
+        Given:
+            Two due pending jobs with different next_dispatch_at times,
+            inserted newest-first.
+        When:
+            lease_due_dispatch is awaited.
+        Then:
+            It should lease the one with the earliest next_dispatch_at, so
+            sustained overflow cannot starve the oldest job.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="newer",
+            status=JobStatus.PENDING,
+            next_dispatch_at=now - timedelta(seconds=10),
+        )
+        _insert_job(
+            mock_db,
+            workflow_key="older",
+            status=JobStatus.PENDING,
+            next_dispatch_at=now - timedelta(seconds=300),
+        )
+
+        # Act
+        leased = await lock.lease_due_dispatch(
+            mock_db, now=now, next_at=now + timedelta(seconds=120)
+        )
+
+        # Assert
+        assert leased is not None
+        assert leased.workflow_key == "older"
+
+    @pytest.mark.asyncio
+    async def test_lease_due_dispatch_should_reject_next_at_not_in_future(
+        self, mock_db
+    ):
+        """Test that a non-future next_at is rejected.
+
+        Given:
+            A now timestamp and a next_at equal to it.
+        When:
+            lease_due_dispatch is awaited.
+        Then:
+            It should raise ValueError — an equal/past next_at would let a
+            concurrent tick immediately re-lease the same job.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+
+        # Act & assert
+        with pytest.raises(ValueError, match="strictly after"):
+            await lock.lease_due_dispatch(mock_db, now=now, next_at=now)
+
+
+class TestRequeueOrphanedDispatch:
+    @pytest.mark.asyncio
+    async def test_requeue_orphaned_dispatch_should_requeue_a_stale_running_orphan(self, mock_db):
+        """Test that a RUNNING job with no recent heartbeat is re-queued.
+
+        Given:
+            A RUNNING job whose `updated_at` is older than the stale
+            threshold — an in-flight job orphaned when its API consumer
+            died mid-stream.
+        When:
+            requeue_orphaned_dispatch runs with that staleness cutoff.
+        Then:
+            The job is reset to PENDING with `next_dispatch_at` set so the
+            scheduler re-dispatches it, and the call reports one requeued
+            row.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        stale = now - timedelta(seconds=2000)
+        _insert_job(
+            mock_db, workflow_key="a", status=JobStatus.RUNNING, updated_at=stale
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 1
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.status == JobStatus.PENDING
+        assert job.next_dispatch_at == now
+
+    @pytest.mark.asyncio
+    async def test_requeue_orphaned_dispatch_should_requeue_a_stale_pending_job_with_no_next_dispatch(
+        self, mock_db
+    ):
+        """Test that a stale PENDING job with unset next_dispatch_at is re-queued.
+
+        Given:
+            A PENDING job with `next_dispatch_at` unset (a fresh claim whose
+            inline attempt never rescheduled) and a stale `updated_at`.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            Its `next_dispatch_at` is set to now so the scheduler — which
+            never leases a null-`next_dispatch_at` row — can pick it up.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.PENDING,
+            next_dispatch_at=None,
+            updated_at=now - timedelta(seconds=2000),
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 1
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.status == JobStatus.PENDING
+        assert job.next_dispatch_at == now
+
+    @pytest.mark.asyncio
+    async def test_requeue_orphaned_dispatch_should_not_touch_a_fresh_running_job(self, mock_db):
+        """Test that a healthy, recently-heartbeating RUNNING job is left alone.
+
+        Given:
+            A RUNNING job whose `updated_at` is recent (within the stale
+            threshold), i.e. a healthy in-flight job.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            It is not touched — staleness gating prevents the sweep from
+            yanking a live job away from its worker.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.RUNNING,
+            updated_at=now - timedelta(seconds=10),
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 0
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.status == JobStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_requeue_orphaned_dispatch_should_not_touch_an_already_queued_pending_job(self, mock_db):
+        """Test that a stale PENDING job already carrying next_dispatch_at is left.
+
+        Given:
+            A PENDING job that already has `next_dispatch_at` set (it is
+            queued and leasable by the scheduler), even with a stale
+            `updated_at`.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            It is not touched — the scheduler already handles it; the sweep
+            targets only the non-leasable orphan states.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        original = now - timedelta(seconds=50)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.PENDING,
+            next_dispatch_at=original,
+            updated_at=now - timedelta(seconds=2000),
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 0
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.next_dispatch_at == original
+
+    @pytest.mark.asyncio
+    async def test_requeue_orphaned_dispatch_should_not_touch_terminal_jobs(self, mock_db):
+        """Test that terminal (completed/failed) jobs are never re-queued.
+
+        Given:
+            Stale COMPLETED and FAILED jobs.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            Neither is touched — only active rows (the mutex holders) are
+            candidates for recovery.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        stale = now - timedelta(seconds=2000)
+        _insert_job(
+            mock_db, workflow_key="done", status=JobStatus.COMPLETED, updated_at=stale
+        )
+        _insert_job(
+            mock_db, workflow_key="fail", status=JobStatus.FAILED, updated_at=stale
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 0
+        assert (await lock.get_job(mock_db, "job-done")).status == JobStatus.COMPLETED
+        assert (await lock.get_job(mock_db, "job-fail")).status == JobStatus.FAILED
