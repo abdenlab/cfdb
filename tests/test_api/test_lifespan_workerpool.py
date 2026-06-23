@@ -166,6 +166,7 @@ async def test_build_discovery_should_yield_ecs_discovery_un_entered(
         subnets=("subnet-1",),
         security_groups=(),
         assign_public_ip="DISABLED",
+        max_workers=16,
     )
     profile = profile_mod.WorkflowProfile(
         kind="ecs",

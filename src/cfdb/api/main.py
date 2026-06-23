@@ -180,9 +180,11 @@ def _build_provisioner(profile: WorkflowProfile) -> Optional[EcsProvisioner]:
     return EcsProvisioner(
         cluster=profile.ecs.cluster,
         task_definition=profile.ecs.task_definition,
+        task_family=profile.ecs.task_family,
         subnets=profile.ecs.subnets,
         security_groups=profile.ecs.security_groups,
         assign_public_ip=profile.ecs.assign_public_ip,
+        max_workers=profile.ecs.max_workers,
         endpoint_url=profile.aws_endpoint_url,
         region_name=profile.aws_region,
     )

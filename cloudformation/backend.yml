@@ -35,6 +35,17 @@ Parameters:
     Type: Number
     Default: 1
     Description: Number of ECS tasks
+  EcsMaxWorkers:
+    Type: Number
+    Default: 16
+    Description: >
+      Cap on concurrently-running ephemeral Fargate worker tasks, set as
+      ECS_MAX_WORKERS. Before each RunTask the provisioner counts running
+      worker tasks and skips the spawn when at this cap, so the worker fleet
+      is bounded while excess jobs stay queued (the durable scheduler
+      dispatches them as workers free up). This bounds WORKERS, not the
+      queue — the queue/admission bound is CFDB_WORKFLOW_MAX_ACTIVE. 0
+      disables the cap (rely on the Fargate vCPU quota).
   HostedZoneName:
     Type: String
     Default: vis-api.link
@@ -237,6 +248,11 @@ Resources:
               Value: !Ref WorkflowS3Prefix
             - Name: AWS_REGION
               Value: !Ref AWS::Region
+            # Cap on concurrently-running ephemeral worker tasks: the
+            # provisioner counts the fleet before each RunTask and queues
+            # rather than spawning past this. Bounds workers, not the queue.
+            - Name: ECS_MAX_WORKERS
+              Value: !Ref EcsMaxWorkers
           # The cert PEMs (when mTLS is enabled) are injected as env vars
           # and written to files by the image entrypoint
           # (cfdb-tls-entrypoint.sh), which points CFDB_WORKER_TLS_CA/CERT/KEY

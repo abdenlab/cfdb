@@ -93,6 +93,18 @@ class EcsProvisioner:
         max_in_flight: Soft cap on concurrent ``RunTask`` calls. ECS's
             ``RunTask`` API is rate-limited to ~20 req/s per account;
             this guard keeps us well under it.
+        task_family: Task-definition family used to count the current
+            worker fleet via ``list_tasks`` for the ``max_workers`` cap.
+            Defaults to ``task_definition`` with any ``:revision`` suffix
+            stripped.
+        max_workers: Cap on concurrently-running worker tasks. Before each
+            ``RunTask`` the provisioner counts running/starting worker tasks
+            and skips the spawn when already at this cap, so the worker
+            fleet is bounded while excess jobs stay queued (the durable
+            scheduler dispatches them as workers free up — no shedding).
+            ``0`` disables the cap (rely on the Fargate vCPU quota). Soft:
+            ``list_tasks`` eventual-consistency lag plus a count-then-spawn
+            race across distinct workflow keys can briefly overshoot.
     """
 
     def __init__(
@@ -107,11 +119,15 @@ class EcsProvisioner:
         endpoint_url: Optional[str] = None,
         region_name: Optional[str] = None,
         max_in_flight: int = 16,
+        task_family: Optional[str] = None,
+        max_workers: int = 0,
     ) -> None:
         if not cluster:
             raise ValueError("EcsProvisioner requires a cluster name")
         if not task_definition:
             raise ValueError("EcsProvisioner requires a task_definition")
+        if max_workers < 0:
+            raise ValueError(f"max_workers must be >= 0; got {max_workers}")
         subnet_list = list(subnets)
         if not subnet_list:
             raise ValueError("EcsProvisioner requires at least one subnet")
@@ -128,6 +144,10 @@ class EcsProvisioner:
 
         self._cluster = cluster
         self._task_definition = task_definition
+        # Family used to count the running fleet via ``list_tasks``; strip
+        # any ``:revision`` so a pinned task-def revision still matches.
+        self._task_family = task_family or task_definition.split(":", 1)[0]
+        self._max_workers = max_workers
         self._subnets = subnet_list
         self._security_groups = list(security_groups)
         self._assign_public_ip = assign_public_ip
@@ -239,10 +259,57 @@ class EcsProvisioner:
                     self._in_flight.pop(dedup_key, None)
 
         try:
+            # Worker-fleet cap: if the fleet is already at the cap, do not
+            # launch another task. Return an empty ARN list rather than
+            # raise — the caller (``_handle_overflow``) reschedules the job,
+            # so it stays queued and runs when an existing worker frees up.
+            # This bounds the worker-container count while preserving the
+            # queue (the admission ceiling, not this cap, bounds the queue).
+            if self._max_workers > 0:
+                running = await self._current_worker_count()
+                if running >= self._max_workers:
+                    logger.info(
+                        "Worker fleet at capacity (%d/%d); not spawning for "
+                        "%s — job stays queued until a worker frees",
+                        running,
+                        self._max_workers,
+                        dedup_key,
+                    )
+                    return []
             async with self._semaphore:
                 return await self._run_task()
         finally:
             await asyncio.shield(_release_dedup_slot())
+
+    async def _current_worker_count(self) -> int:
+        """Count worker tasks whose desired status is RUNNING.
+
+        ``list_tasks`` with ``desiredStatus="RUNNING"`` returns tasks still
+        starting (PROVISIONING / PENDING / ACTIVATING) as well as those
+        already running, so the count reflects the workers that exist or are
+        coming up — the right denominator for the fleet cap. A ``list_tasks``
+        failure raises :class:`RetryableProvisionerError` so the caller
+        queues the job and retries on the next tick rather than spawning
+        blind past the cap.
+
+        Read-only and cheap, so it runs on the default executor rather than
+        the owned RunTask pool — ``aclose``'s deterministic drain only needs
+        to cover the billable RunTask launches. The cap is small (well under
+        the first ``list_tasks`` page of 100), so the first page is the whole
+        fleet and pagination is unnecessary to decide whether it is reached.
+        """
+        try:
+            response = await asyncio.to_thread(
+                self._client.list_tasks,
+                cluster=self._cluster,
+                family=self._task_family,
+                desiredStatus="RUNNING",
+            )
+        except (ClientError, BotoCoreError) as exc:
+            raise RetryableProvisionerError(
+                f"list_tasks failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return len(response.get("taskArns") or [])
 
     async def _run_task(self) -> list[str]:
         """Single ``RunTask`` invocation translated to a list of task ARNs.
