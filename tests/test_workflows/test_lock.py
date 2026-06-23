@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cfdb.workflows import lock
-from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind, JobRecord, JobStatus
+from cfdb.workflows.models import ArtifactKind, JobRecord, JobStatus
 from tests.test_workflows import FIXTURE_MD5
 
 PIPELINE_VERSION = 1
@@ -46,9 +46,11 @@ def _install_jobs_index(mock_db) -> None:
     mock_db.jobs.create_index(
         {"workflow_key": 1},
         unique=True,
-        partialFilterExpression={
-            "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-        },
+        # Match production: the mutex partial-unique index filters on the
+        # ``active`` boolean discriminator (DocumentDB rejects ``$in`` inside
+        # a partialFilterExpression). Keying the fake on ``active`` lets the
+        # unit layer catch an ``active``/``status`` lockstep drift.
+        partialFilterExpression={"active": True},
     )
 
 
@@ -1195,7 +1197,7 @@ class TestLeaseDueDispatch:
 
 class TestRequeueOrphanedDispatch:
     @pytest.mark.asyncio
-    async def test_should_requeue_a_stale_running_orphan(self, mock_db):
+    async def test_requeue_orphaned_dispatch_should_requeue_a_stale_running_orphan(self, mock_db):
         """Test that a RUNNING job with no recent heartbeat is re-queued.
 
         Given:
@@ -1229,7 +1231,7 @@ class TestRequeueOrphanedDispatch:
         assert job.next_dispatch_at == now
 
     @pytest.mark.asyncio
-    async def test_should_requeue_a_stale_pending_job_with_no_next_dispatch(
+    async def test_requeue_orphaned_dispatch_should_requeue_a_stale_pending_job_with_no_next_dispatch(
         self, mock_db
     ):
         """Test that a stale PENDING job with unset next_dispatch_at is re-queued.
@@ -1266,7 +1268,7 @@ class TestRequeueOrphanedDispatch:
         assert job.next_dispatch_at == now
 
     @pytest.mark.asyncio
-    async def test_should_not_touch_a_fresh_running_job(self, mock_db):
+    async def test_requeue_orphaned_dispatch_should_not_touch_a_fresh_running_job(self, mock_db):
         """Test that a healthy, recently-heartbeating RUNNING job is left alone.
 
         Given:
@@ -1299,7 +1301,7 @@ class TestRequeueOrphanedDispatch:
         assert job.status == JobStatus.RUNNING
 
     @pytest.mark.asyncio
-    async def test_should_not_touch_an_already_queued_pending_job(self, mock_db):
+    async def test_requeue_orphaned_dispatch_should_not_touch_an_already_queued_pending_job(self, mock_db):
         """Test that a stale PENDING job already carrying next_dispatch_at is left.
 
         Given:
@@ -1335,7 +1337,7 @@ class TestRequeueOrphanedDispatch:
         assert job.next_dispatch_at == original
 
     @pytest.mark.asyncio
-    async def test_should_not_touch_terminal_jobs(self, mock_db):
+    async def test_requeue_orphaned_dispatch_should_not_touch_terminal_jobs(self, mock_db):
         """Test that terminal (completed/failed) jobs are never re-queued.
 
         Given:

@@ -373,16 +373,22 @@ def test_create_indexes_js_should_define_all_operational_index_names():
         The JS source is read.
     Then:
         It should reference each named operational index and the
-        locks.active index.
+        locks.active index. The names are derived from
+        ``operational_index_specs()`` (not hard-coded) so a newly-added
+        operational index is guarded automatically.
     """
+    # Arrange — the named jobs-collection operational indexes (the locks
+    # index relies on Mongo's auto-generated name and is asserted below).
+    named = [
+        spec.name
+        for spec in operational_index_specs()
+        if spec.name and spec.collection == "jobs"
+    ]
+
     # Assert
-    for name in (
-        "workflow_key_active_unique",
-        "job_id_unique",
-        "status_updated_at",
-        "terminal_ttl",
-    ):
-        assert name in _JS
+    assert named, "expected at least one named jobs operational index"
+    for name in named:
+        assert name in _JS, f"{name} missing from create-indexes.js"
     assert "db.locks.createIndex({ active: 1 })" in _JS
 
 

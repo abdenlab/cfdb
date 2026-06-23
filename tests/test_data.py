@@ -11,7 +11,6 @@ from cfdb import api
 from cfdb.api.routers.data import stream_file, stream_file_status
 from cfdb.services import drs, locks
 from cfdb.workflows.executor import WoolExecutor
-from cfdb.workflows.models import ACTIVE_STATUSES
 from cfdb.workflows.processors.bam import BamIndexProcessor
 from tests.test_workflows import FIXTURE_MD5
 from cfdb.workflows.processors.registry import ProcessorRegistry, default_registry
@@ -115,9 +114,7 @@ class TestStreamFileWorkflowPath:
         mock_db.jobs.create_index(
             {"workflow_key": 1},
             unique=True,
-            partialFilterExpression={
-                "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-            },
+            partialFilterExpression={"active": True},
         )
 
         mock_db.dcc.docs = [

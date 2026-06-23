@@ -11,7 +11,7 @@ from cfdb import api
 from cfdb.api.routers.index import stream_index_file, stream_index_file_status
 from cfdb.services import drs, locks
 from cfdb.workflows.executor import WoolExecutor
-from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind
+from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.bam import BamIndexProcessor
 from cfdb.workflows.processors.registry import ProcessorRegistry, default_registry
 from tests.test_workflows import FIXTURE_MD5
@@ -1048,9 +1048,7 @@ class TestStreamIndexFileWorkflowPaths:
         mock_db.jobs.create_index(
             {"workflow_key": 1},
             unique=True,
-            partialFilterExpression={
-                "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-            },
+            partialFilterExpression={"active": True},
         )
 
         # Register a real processor + cache + executor on the module.

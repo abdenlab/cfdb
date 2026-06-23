@@ -30,9 +30,7 @@ def _install_jobs_index(mock_db) -> None:
     mock_db.jobs.create_index(
         {"workflow_key": 1},
         unique=True,
-        partialFilterExpression={
-            "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-        },
+        partialFilterExpression={"active": True},
     )
 
 

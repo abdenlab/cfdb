@@ -23,10 +23,18 @@ def _resolve(doc: dict, key: str):
 def _match(doc: dict, query: dict) -> bool:
     """Minimal MongoDB query matcher supporting a small operator subset."""
     for key, cond in query.items():
+        # AND $and/$or with the rest of the top-level keys rather than
+        # short-circuiting the whole match, so a query that mixes them with
+        # sibling field conditions (e.g. {active, updated_at, $or}) is
+        # evaluated faithfully regardless of key order.
         if key == "$and":
-            return all(_match(doc, sub) for sub in cond)
+            if not all(_match(doc, sub) for sub in cond):
+                return False
+            continue
         if key == "$or":
-            return any(_match(doc, sub) for sub in cond)
+            if not any(_match(doc, sub) for sub in cond):
+                return False
+            continue
 
         value = _resolve(doc, key)
 

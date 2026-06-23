@@ -27,7 +27,7 @@ from cfdb.workflows.cache import S3Cache
 from cfdb.workflows.events import Complete, StageComplete, WorkflowEvent
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.lock import get_job
-from cfdb.workflows.models import ACTIVE_STATUSES, ArtifactKind, JobStatus
+from cfdb.workflows.models import ArtifactKind, JobStatus
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.registry import ProcessorRegistry
 from tests.test_workflows import FIXTURE_MD5
@@ -79,9 +79,7 @@ def _install_jobs_index(mock_db) -> None:
     mock_db.jobs.create_index(
         {"workflow_key": 1},
         unique=True,
-        partialFilterExpression={
-            "status": {"$in": [s.value for s in ACTIVE_STATUSES]}
-        },
+        partialFilterExpression={"active": True},
     )
 
 
