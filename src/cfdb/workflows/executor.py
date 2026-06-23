@@ -40,6 +40,7 @@ import contextlib
 import logging
 import random
 import shutil
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
@@ -123,7 +124,10 @@ _RETRY_INTERVAL_SECONDS = float(WORKFLOW_RETRY_INTERVAL_S)
 
 #: Upper bound on the random jitter added to each reschedule, to spread a
 #: thundering herd of queued jobs across retry ticks instead of stampeding
-#: the pool in lockstep. Tests set this to 0 for deterministic timing.
+#: the pool in lockstep. Clamped to the retry interval, so tests that
+#: monkeypatch ``_RETRY_INTERVAL_SECONDS`` low get correspondingly small,
+#: bounded jitter (determinism in tests comes from that clamp, not from
+#: zeroing this constant).
 _RETRY_JITTER_MAX_SECONDS = min(30.0, _RETRY_INTERVAL_SECONDS)
 
 #: Max wall-clock a job may wait for capacity (measured from
@@ -137,6 +141,28 @@ _DISPATCH_DEADLINE_SECONDS = float(WORKFLOW_DISPATCH_DEADLINE_S)
 #: refreshes ``JobRecord.updated_at`` on each heartbeat so a healthy
 #: long-running stage doesn't get reclaimed as stale.
 _HEARTBEAT_INTERVAL_S = float(WORKFLOW_HEARTBEAT_INTERVAL_S)
+
+#: How long a consumer may fail to refresh its heartbeat before it aborts
+#: its own job. This makes a stale ``RUNNING`` row reliably mean "the
+#: consumer is gone": a consumer that cannot reach Mongo stops computing
+#: (and lets ``stream.aclose`` cancel the remote worker) *before* the
+#: orphan sweep's ``STALE_WORKFLOW_THRESHOLD`` would revive the row, so
+#: recovery never double-dispatches a still-live job. Sized strictly
+#: between one heartbeat interval (a single transient write failure must
+#: not abort) and the sweep threshold (the consumer must give up with
+#: margin to spare); the ``STALE >= 2*HEARTBEAT`` startup invariant keeps
+#: that window non-empty.
+_HEARTBEAT_LOSS_ABORT_S = max(
+    _HEARTBEAT_INTERVAL_S,
+    STALE_WORKFLOW_THRESHOLD.total_seconds() - _HEARTBEAT_INTERVAL_S,
+)
+
+#: Max jobs leased per scheduler tick. Bounds the per-tick dispatch
+#: fan-out so a large queued backlog (up to ``WORKFLOW_MAX_ACTIVE``) can't
+#: spawn thousands of concurrent attempts in one tick; the remainder is
+#: leased on subsequent ticks. Generous enough to keep a reasonable fleet
+#: saturated, small enough to avoid a thundering herd against the pool.
+_MAX_DISPATCHES_PER_TICK = 64
 
 #: Grace given to ``_finalize`` tasks during ``drain``'s second phase
 #: after the primary ``_pending_tasks`` gather is done. A workflow that
@@ -198,6 +224,20 @@ class AdmissionRejected(RuntimeError):
         )
 
 
+class HeartbeatLost(RuntimeError):
+    """Raised by the stream consumer when it can no longer refresh the job.
+
+    Signals that ``heartbeat_workflow`` has been failing for longer than
+    :data:`_HEARTBEAT_LOSS_ABORT_S` while a worker is still streaming — i.e.
+    this consumer has lost its connection to Mongo and can no longer keep
+    the row fresh. Consuming the rest of the stream would let the worker
+    keep computing invisibly until the orphan sweep (on a healthy replica)
+    reclaims the now-stale row and re-dispatches it, double-running the job.
+    Raising this aborts the attempt and ``aclose``s the stream, cancelling
+    the remote worker so recovery has a single live attempt to revive.
+    """
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -251,6 +291,7 @@ async def _run_processor_routine(
     file_meta: dict[str, Any],
     workdir_str: str,
     cache: CacheBackend,
+    heartbeat_interval: float,
 ) -> AsyncIterator[WorkflowEvent]:
     """Wool routine body: stream processor events back to the dispatcher.
 
@@ -258,12 +299,16 @@ async def _run_processor_routine(
     :class:`~cfdb.workflows.events.StageComplete` and
     :class:`~cfdb.workflows.events.Complete` events. We wrap its stream
     with a heartbeat-aware iterator: while waiting on the next event from
-    the processor, every ``_HEARTBEAT_INTERVAL_S`` we inject a
+    the processor, every ``heartbeat_interval`` seconds we inject a
     :class:`~cfdb.workflows.events.Heartbeat` so the API process can
     refresh ``JobRecord.updated_at`` and signal liveness without requiring
-    the worker to touch Mongo. An exception from the processor is
-    converted to an :class:`~cfdb.workflows.events.Error` event so the API
-    consumer can record a clean terminal state.
+    the worker to touch Mongo. ``heartbeat_interval`` is passed explicitly
+    (resolved API-side at dispatch) rather than read from the worker's
+    module globals, because cloudpickle ships this routine by value and the
+    worker's own ``_HEARTBEAT_INTERVAL_S`` would otherwise be ignored. An
+    exception from the processor is converted to an
+    :class:`~cfdb.workflows.events.Error` event so the API consumer can
+    record a clean terminal state.
 
     The routine yields an immediate :class:`~cfdb.workflows.events.Heartbeat`
     as its very first event — the instant a worker *accepts* the dispatch,
@@ -304,14 +349,14 @@ async def _run_processor_routine(
         while True:
             next_task = asyncio.ensure_future(inner.__anext__())
             # Loop on a per-event wait_for so a heartbeat injects every
-            # _HEARTBEAT_INTERVAL_S of stage silence; shield the task so
+            # heartbeat_interval of stage silence; shield the task so
             # a timeout doesn't propagate cancellation into the inner
             # generator mid-stage.
             while True:
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(next_task),
-                        timeout=_HEARTBEAT_INTERVAL_S,
+                        timeout=heartbeat_interval,
                     )
                     break
                 except asyncio.TimeoutError:
@@ -356,18 +401,19 @@ async def _run_processor_routine(
 class WoolExecutor(JobExecutor):
     """Executor backed by a ``wool.WorkerPool`` and a Mongo jobs collection.
 
-    When configured with an :class:`EcsProvisioner`, the executor also
-    issues a ``RunTask`` on each fresh claim before opening the routine
-    stream, so a Fargate worker boots before the dispatch retry loop
-    begins polling for it. Without a provisioner (PoC dev profile) the
-    executor relies on workers already published into the discovery
-    namespace.
+    Dispatch tries existing workers first via the priority load balancer.
+    Only when an attempt overflows (no worker accepts) does the executor —
+    when configured with an :class:`EcsProvisioner` — issue a best-effort
+    ``RunTask`` to scale the fleet up, then leave the job queued for a later
+    retry; it never spawns a worker pre-dispatch. Without a provisioner
+    (PoC dev profile) the executor relies on workers already published into
+    the discovery namespace.
 
-    A :class:`RetryableProvisionerError` from the provisioner surfaces
-    as a terminal ``FAILED`` job with a ``capacity:``-prefixed error
-    string; any other provisioner failure surfaces with a
-    ``provisioner:`` prefix. Clients parse the prefix to decide
-    whether to resubmit.
+    A job that cannot find capacity before its dispatch deadline is failed
+    with a ``capacity:``-prefixed error string, which clients parse to
+    decide whether to resubmit. Provisioner failures on the overflow path
+    are best-effort and swallowed (the job simply retries on the next tick),
+    so they never surface as a terminal job state.
 
     Args:
         db: Motor database handle holding the ``jobs`` collection.
@@ -376,7 +422,7 @@ class WoolExecutor(JobExecutor):
             processors persist artifacts to the deployment's real store
             (local FS or S3), not a worker-local filesystem.
         registry: Processor registry mapping artifact kinds to runners.
-        workdir_root: Parent directory under which per-job workdirs land.
+        workdir_root: Parent directory under which per-attempt workdirs land.
         pipeline_version: Embedded in workflow keys; bump to invalidate
             every in-flight workflow.
         provisioner: Optional :class:`EcsProvisioner`. When ``None``
@@ -445,7 +491,12 @@ class WoolExecutor(JobExecutor):
         # AFTER applicability (don't 429 a file that needs no workflow) and
         # BEFORE claiming the mutex. Soft cap — a count-then-claim race may
         # transiently overshoot, acceptable for a flood guard; the
-        # per-source mutex still dedups same-file requests.
+        # per-source mutex still dedups same-file requests below the cap.
+        # NOTE: because this precedes the claim, at the ceiling a re-GET for
+        # a file whose workflow is already active is also shed with 429
+        # (rather than attaching to the in-flight job); the client retries.
+        # This is the deliberate trade for shedding before an unbounded
+        # count-then-insert race window.
         active = await count_active_workflows(self._db)
         if active >= _MAX_ACTIVE_WORKFLOWS:
             raise AdmissionRejected(active=active, ceiling=_MAX_ACTIVE_WORKFLOWS)
@@ -552,16 +603,24 @@ class WoolExecutor(JobExecutor):
             )
 
     async def _drain_due_jobs(self) -> None:
-        """Lease every currently-due queued job and spawn its retry attempt.
+        """Lease currently-due queued jobs and spawn their retry attempts.
 
         ``lease_due_dispatch`` atomically claims one due job and pushes its
         ``next_dispatch_at`` forward, so concurrent ticks (or replicas)
         can't double-lease and a crashed attempt is still retried. We loop
-        until nothing is due, dispatching each leased job as a tracked
-        background task so a winning attempt's long stream-consume doesn't
-        block the scheduler from filling the rest of the pool.
+        until nothing is due (or the per-tick cap is hit), dispatching each
+        leased job as a tracked background task so a winning attempt's long
+        stream-consume doesn't block the scheduler from filling the pool.
+
+        The per-tick cap (``_MAX_DISPATCHES_PER_TICK``) bounds the dispatch
+        fan-out: after a large backlog (up to ``WORKFLOW_MAX_ACTIVE``) a
+        single tick would otherwise spawn thousands of concurrent attempts,
+        each opening a wool stream that immediately overflows. The remainder
+        is leased on subsequent ticks; the deadline/retry machinery tolerates
+        the delay.
         """
-        while not self._draining:
+        dispatched = 0
+        while not self._draining and dispatched < _MAX_DISPATCHES_PER_TICK:
             now = _utcnow()
             leased = await lease_due_dispatch(
                 self._db, now=now, next_at=_next_dispatch_time(now)
@@ -594,6 +653,7 @@ class WoolExecutor(JobExecutor):
                 )
                 continue
             self._spawn_attempt(leased, processor, file_meta)
+            dispatched += 1
 
     async def drain(self, *, timeout: float) -> int:
         """Wait for in-flight workflow tasks to complete.
@@ -679,12 +739,22 @@ class WoolExecutor(JobExecutor):
         unconditional pre-dispatch spawn: existing capacity is tried first
         and scale-up happens only on overflow.
         """
-        workdir = self._workdir_root / record.job_id
+        # Per-attempt workdir (unique nonce), not per-job. If the orphan
+        # sweep ever re-dispatches a job whose previous attempt is somehow
+        # still alive (e.g. event-loop starvation that defeated the
+        # heartbeat-loss abort), the two attempts use disjoint scratch dirs
+        # and cannot corrupt each other's downloads / sort temp / cleanup.
+        # Partial-commit recovery is unaffected — it keys off the cache, not
+        # the workdir.
+        workdir = self._workdir_root / f"{record.job_id}-{uuid.uuid4().hex}"
 
         # Deadline: a job that has waited for capacity longer than the
-        # dispatch deadline (measured from submission) is failed rather than
-        # retried forever. ``capacity:`` is the stable on-wire prefix
-        # clients parse to decide whether to resubmit.
+        # dispatch deadline (measured from ``submitted_at``) is failed rather
+        # than retried forever. ``capacity:`` is the stable on-wire prefix
+        # clients parse to decide whether to resubmit. Note the clock runs
+        # from original submission and is NOT reset on orphan recovery, so a
+        # job recovered after its deadline is failed here rather than resumed
+        # — recovery is best-effort, bounded by the same deadline.
         waited = (_utcnow() - record.submitted_at).total_seconds()
         if waited > _DISPATCH_DEADLINE_SECONDS:
             logger.warning(
@@ -747,6 +817,13 @@ class WoolExecutor(JobExecutor):
             )
             with contextlib.suppress(BaseException):
                 await stream.aclose()
+            # The successor owns the row, so do NOT release the mutex here —
+            # but this attempt's workdir was already created by the routine,
+            # so clean it up to avoid leaking scratch on the hand-off (A1).
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    shutil.rmtree, str(workdir), ignore_errors=True
+                )
             return
         except Exception as exc:
             logger.exception("Failed to mark job %s as running", record.job_id)
@@ -818,6 +895,12 @@ class WoolExecutor(JobExecutor):
         """
         final_status: JobStatus = JobStatus.FAILED
         final_error: Optional[str] = None
+        # Time of the last successful heartbeat write. Seeded now because
+        # the caller just marked the job RUNNING (the row is fresh). If
+        # heartbeat writes then fail for longer than _HEARTBEAT_LOSS_ABORT_S
+        # we raise HeartbeatLost and abort, so a Mongo-blind consumer stops
+        # computing before the orphan sweep revives its row (B1).
+        last_heartbeat_ok = _utcnow()
 
         try:
 
@@ -827,7 +910,20 @@ class WoolExecutor(JobExecutor):
                         if isinstance(event, Heartbeat):
                             try:
                                 await heartbeat_workflow(self._db, record.job_id)
+                                last_heartbeat_ok = _utcnow()
                             except Exception:
+                                stalled = (
+                                    _utcnow() - last_heartbeat_ok
+                                ).total_seconds()
+                                if stalled > _HEARTBEAT_LOSS_ABORT_S:
+                                    # Lost Mongo long enough that the orphan
+                                    # sweep will treat this row as dead; abort
+                                    # so recovery doesn't double-run the job.
+                                    raise HeartbeatLost(
+                                        f"no successful heartbeat for "
+                                        f"{stalled:.0f}s "
+                                        f"(> {_HEARTBEAT_LOSS_ABORT_S:.0f}s)"
+                                    )
                                 logger.exception(
                                     "Heartbeat failed for %s; continuing",
                                     record.job_id,
@@ -900,6 +996,18 @@ class WoolExecutor(JobExecutor):
                 if final_status == JobStatus.FAILED:
                     final_error = "Workflow cancelled (worker shutdown)"
                 raise
+            except HeartbeatLost as exc:
+                # Expected abort, not a crash: this consumer lost Mongo and
+                # is giving up the job so the orphan sweep can recover it
+                # without a concurrent live attempt. The terminal write
+                # below will likely no-op (Mongo is unreachable for us); the
+                # inner finally still aclose()s the stream, cancelling the
+                # remote worker so it stops computing.
+                logger.warning(
+                    "Aborting workflow %s: %s", record.job_id, exc
+                )
+                final_status = JobStatus.FAILED
+                final_error = f"heartbeat lost: {exc}"
             except Exception as exc:
                 logger.exception(
                     "Workflow %s failed during stream consumption",
@@ -986,6 +1094,7 @@ class WoolExecutor(JobExecutor):
             file_meta,
             str(workdir),
             self._cache,
+            _HEARTBEAT_INTERVAL_S,
         )
         # ``returning`` flips True only after we've handed the stream off to
         # ``_prepend_first_event``. Any other exit (NoWorkersAvailable, a
