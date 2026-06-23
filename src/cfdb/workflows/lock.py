@@ -491,9 +491,14 @@ async def count_active_workflows(db) -> int:
     ``CFDB_WORKFLOW_MAX_ACTIVE`` new requests are shed with 429. Soft by
     nature — a count-then-insert race can briefly overshoot the cap, which
     is acceptable for a flood guard.
+
+    Counts on the canonical ``active`` boolean discriminator (the single
+    source of truth every other jobs read/write/index keys off), not the
+    derived ``status $in ACTIVE_STATUSES`` view, so the ceiling and the
+    mutex stay in lockstep even if the two ever drift.
     """
     jobs = _jobs(db)
-    return await jobs.count_documents({"status": {"$in": _ACTIVE_STATUS_VALUES}})
+    return await jobs.count_documents({"active": True})
 
 
 async def reschedule_dispatch(db, job_id: str, *, next_at: datetime) -> None:

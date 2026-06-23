@@ -73,7 +73,14 @@ class JobRecord(BaseModel):
         error: Populated on ``FAILED`` status with a human-readable reason.
             Capped at 1024 chars after path-scrubbing in
             ``lock.release_workflow`` so absolute filesystem paths from
-            tool stderr don't leak via ``/jobs/{id}``.
+            tool stderr don't leak via ``/jobs/{id}``. Some failures carry a
+            stable, client-parseable prefix: ``capacity:`` (the dispatch
+            deadline elapsed while the job waited for a worker — safe to
+            resubmit later), ``heartbeat lost:`` (the consumer lost its
+            Mongo connection and aborted so the orphan sweep can recover the
+            job), and ``internal:`` (a should-never-happen executor
+            invariant failure, e.g. a leased job missing its file_meta
+            snapshot or processor).
         superseded_by: When this row is stale-reclaimed by a fresh claim,
             the winner's ``job_id`` is recorded here so clients polling
             this (now-FAILED) job can follow the chain to the live one.

@@ -17,16 +17,20 @@ namespace the API uses (``WORKFLOW_POOL_NAMESPACE``)::
     python -m cfdb.workflows.worker_lan --namespace cfdb-workers --workers 2
 
 SIGINT (Ctrl-C) or SIGTERM drains the pool and exits. With no pool
-running, ``/data`` and ``/index`` requests for processable formats hang
-on the dispatch retry budget before failing with ``NoWorkersAvailable``.
+running, ``/data`` and ``/index`` requests for processable formats do not
+hang or surface ``NoWorkersAvailable`` to the client: the job is claimed
+and queued PENDING (the request returns ``202``), and the API's durable
+retry scheduler re-attempts dispatch every ``CFDB_WORKFLOW_RETRY_INTERVAL_S``
+until a worker appears or the ``CFDB_WORKFLOW_DISPATCH_DEADLINE_S`` deadline
+elapses (then the job is failed ``capacity:``).
 
 Environment variables (CLI flags mirror them):
 
 * ``WORKFLOW_POOL_NAMESPACE`` — LAN discovery namespace the pool
   publishes under (default ``cfdb-workers``). MUST match the API's value.
 * ``WORKFLOW_WORKER_COUNT`` — number of workers to spawn and publish
-  (default ``2``). Size it at least as high as the API's lease count or
-  the API blocks waiting for workers.
+  (default ``2``). The API admits every worker discovery surfaces (there is
+  no fixed lease count), so size this to the local concurrency you want.
 """
 
 from __future__ import annotations

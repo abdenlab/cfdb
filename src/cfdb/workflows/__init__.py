@@ -150,17 +150,22 @@ WORKFLOW_STALE_THRESHOLD_S: Final = _positive_int(
     minimum=1,
 )
 
-# The stale-reclaim threshold MUST exceed two heartbeat intervals so a
-# single missed heartbeat (e.g., a brief Mongo write delay) does not
-# falsely reclaim a healthy worker. The default values (300 / 900)
-# satisfy this with a 300s safety margin; an operator-tuned pair that
-# violates the invariant is a configuration error.
-if WORKFLOW_STALE_THRESHOLD_S < 2 * WORKFLOW_HEARTBEAT_INTERVAL_S:
+# The stale-reclaim threshold MUST strictly exceed two heartbeat intervals.
+# A single missed heartbeat (e.g., a brief Mongo write delay) must not
+# falsely reclaim a healthy worker, AND the executor's
+# ``_HEARTBEAT_LOSS_ABORT_S = max(HEARTBEAT, STALE - HEARTBEAT)`` needs a
+# non-zero margin above one interval to keep its single-transient-failure
+# tolerance: at the boundary ``STALE == 2 * HEARTBEAT`` that window
+# collapses to exactly one interval (see issue #45 review A7). The default
+# values (300 / 900) satisfy the strict form with a 300s margin; an
+# operator-tuned pair that violates it is a configuration error.
+if WORKFLOW_STALE_THRESHOLD_S <= 2 * WORKFLOW_HEARTBEAT_INTERVAL_S:
     raise ValueError(
         f"CFDB_WORKFLOW_STALE_THRESHOLD_S ({WORKFLOW_STALE_THRESHOLD_S}s) "
-        f"must be >= 2 * CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S "
+        f"must be > 2 * CFDB_WORKFLOW_HEARTBEAT_INTERVAL_S "
         f"({WORKFLOW_HEARTBEAT_INTERVAL_S}s) to avoid false stale-reclaim "
-        "of healthy workers between heartbeats."
+        "of healthy workers between heartbeats and to keep the "
+        "heartbeat-loss abort window strictly positive."
     )
 
 # --- Bounded-concurrency control (issue #45) --------------------------------

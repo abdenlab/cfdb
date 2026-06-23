@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from typing import AsyncGenerator
+from typing import Any
+from typing import AsyncIterator
 
 from wool import LoadBalancerContextLike
 from wool import LoadBalancerLike
@@ -63,7 +64,7 @@ class PriorityLoadBalancer(LoadBalancerLike):
         *,
         context: LoadBalancerContextLike,
         timeout: float | None = None,
-    ) -> AsyncGenerator:
+    ) -> AsyncIterator[Any]:
         """Dispatch *task* to the first worker, in priority order, that accepts.
 
         :param task:

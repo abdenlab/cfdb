@@ -147,11 +147,13 @@ _HEARTBEAT_INTERVAL_S = float(WORKFLOW_HEARTBEAT_INTERVAL_S)
 #: consumer is gone": a consumer that cannot reach Mongo stops computing
 #: (and lets ``stream.aclose`` cancel the remote worker) *before* the
 #: orphan sweep's ``STALE_WORKFLOW_THRESHOLD`` would revive the row, so
-#: recovery never double-dispatches a still-live job. Sized strictly
-#: between one heartbeat interval (a single transient write failure must
-#: not abort) and the sweep threshold (the consumer must give up with
-#: margin to spare); the ``STALE >= 2*HEARTBEAT`` startup invariant keeps
-#: that window non-empty.
+#: recovery is spared a redundant second run of a still-live job. Sized
+#: strictly between one heartbeat interval (a single transient write
+#: failure must not abort) and the sweep threshold (the consumer must give
+#: up with margin to spare); the strict ``STALE > 2*HEARTBEAT`` startup
+#: invariant keeps that window strictly positive (at ``STALE == 2*HEARTBEAT``
+#: it would collapse to exactly one interval, leaving no transient-failure
+#: tolerance — see issue #45 review A7).
 _HEARTBEAT_LOSS_ABORT_S = max(
     _HEARTBEAT_INTERVAL_S,
     STALE_WORKFLOW_THRESHOLD.total_seconds() - _HEARTBEAT_INTERVAL_S,
@@ -228,13 +230,23 @@ class HeartbeatLost(RuntimeError):
     """Raised by the stream consumer when it can no longer refresh the job.
 
     Signals that ``heartbeat_workflow`` has been failing for longer than
-    :data:`_HEARTBEAT_LOSS_ABORT_S` while a worker is still streaming — i.e.
-    this consumer has lost its connection to Mongo and can no longer keep
-    the row fresh. Consuming the rest of the stream would let the worker
-    keep computing invisibly until the orphan sweep (on a healthy replica)
-    reclaims the now-stale row and re-dispatches it, double-running the job.
-    Raising this aborts the attempt and ``aclose``s the stream, cancelling
-    the remote worker so recovery has a single live attempt to revive.
+    :data:`_HEARTBEAT_LOSS_ABORT_S` while a worker is still streaming
+    ``heartbeat`` events — i.e. this consumer has lost its connection to
+    Mongo and can no longer keep the row fresh. Raising this aborts the
+    attempt and ``aclose``s the stream, cancelling the remote worker so it
+    stops computing.
+
+    This is a *best-effort optimization*, NOT the load-bearing
+    double-dispatch guard. A ``heartbeat`` event is only injected after a
+    quiet ``heartbeat_interval`` of stage silence, so a stage that streams
+    ``stage_complete`` / ``progress`` faster than that interval never trips
+    the check — meaning a Mongo-blind consumer is not guaranteed to abort
+    before the orphan sweep revives its row. What actually keeps a recovered
+    re-dispatch from corrupting a still-live attempt is the per-attempt
+    workdir nonce (``_attempt_dispatch``) plus content-addressed, atomically
+    committed cache artifacts. The abort just spares the wasted second run
+    when it can; do not remove the per-attempt workdir on the assumption
+    this covers the race.
     """
 
 
@@ -246,10 +258,12 @@ def _next_dispatch_time(now: datetime) -> datetime:
     """Compute the next dispatch attempt time for an overflowed job.
 
     ``now + retry_interval + jitter``. The jitter spreads a queued backlog
-    across ticks; tests zero ``_RETRY_JITTER_MAX_SECONDS`` for determinism.
-    Always strictly after ``now`` (retry interval is >= 1s), which
-    ``lease_due_dispatch`` requires so a leased row moves out of the
-    due-window before its attempt resolves.
+    across ticks; it is bounded by ``_RETRY_JITTER_MAX_SECONDS`` (itself
+    clamped to the retry interval), so a test that monkeypatches
+    ``_RETRY_INTERVAL_SECONDS`` low gets correspondingly small, bounded
+    jitter — no test zeroes the constant. Always strictly after ``now``
+    (retry interval is >= 1s), which ``lease_due_dispatch`` requires so a
+    leased row moves out of the due-window before its attempt resolves.
     """
     jitter = (
         random.uniform(0, _RETRY_JITTER_MAX_SECONDS)
@@ -590,6 +604,14 @@ class WoolExecutor(JobExecutor):
         is then autonomous: it no longer depends on a client re-requesting
         the same file to trigger ``claim_workflow``'s stale-reclaim. Gated
         on the stale threshold so healthy heartbeating jobs are untouched.
+
+        Note the recovery promise is bounded by the same dispatch deadline
+        as a fresh job: ``requeue_orphaned_dispatch`` preserves the original
+        ``submitted_at``, and ``_attempt_dispatch`` measures the deadline
+        from it, so an orphan older than ``CFDB_WORKFLOW_DISPATCH_DEADLINE_S``
+        is failed ``capacity:`` on its first recovery attempt rather than
+        resumed (its committed cache artifacts survive for a later fresh
+        ``GET`` to reuse). Recovery is best-effort, not unbounded.
         """
         now = _utcnow()
         requeued = await requeue_orphaned_dispatch(
@@ -626,7 +648,7 @@ class WoolExecutor(JobExecutor):
                 self._db, now=now, next_at=_next_dispatch_time(now)
             )
             if leased is None:
-                return
+                break
             file_meta = leased.file_meta_snapshot
             if file_meta is None:
                 logger.error(
@@ -654,6 +676,19 @@ class WoolExecutor(JobExecutor):
                 continue
             self._spawn_attempt(leased, processor, file_meta)
             dispatched += 1
+
+        # Leading operability signal: a saturated queue is otherwise silent
+        # until jobs start failing ``capacity:`` at the dispatch deadline.
+        # Emitted at most once per tick (cadence ``_RETRY_INTERVAL_SECONDS``),
+        # so it does not flood the log even under a sustained backlog.
+        if dispatched:
+            logger.info(
+                "Scheduler tick dispatched %d queued workflow(s)%s",
+                dispatched,
+                " (per-tick cap hit; remainder deferred to the next tick)"
+                if dispatched >= _MAX_DISPATCHES_PER_TICK
+                else "",
+            )
 
     async def drain(self, *, timeout: float) -> int:
         """Wait for in-flight workflow tasks to complete.
@@ -867,6 +902,14 @@ class WoolExecutor(JobExecutor):
                     "next tick",
                     record.job_id,
                 )
+        # Leading operability signal that the pool is over capacity: the job
+        # found no worker and is being deferred to a later tick. Logged at
+        # info so a steadily-overflowing fleet is visible before jobs start
+        # failing ``capacity:`` at the dispatch deadline.
+        logger.info(
+            "No worker capacity for %s; rescheduling (pool overflow)",
+            record.job_id,
+        )
         await reschedule_dispatch(
             self._db, record.job_id, next_at=_next_dispatch_time(_utcnow())
         )
@@ -899,7 +942,10 @@ class WoolExecutor(JobExecutor):
         # the caller just marked the job RUNNING (the row is fresh). If
         # heartbeat writes then fail for longer than _HEARTBEAT_LOSS_ABORT_S
         # we raise HeartbeatLost and abort, so a Mongo-blind consumer stops
-        # computing before the orphan sweep revives its row (B1).
+        # computing before the orphan sweep revives its row. Best-effort: it
+        # only re-evaluates on a Heartbeat event (i.e. during quiet stages),
+        # so the per-attempt workdir — not this abort — is the actual
+        # corruption guard (see HeartbeatLost).
         last_heartbeat_ok = _utcnow()
 
         try:
@@ -918,7 +964,8 @@ class WoolExecutor(JobExecutor):
                                 if stalled > _HEARTBEAT_LOSS_ABORT_S:
                                     # Lost Mongo long enough that the orphan
                                     # sweep will treat this row as dead; abort
-                                    # so recovery doesn't double-run the job.
+                                    # so recovery is spared a redundant second
+                                    # run of this still-live attempt.
                                     raise HeartbeatLost(
                                         f"no successful heartbeat for "
                                         f"{stalled:.0f}s "
