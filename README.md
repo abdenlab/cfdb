@@ -548,7 +548,7 @@ Stream file contents from DCCs via HTTPS.
 | Code | Description |
 |------|-------------|
 | 200 | Full file content (GET) or file metadata (HEAD) |
-| 202 | Preprocessed artifact not yet cached — workflow dispatched. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. |
+| 202 | Preprocessed artifact not yet cached — workflow accepted. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. Under load the job may sit `pending` in the durable queue before a worker picks it up; poll `/jobs/{id}` for progress. |
 | 206 | Partial content (Range request) |
 | 400 | Invalid DCC, path-param shape, or Range header |
 | 403 | File requires authentication (consortium/protected access) or denied by upstream repository |
@@ -587,7 +587,7 @@ Stream index files (e.g., `.px2`, `.bai`) associated with DCC data files.
 | Code | Description |
 |------|-------------|
 | 200 | Full index file content (GET) or file metadata (HEAD) |
-| 202 | Index not yet cached — workflow dispatched. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. |
+| 202 | Index not yet cached — workflow accepted. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. Under load the job may sit `pending` in the durable queue before a worker picks it up; poll `/jobs/{id}` for progress. |
 | 206 | Partial content (Range request) |
 | 400 | Invalid DCC, path-param shape, or Range header |
 | 403 | File requires consortium/protected access (HuBMAP) |
@@ -658,7 +658,7 @@ Cache keys are content-addressed using each file's upstream `md5`, so a byte cha
 - **Per-worker backpressure** — each worker accepts at most `CFDB_WORKER_MAX_CONCURRENT_TASKS` tasks at once (default `1`), serializing the subprocess pipelines on a 1-vCPU worker. A worker at capacity rejects the dispatch and the API's priority load balancer rotates to the next worker.
 - **Priority (leaky-bucket) load balancing** — the API offers each task to discovered workers in a stable order, so load concentrates on the lowest-ordered workers and over-provisioned workers drain to idle and self-reap (via `CFDB_WORKER_MAX_LIFETIME_SECONDS`) instead of every worker carrying a thin perpetual slice.
 - **Durable queue + retry-to-deadline** — when no worker has capacity, the job is **not** failed and does **not** block the request: it stays `pending` and a durable, Mongo-backed scheduler re-attempts dispatch every `CFDB_WORKFLOW_RETRY_INTERVAL_S` (plus jitter) until a worker frees up or the `CFDB_WORKFLOW_DISPATCH_DEADLINE_S` deadline elapses (then it is failed with a `capacity:`-prefixed error). Because the queue lives in Mongo, an API restart resumes it. On every scheduler tick (including the first, on boot) an orphan-recovery sweep re-queues jobs a crash left mid-flight — a `running` job whose API consumer died, or a fresh `pending` claim that never rescheduled — once they pass the stale threshold (`CFDB_WORKFLOW_STALE_THRESHOLD_S`), so recovery is autonomous and does not wait for a client to re-request the file. On the ECS profile, an overflow also requests one bounded worker spawn (the leaky bucket overflowing), inverting the old unconditional per-request spawn.
-- **Admission ceiling** — once `CFDB_WORKFLOW_MAX_ACTIVE` workflows are active (`pending` + `running`), further preprocessing requests are shed with `429 Retry-After` rather than queued, so the backlog itself is bounded. The readiness `/status` probes never dispatch and so never `429`.
+- **Admission ceiling** — once `CFDB_WORKFLOW_MAX_ACTIVE` workflows are active (`pending` + `running`), further preprocessing requests are shed with `429 Retry-After` rather than queued, so the backlog itself is bounded. The check runs before the per-file mutex, so at the ceiling even a re-`GET` for a file whose workflow is already in flight is shed with `429` (rather than attaching to the in-flight job) and the client retries — the deliberate trade for shedding before an unbounded admission race. The readiness `/status` probes never dispatch and so never `429`.
 
 `/index` continues to serve upstream sidecars first when present (the 218 BED→beddb and 4 BED→tbi 4DN cases that publish under `extra.extra_files` or `extra.fourdn.extra_files`); the workflow path is dispatched only when no sidecar exists. Set `?raw=true` to bypass the workflow path entirely and return only the upstream sidecar (404 when none exists).
 
