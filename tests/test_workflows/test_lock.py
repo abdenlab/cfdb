@@ -20,6 +20,7 @@ def _insert_job(
     status: JobStatus,
     next_dispatch_at: datetime | None = None,
     dispatch_attempts: int = 0,
+    updated_at: datetime | None = None,
 ) -> JobRecord:
     """Insert a crafted job doc into the fake collection and return it."""
     now = datetime.now(timezone.utc)
@@ -32,7 +33,7 @@ def _insert_job(
         md5=FIXTURE_MD5,
         pipeline_version=PIPELINE_VERSION,
         submitted_at=now,
-        updated_at=now,
+        updated_at=updated_at or now,
         next_dispatch_at=next_dispatch_at,
         dispatch_attempts=dispatch_attempts,
     )
@@ -1190,3 +1191,177 @@ class TestLeaseDueDispatch:
         # Act & assert
         with pytest.raises(ValueError, match="strictly after"):
             await lock.lease_due_dispatch(mock_db, now=now, next_at=now)
+
+
+class TestRequeueOrphanedDispatch:
+    @pytest.mark.asyncio
+    async def test_should_requeue_a_stale_running_orphan(self, mock_db):
+        """Test that a RUNNING job with no recent heartbeat is re-queued.
+
+        Given:
+            A RUNNING job whose `updated_at` is older than the stale
+            threshold — an in-flight job orphaned when its API consumer
+            died mid-stream.
+        When:
+            requeue_orphaned_dispatch runs with that staleness cutoff.
+        Then:
+            The job is reset to PENDING with `next_dispatch_at` set so the
+            scheduler re-dispatches it, and the call reports one requeued
+            row.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        stale = now - timedelta(seconds=2000)
+        _insert_job(
+            mock_db, workflow_key="a", status=JobStatus.RUNNING, updated_at=stale
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 1
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.status == JobStatus.PENDING
+        assert job.next_dispatch_at == now
+
+    @pytest.mark.asyncio
+    async def test_should_requeue_a_stale_pending_job_with_no_next_dispatch(
+        self, mock_db
+    ):
+        """Test that a stale PENDING job with unset next_dispatch_at is re-queued.
+
+        Given:
+            A PENDING job with `next_dispatch_at` unset (a fresh claim whose
+            inline attempt never rescheduled) and a stale `updated_at`.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            Its `next_dispatch_at` is set to now so the scheduler — which
+            never leases a null-`next_dispatch_at` row — can pick it up.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.PENDING,
+            next_dispatch_at=None,
+            updated_at=now - timedelta(seconds=2000),
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 1
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.status == JobStatus.PENDING
+        assert job.next_dispatch_at == now
+
+    @pytest.mark.asyncio
+    async def test_should_not_touch_a_fresh_running_job(self, mock_db):
+        """Test that a healthy, recently-heartbeating RUNNING job is left alone.
+
+        Given:
+            A RUNNING job whose `updated_at` is recent (within the stale
+            threshold), i.e. a healthy in-flight job.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            It is not touched — staleness gating prevents the sweep from
+            yanking a live job away from its worker.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.RUNNING,
+            updated_at=now - timedelta(seconds=10),
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 0
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.status == JobStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_should_not_touch_an_already_queued_pending_job(self, mock_db):
+        """Test that a stale PENDING job already carrying next_dispatch_at is left.
+
+        Given:
+            A PENDING job that already has `next_dispatch_at` set (it is
+            queued and leasable by the scheduler), even with a stale
+            `updated_at`.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            It is not touched — the scheduler already handles it; the sweep
+            targets only the non-leasable orphan states.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        original = now - timedelta(seconds=50)
+        _insert_job(
+            mock_db,
+            workflow_key="a",
+            status=JobStatus.PENDING,
+            next_dispatch_at=original,
+            updated_at=now - timedelta(seconds=2000),
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 0
+        job = await lock.get_job(mock_db, "job-a")
+        assert job is not None
+        assert job.next_dispatch_at == original
+
+    @pytest.mark.asyncio
+    async def test_should_not_touch_terminal_jobs(self, mock_db):
+        """Test that terminal (completed/failed) jobs are never re-queued.
+
+        Given:
+            Stale COMPLETED and FAILED jobs.
+        When:
+            requeue_orphaned_dispatch runs.
+        Then:
+            Neither is touched — only active rows (the mutex holders) are
+            candidates for recovery.
+        """
+        # Arrange
+        now = datetime.now(timezone.utc)
+        stale = now - timedelta(seconds=2000)
+        _insert_job(
+            mock_db, workflow_key="done", status=JobStatus.COMPLETED, updated_at=stale
+        )
+        _insert_job(
+            mock_db, workflow_key="fail", status=JobStatus.FAILED, updated_at=stale
+        )
+
+        # Act
+        count = await lock.requeue_orphaned_dispatch(
+            mock_db, now=now, stale_before=now - timedelta(seconds=900)
+        )
+
+        # Assert
+        assert count == 0
+        assert (await lock.get_job(mock_db, "job-done")).status == JobStatus.COMPLETED
+        assert (await lock.get_job(mock_db, "job-fail")).status == JobStatus.FAILED

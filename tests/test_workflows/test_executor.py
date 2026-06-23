@@ -151,13 +151,17 @@ async def _seed_pending_job(
     submitted_at: datetime | None = None,
     next_dispatch_at: datetime | None = None,
     meta: dict[str, Any] | None = None,
+    status: JobStatus = JobStatus.PENDING,
+    updated_at: datetime | None = None,
 ) -> JobRecord:
-    """Insert a PENDING job row directly and return its JobRecord.
+    """Insert a crafted job row directly and return its JobRecord.
 
-    Lets a test drive ``_attempt_dispatch`` / ``_drain_due_jobs`` against a
-    queued job without going through ``ensure_workflow`` (which would spawn
-    its own inline attempt). ``submitted_at`` controls the deadline clock;
-    ``next_dispatch_at`` controls scheduler due-ness.
+    Lets a test drive ``_attempt_dispatch`` / ``_drain_due_jobs`` /
+    ``_recover_orphans`` against a job without going through
+    ``ensure_workflow`` (which would spawn its own inline attempt).
+    ``submitted_at`` controls the deadline clock; ``next_dispatch_at``
+    controls scheduler due-ness; ``status`` / ``updated_at`` craft orphan
+    states (e.g. a stale RUNNING row).
     """
     meta = meta or _file_meta()
     dcc, local_id, md5 = extract_identity(meta)
@@ -167,13 +171,13 @@ async def _seed_pending_job(
         workflow_key=key_utils.workflow_key(
             dcc=dcc, local_id=local_id, md5=md5, pipeline_version=PIPELINE_VERSION
         ),
-        status=JobStatus.PENDING,
+        status=status,
         dcc=dcc,
         local_id=local_id,
         md5=md5,
         pipeline_version=PIPELINE_VERSION,
         submitted_at=submitted_at or now,
-        updated_at=now,
+        updated_at=updated_at or now,
         file_meta_snapshot=meta,
         next_dispatch_at=next_dispatch_at,
     )
@@ -1662,6 +1666,82 @@ class TestWoolExecutorScheduler:
         assert final is not None
         assert final.status == JobStatus.PENDING
         assert processor.run_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_recover_orphans_should_requeue_and_dispatch_a_stale_running_job(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
+    ):
+        """Test that a RUNNING job orphaned by a crash is recovered autonomously.
+
+        Given:
+            A stale RUNNING job (no heartbeat past the stale threshold,
+            `next_dispatch_at` unset) — what an API crash mid-stream leaves
+            behind — and a registered processor.
+        When:
+            A scheduler tick runs (`_recover_orphans` then `_drain_due_jobs`).
+        Then:
+            The orphan is re-queued to PENDING, leased, dispatched, and
+            reaches COMPLETED — without any new request for the file, closing
+            the restart-recovery gap.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        stale = datetime.now(timezone.utc) - timedelta(seconds=2000)
+        record = await _seed_pending_job(
+            mock_db,
+            status=JobStatus.RUNNING,
+            updated_at=stale,
+            next_dispatch_at=None,
+        )
+
+        # Act — one scheduler tick: recover orphans, then dispatch due jobs.
+        await executor._recover_orphans()
+        await executor._drain_due_jobs()
+        await _wait_for_terminal(mock_db, record.job_id)
+
+        # Assert
+        final = await get_job(mock_db, record.job_id)
+        assert final is not None
+        assert final.status == JobStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_recover_orphans_should_leave_a_fresh_running_job_alone(
+        self, mock_db, tmp_cache, tmp_workdir, no_wool_dispatch
+    ):
+        """Test that a healthy in-flight RUNNING job is not reclaimed.
+
+        Given:
+            A RUNNING job with a recent `updated_at` (a live, heartbeating
+            job).
+        When:
+            `_recover_orphans` runs.
+        Then:
+            The job is left RUNNING — the staleness gate keeps the sweep from
+            yanking a live job away from its worker.
+        """
+        # Arrange
+        _install_jobs_index(mock_db)
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        executor = WoolExecutor(
+            mock_db, tmp_cache, registry, workdir_root=tmp_workdir
+        )
+        record = await _seed_pending_job(
+            mock_db, status=JobStatus.RUNNING, next_dispatch_at=None
+        )
+
+        # Act
+        await executor._recover_orphans()
+
+        # Assert
+        job = await get_job(mock_db, record.job_id)
+        assert job is not None
+        assert job.status == JobStatus.RUNNING
 
     @pytest.mark.asyncio
     async def test_scheduler_loop_should_survive_a_tick_exception(

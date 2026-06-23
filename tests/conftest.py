@@ -322,10 +322,10 @@ class FakeCollection:
         for d in self.docs:
             if _match(d, query):
                 matched += 1
-                for k, v in update.get("$set", {}).items():
-                    if d.get(k) != v:
-                        d[k] = v
-                        modified += 1
+                # Row-level modified count, matching real Mongo semantics
+                # (number of documents changed, not number of field writes).
+                if _apply_update(d, update, is_insert=False):
+                    modified += 1
         return _UpdateResult(matched, modified)
 
     async def update_one(self, query: dict, update: dict, **kwargs) -> _UpdateResult:

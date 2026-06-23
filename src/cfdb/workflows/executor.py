@@ -66,6 +66,7 @@ from cfdb.workflows.events import (
     WorkflowEvent,
 )
 from cfdb.workflows.lock import (
+    STALE_WORKFLOW_THRESHOLD,
     claim_workflow,
     count_active_workflows,
     heartbeat_workflow,
@@ -73,6 +74,7 @@ from cfdb.workflows.lock import (
     mark_running,
     record_stage_complete,
     release_workflow,
+    requeue_orphaned_dispatch,
     reschedule_dispatch,
     update_progress,
 )
@@ -519,12 +521,35 @@ class WoolExecutor(JobExecutor):
         """
         while not self._draining:
             try:
+                await self._recover_orphans()
                 await self._drain_due_jobs()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Scheduler dispatch tick failed; continuing")
             await asyncio.sleep(_RETRY_INTERVAL_SECONDS)
+
+    async def _recover_orphans(self) -> None:
+        """Re-queue jobs orphaned by an API/worker crash for re-dispatch.
+
+        Runs at the top of every scheduler tick — including the first, on
+        boot — so a process that died mid-flight does not strand jobs the
+        normal lease query cannot pick up (``RUNNING`` rows whose consumer
+        died, and fresh ``PENDING`` claims that never rescheduled). Recovery
+        is then autonomous: it no longer depends on a client re-requesting
+        the same file to trigger ``claim_workflow``'s stale-reclaim. Gated
+        on the stale threshold so healthy heartbeating jobs are untouched.
+        """
+        now = _utcnow()
+        requeued = await requeue_orphaned_dispatch(
+            self._db, now=now, stale_before=now - STALE_WORKFLOW_THRESHOLD
+        )
+        if requeued:
+            logger.info(
+                "Re-queued %d orphaned workflow(s) for re-dispatch after a "
+                "restart or worker crash",
+                requeued,
+            )
 
     async def _drain_due_jobs(self) -> None:
         """Lease every currently-due queued job and spawn its retry attempt.

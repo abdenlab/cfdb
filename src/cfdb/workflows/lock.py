@@ -563,3 +563,53 @@ async def lease_due_dispatch(
         return_document=ReturnDocument.AFTER,
     )
     return _record_from_mongo(doc) if doc is not None else None
+
+
+async def requeue_orphaned_dispatch(
+    db, *, now: datetime, stale_before: datetime
+) -> int:
+    """Re-queue jobs orphaned by an API/worker crash so they re-dispatch.
+
+    The durable scheduler only leases ``PENDING`` jobs whose
+    ``next_dispatch_at`` is set and due, so two states survive a restart
+    that it would never pick up on its own:
+
+    - ``RUNNING`` rows whose API consumer died mid-stream (no heartbeat
+      since), and
+    - ``PENDING`` rows with ``next_dispatch_at`` unset — a fresh claim whose
+      inline first attempt never got to reschedule before the crash.
+
+    Both are reset to ``PENDING`` with ``next_dispatch_at = now`` so the next
+    scheduler tick leases them. Gated on ``updated_at < stale_before`` (the
+    same staleness threshold :func:`claim_workflow` uses) so a healthy
+    in-flight job — which keeps ``updated_at`` fresh via heartbeats — is
+    never falsely reclaimed. Returns the number of rows requeued.
+
+    Unlike ``claim_workflow``'s stale-reclaim, which fails the stale row so a
+    *new* claimant can supersede it, this revives the same row: there is no
+    new claimant, so the goal is to recover the in-flight work itself.
+    Partial-commit recovery means the re-dispatched job reuses any stages
+    already committed to cache.
+    """
+    jobs = _jobs(db)
+    result = await jobs.update_many(
+        {
+            "active": True,
+            "updated_at": {"$lt": stale_before},
+            "$or": [
+                {"status": JobStatus.RUNNING.value},
+                {"status": JobStatus.PENDING.value, "next_dispatch_at": None},
+            ],
+        },
+        {
+            "$set": {
+                "status": JobStatus.PENDING.value,
+                # PENDING is active; re-assert defensively so the
+                # discriminator can never drift from the status.
+                "active": True,
+                "next_dispatch_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    return getattr(result, "modified_count", 0)
