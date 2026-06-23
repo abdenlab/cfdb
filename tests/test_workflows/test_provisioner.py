@@ -532,6 +532,45 @@ class TestEcsProvisionerWorkerCap:
         assert client.list_tasks_calls == []
 
     @pytest.mark.asyncio
+    async def test_request_should_cap_a_concurrent_cold_fleet_burst(self):
+        """Test that a simultaneous burst from a list_tasks-blind fleet is capped.
+
+        Given:
+            ``max_workers=2`` and a client whose ``list_tasks`` always reports
+            zero running tasks — modeling the ECS eventual-consistency lag
+            where freshly launched workers are not yet visible (the live
+            failure mode where every decider saw a stale 0 and all spawned).
+        When:
+            Five distinct-key requests are awaited concurrently.
+        Then:
+            Only two RunTask calls happen: the in-flight-launch accounting
+            bounds the burst even though ``list_tasks`` never reflects the new
+            workers, and the excess three requests return [] (queue, not
+            spawn).
+        """
+        # Arrange — list_tasks is permanently blind (always 0 visible).
+        client = _FakeEcsClient(list_tasks_arns=[])
+        provisioner = EcsProvisioner(
+            cluster="c",
+            task_definition="worker",
+            subnets=["subnet-1"],
+            client=client,
+            max_workers=2,
+        )
+
+        # Act
+        results = await asyncio.gather(
+            *(provisioner.request(dedup_key=f"wf-{i}") for i in range(5))
+        )
+
+        # Assert — at most the cap launched, despite list_tasks reporting 0.
+        spawned = [r for r in results if r]
+        skipped = [r for r in results if r == []]
+        assert len(client.calls) == 2, f"expected 2 RunTask, got {len(client.calls)}"
+        assert len(spawned) == 2
+        assert len(skipped) == 3
+
+    @pytest.mark.asyncio
     async def test_request_should_raise_retryable_when_list_tasks_fails(self):
         """Test that a list_tasks failure surfaces as a retryable error.
 
