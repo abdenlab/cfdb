@@ -51,6 +51,7 @@ class _EcsConfig:
     subnets: tuple[str, ...]
     security_groups: tuple[str, ...]
     assign_public_ip: AssignPublicIp
+    max_workers: int
 
 
 @dataclass(frozen=True)
@@ -152,4 +153,5 @@ def _ecs_config_from_env() -> Optional[_EcsConfig]:
         subnets=tuple(api.ECS_WORKER_SUBNETS),
         security_groups=tuple(api.ECS_WORKER_SECURITY_GROUPS),
         assign_public_ip=api.ECS_WORKER_ASSIGN_PUBLIC_IP,
+        max_workers=api.ECS_MAX_WORKERS,
     )

@@ -12,19 +12,35 @@ from cfdb.workflows.provisioner import RetryableProvisionerError, EcsProvisioner
 class _FakeEcsClient:
     """In-memory ECS client recording RunTask calls for assertions."""
 
-    def __init__(self, *, response: dict | None = None, raise_on_call: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        response: dict | None = None,
+        raise_on_call: Exception | None = None,
+        list_tasks_arns: list[str] | None = None,
+        list_tasks_raise: Exception | None = None,
+    ) -> None:
         self.calls: list[dict] = []
+        self.list_tasks_calls: list[dict] = []
         self._response = response or {
             "tasks": [{"taskArn": "arn:aws:ecs:::task/cluster/abc"}],
             "failures": [],
         }
         self._raise = raise_on_call
+        self._list_tasks_arns = list(list_tasks_arns or [])
+        self._list_tasks_raise = list_tasks_raise
 
     def run_task(self, **kwargs):
         self.calls.append(kwargs)
         if self._raise is not None:
             raise self._raise
         return self._response
+
+    def list_tasks(self, **kwargs):
+        self.list_tasks_calls.append(kwargs)
+        if self._list_tasks_raise is not None:
+            raise self._list_tasks_raise
+        return {"taskArns": list(self._list_tasks_arns)}
 
 
 class _SimpleGatedClient(_FakeEcsClient):
@@ -396,6 +412,152 @@ async def _resolved(value):
     holds the same return value as the first request.
     """
     return value
+
+
+class TestEcsProvisionerWorkerCap:
+    def test___init___rejects_negative_max_workers(self):
+        """Test that a negative max_workers is rejected at construction.
+
+        Given:
+            A negative ``max_workers`` value.
+        When:
+            EcsProvisioner is constructed.
+        Then:
+            It should raise ValueError so the misconfiguration is caught at
+            boot rather than silently disabling the cap.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="max_workers"):
+            EcsProvisioner(
+                cluster="c",
+                task_definition="worker",
+                subnets=["subnet-1"],
+                client=_FakeEcsClient(),
+                max_workers=-1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_request_should_skip_spawn_when_fleet_at_capacity(self):
+        """Test that request does not launch a task when the fleet is at the cap.
+
+        Given:
+            A provisioner with ``max_workers=2`` whose ``list_tasks`` reports
+            two running worker tasks.
+        When:
+            request is awaited.
+        Then:
+            It should count the fleet, skip RunTask entirely, and return an
+            empty ARN list so the caller queues the job instead of spawning a
+            third worker.
+        """
+        # Arrange
+        client = _FakeEcsClient(
+            list_tasks_arns=["arn:task/w1", "arn:task/w2"],
+        )
+        provisioner = EcsProvisioner(
+            cluster="c",
+            task_definition="worker:7",
+            subnets=["subnet-1"],
+            client=client,
+            max_workers=2,
+        )
+
+        # Act
+        arns = await provisioner.request(dedup_key="wf-1")
+
+        # Assert
+        assert arns == []
+        assert client.calls == []  # RunTask never invoked
+        assert len(client.list_tasks_calls) == 1
+        # The :revision suffix is stripped for the family filter.
+        assert client.list_tasks_calls[0]["family"] == "worker"
+        assert client.list_tasks_calls[0]["desiredStatus"] == "RUNNING"
+
+    @pytest.mark.asyncio
+    async def test_request_should_spawn_when_below_capacity(self):
+        """Test that request launches a task when the fleet is below the cap.
+
+        Given:
+            A provisioner with ``max_workers=3`` whose ``list_tasks`` reports
+            one running worker task.
+        When:
+            request is awaited.
+        Then:
+            It should launch one worker via RunTask and return its ARN.
+        """
+        # Arrange
+        client = _FakeEcsClient(list_tasks_arns=["arn:task/w1"])
+        provisioner = EcsProvisioner(
+            cluster="c",
+            task_definition="worker",
+            subnets=["subnet-1"],
+            client=client,
+            max_workers=3,
+        )
+
+        # Act
+        arns = await provisioner.request(dedup_key="wf-1")
+
+        # Assert
+        assert arns == ["arn:aws:ecs:::task/cluster/abc"]
+        assert len(client.calls) == 1
+        assert len(client.list_tasks_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_request_should_not_count_fleet_when_cap_disabled(self):
+        """Test that max_workers=0 disables the fleet count entirely.
+
+        Given:
+            A provisioner with the default ``max_workers=0`` (cap disabled).
+        When:
+            request is awaited.
+        Then:
+            It should launch a worker without ever calling ``list_tasks``, so
+            an unset cap incurs no extra ECS round-trip and never throttles.
+        """
+        # Arrange
+        client = _FakeEcsClient(list_tasks_arns=["arn:task/w1", "arn:task/w2"])
+        provisioner = EcsProvisioner(
+            cluster="c",
+            task_definition="worker",
+            subnets=["subnet-1"],
+            client=client,
+        )
+
+        # Act
+        arns = await provisioner.request(dedup_key="wf-1")
+
+        # Assert
+        assert arns == ["arn:aws:ecs:::task/cluster/abc"]
+        assert client.list_tasks_calls == []
+
+    @pytest.mark.asyncio
+    async def test_request_should_raise_retryable_when_list_tasks_fails(self):
+        """Test that a list_tasks failure surfaces as a retryable error.
+
+        Given:
+            A provisioner with a cap whose ``list_tasks`` raises a
+            botocore ClientError.
+        When:
+            request is awaited.
+        Then:
+            It should raise RetryableProvisionerError (so the caller queues
+            and retries) and never launch a task blind past the cap.
+        """
+        # Arrange
+        client = _FakeEcsClient(list_tasks_raise=_client_error("ThrottlingException"))
+        provisioner = EcsProvisioner(
+            cluster="c",
+            task_definition="worker",
+            subnets=["subnet-1"],
+            client=client,
+            max_workers=2,
+        )
+
+        # Act & assert
+        with pytest.raises(RetryableProvisionerError, match="list_tasks failed"):
+            await provisioner.request(dedup_key="wf-1")
+        assert client.calls == []
 
 
 # ---------------------------------------------------------------------------

@@ -223,6 +223,17 @@ ECS_WORKER_ASSIGN_PUBLIC_IP: Final = _parse_assign_public_ip(
     "ECS_WORKER_ASSIGN_PUBLIC_IP", "DISABLED"
 )
 
+#: Cap on concurrently-running ephemeral worker tasks on the ECS profile.
+#: Before each RunTask the provisioner counts running/starting worker tasks
+#: and skips the spawn when already at this cap, so the worker fleet is
+#: bounded while excess jobs stay queued (the durable scheduler dispatches
+#: them as workers free up — no shedding; the queue is bounded separately by
+#: CFDB_WORKFLOW_MAX_ACTIVE). ``0`` disables the cap (rely on the Fargate
+#: vCPU quota). Default 16 so an unconfigured ECS deployment fails safe to a
+#: small fleet rather than the account quota. Applies only to the ECS
+#: profile (no provisioner exists in the local/LAN profile).
+ECS_MAX_WORKERS: Final = _parse_int_env("ECS_MAX_WORKERS", 16, minimum=0)
+
 db: AsyncIOMotorDatabase | None = None
 cache: "CacheBackend | None" = None
 executor: "JobExecutor | None" = None
