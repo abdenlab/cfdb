@@ -55,6 +55,56 @@ from cfdb.workflows.processors.tools import (
 __all__ = ["TabixIntervalProcessor", "download_source"]
 
 
+#: gzip / bgzip stream magic (RFC 1952). bgzip output is gzip-compatible
+#: and shares this prefix, so it is accepted too.
+_GZIP_MAGIC = b"\x1f\x8b"
+
+#: How many leading source bytes to inspect when sniffing the encoding.
+_SOURCE_SNIFF_BYTES = 512
+
+
+def _source_looks_processable(prefix: bytes) -> bool:
+    """Return True if ``prefix`` is gzip-compressed or decodes as text.
+
+    The tabix text-interval pipeline assumes ``zcat -f`` yields plain
+    text, so a source must be either a gzip/bgzip member (magic
+    ``1f 8b``) or already plaintext. Anything else is a binary
+    serialization the pipeline would silently mangle — most notably a
+    BEDOPS ``starch`` archive (magic ``ca5cade5``), which the upstream
+    ontology mapper labels ``BED`` even though ``zcat -f`` cannot
+    decompress it (see issue #69).
+
+    An empty prefix returns True: the genuinely-empty-source case is
+    caught later by the zero-data-line guard in ``_stage_prepare``.
+
+    The text test is "decodes as UTF-8 with no NUL byte". A multi-byte
+    UTF-8 character may be split at the sniff boundary, so up to three
+    trailing bytes are trimmed before concluding the prefix is not text.
+    """
+    if not prefix:
+        return True
+    if prefix.startswith(_GZIP_MAGIC):
+        return True
+    if b"\x00" in prefix:
+        return False
+    for trim in range(4):
+        candidate = prefix[: len(prefix) - trim] if trim else prefix
+        if not candidate:
+            break
+        try:
+            candidate.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        return True
+    return False
+
+
+def _read_prefix(path: Path, n: int = _SOURCE_SNIFF_BYTES) -> bytes:
+    """Read up to ``n`` leading bytes of ``path``."""
+    with path.open("rb") as fh:
+        return fh.read(n)
+
+
 # Format → tabix preset. Both GFF and GFF3 map onto the same preset; the
 # upstream ontology mapper emits ``GFF`` for ``.gff`` and ``GFF3`` for
 # ``.gff3`` so both must be accepted here to avoid silent bypasses.
@@ -131,6 +181,15 @@ class TabixIntervalProcessor(Processor):
         """Produce ``{workdir}/out.bgz`` — sorted, bgzipped text."""
         source = workdir / "source.raw"
         await download_source(file_meta, source)
+
+        # Reject a non-gzip/non-text source before any processing or
+        # cache commit. bigBed is binary by design and handled by
+        # ``bigBedToBed`` (which validates its own input), so it is
+        # exempt; every other format flows through ``zcat -f`` and must
+        # be gzip or plain text (see issue #69 — BEDOPS starch archives
+        # are mislabeled ``BED`` upstream).
+        if fmt != "bigBed":
+            await self._assert_source_processable(source, fmt, file_meta)
 
         tmp_dir = workdir / "sort_tmp"
         tmp_dir.mkdir(exist_ok=True)
@@ -223,6 +282,31 @@ class TabixIntervalProcessor(Processor):
                 "Fix at the source or route through a sort-aware processor."
             )
         return bgz_path
+
+    async def _assert_source_processable(
+        self, source: Path, fmt: str, file_meta: dict[str, Any]
+    ) -> None:
+        """Reject a non-gzip/non-text source before committing anything.
+
+        Reads the leading bytes of the freshly-downloaded ``source`` and
+        raises ``RuntimeError`` when they are neither gzip nor text, so a
+        binary serialization the ``zcat -f`` pipeline cannot decompress
+        (e.g. a BEDOPS ``starch`` archive mislabeled ``BED`` upstream)
+        fails the job cleanly *before* any ``cache.put`` rather than
+        committing a corrupt artifact. Callers skip this for ``bigBed``,
+        whose binary source is handled by ``bigBedToBed``.
+        """
+        prefix = await asyncio.to_thread(_read_prefix, source)
+        if _source_looks_processable(prefix):
+            return
+        local_id = file_meta.get("local_id")
+        raise RuntimeError(
+            f"Refusing to process {fmt} source for {local_id!r}: leading "
+            f"bytes {prefix[:8].hex()!r} are neither gzip nor text. An "
+            "unsupported serialization (e.g. BEDOPS starch) was likely "
+            "mapped onto a text-interval format upstream; failing before "
+            "commit so no corrupt artifact is cached."
+        )
 
     async def _count_data_lines(self, bgz_path: Path, fmt: str) -> int:
         """Return the count of non-header data lines in ``bgz_path``.
