@@ -19,6 +19,7 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
+import time
 from collections.abc import Iterable
 from typing import Any, Literal, Optional, get_args
 
@@ -33,6 +34,17 @@ logger = logging.getLogger(__name__)
 #: ``Literal`` so the two definitions can't drift.
 AssignPublicIp = Literal["ENABLED", "DISABLED"]
 _ASSIGN_PUBLIC_IP_VALUES = frozenset(get_args(AssignPublicIp))
+
+
+#: How long a just-issued ``RunTask`` is counted as an in-flight worker
+#: launch on top of what ``list_tasks`` reports. ECS ``list_tasks`` is
+#: eventually consistent — a freshly launched task is not visible for a few
+#: seconds — so a simultaneous burst would otherwise see a stale count and
+#: every spawn would slip under the cap. Counting recent launches for this
+#: window closes that race; it MUST exceed the real ``list_tasks`` visibility
+#: lag (err high — over-counting is conservative, only briefly delaying a
+#: spawn, whereas under-counting lets the fleet overshoot the cap).
+_LAUNCH_VISIBILITY_WINDOW_S = 60.0
 
 
 class _SubmittedRunTask:
@@ -98,13 +110,18 @@ class EcsProvisioner:
             Defaults to ``task_definition`` with any ``:revision`` suffix
             stripped.
         max_workers: Cap on concurrently-running worker tasks. Before each
-            ``RunTask`` the provisioner counts running/starting worker tasks
-            and skips the spawn when already at this cap, so the worker
-            fleet is bounded while excess jobs stay queued (the durable
-            scheduler dispatches them as workers free up — no shedding).
-            ``0`` disables the cap (rely on the Fargate vCPU quota). Soft:
-            ``list_tasks`` eventual-consistency lag plus a count-then-spawn
-            race across distinct workflow keys can briefly overshoot.
+            ``RunTask`` the provisioner counts the ECS-visible fleet plus its
+            own recently-issued launches (which ``list_tasks`` may not
+            reflect yet) under a lock, and skips the spawn when already at
+            this cap, so the worker fleet is bounded while excess jobs stay
+            queued (the durable scheduler dispatches them as workers free up
+            — no shedding). ``0`` disables the cap (rely on the Fargate vCPU
+            quota). Counting in-flight launches is what bounds a simultaneous
+            cold-start burst; counting only ``list_tasks`` lets a concurrent
+            burst see a stale count and every spawn slip under the cap.
+            Bounded per API task: a single API task (the default) is held to
+            the cap; a multi-task API would each track only its own launches
+            and need a shared lease to bound the total.
     """
 
     def __init__(
@@ -178,6 +195,14 @@ class EcsProvisioner:
         )
         self._pending_lock = threading.Lock()
         self._pending: set[_SubmittedRunTask] = set()
+        # Worker-fleet cap accounting. ``_recent_launches`` holds the
+        # monotonic timestamps of RunTask launches this provisioner issued
+        # but that ``list_tasks`` may not reflect yet; the cap counts them on
+        # top of the ECS-visible fleet so a concurrent burst cannot all slip
+        # under a stale count. ``_cap_lock`` serializes the count-and-reserve
+        # so concurrent deciders observe each other's reservations.
+        self._cap_lock = asyncio.Lock()
+        self._recent_launches: list[float] = []
 
     async def request(self, *, dedup_key: str) -> list[str]:
         """Launch a worker task, returning its ARN(s).
@@ -259,27 +284,71 @@ class EcsProvisioner:
                     self._in_flight.pop(dedup_key, None)
 
         try:
-            # Worker-fleet cap: if the fleet is already at the cap, do not
-            # launch another task. Return an empty ARN list rather than
+            # Worker-fleet cap: reserve a slot under the cap before launching.
+            # When the fleet is full, return an empty ARN list rather than
             # raise — the caller (``_handle_overflow``) reschedules the job,
             # so it stays queued and runs when an existing worker frees up.
             # This bounds the worker-container count while preserving the
             # queue (the admission ceiling, not this cap, bounds the queue).
+            token: Optional[float] = None
             if self._max_workers > 0:
-                running = await self._current_worker_count()
-                if running >= self._max_workers:
-                    logger.info(
-                        "Worker fleet at capacity (%d/%d); not spawning for "
-                        "%s — job stays queued until a worker frees",
-                        running,
-                        self._max_workers,
-                        dedup_key,
-                    )
+                token = await self._reserve_worker_slot(dedup_key)
+                if token is None:
                     return []
-            async with self._semaphore:
-                return await self._run_task()
+            try:
+                async with self._semaphore:
+                    return await self._run_task()
+            except BaseException:
+                # The launch did not produce a worker; release the reserved
+                # slot so the in-flight count does not over-count a spawn
+                # that never happened.
+                if token is not None:
+                    await self._release_worker_slot(token)
+                raise
         finally:
             await asyncio.shield(_release_dedup_slot())
+
+    async def _reserve_worker_slot(self, dedup_key: str) -> Optional[float]:
+        """Reserve a worker slot under the cap, or return None when full.
+
+        Counts the ECS-visible fleet PLUS this provisioner's own recent
+        launches (``_recent_launches``) that ``list_tasks`` may not reflect
+        yet, all under ``_cap_lock`` so concurrent burst deciders observe
+        each other's reservations. This is what bounds a simultaneous
+        cold-start burst: counting only ``list_tasks`` lets every decider see
+        a stale ~0 and all spawn. Returns the launch token (a monotonic
+        timestamp) on success, or None when already at the cap.
+        """
+        async with self._cap_lock:
+            now = time.monotonic()
+            self._recent_launches = [
+                t
+                for t in self._recent_launches
+                if now - t < _LAUNCH_VISIBILITY_WINDOW_S
+            ]
+            ecs_visible = await self._current_worker_count()
+            effective = ecs_visible + len(self._recent_launches)
+            if effective >= self._max_workers:
+                logger.info(
+                    "Worker fleet at capacity (%d running + %d in-flight "
+                    ">= %d); not spawning for %s — job stays queued until a "
+                    "worker frees",
+                    ecs_visible,
+                    len(self._recent_launches),
+                    self._max_workers,
+                    dedup_key,
+                )
+                return None
+            self._recent_launches.append(now)
+            return now
+
+    async def _release_worker_slot(self, token: float) -> None:
+        """Drop a reservation whose RunTask did not produce a worker."""
+        async with self._cap_lock:
+            try:
+                self._recent_launches.remove(token)
+            except ValueError:
+                pass  # already aged out of the visibility window
 
     async def _current_worker_count(self) -> int:
         """Count worker tasks whose desired status is RUNNING.
