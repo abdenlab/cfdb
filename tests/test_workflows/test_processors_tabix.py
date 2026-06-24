@@ -141,6 +141,30 @@ def test__source_looks_processable_should_reject_starch_archive():
     )
 
 
+@pytest.mark.parametrize(
+    "magic",
+    [
+        b"BZh91AY&SY",  # bzip2
+        b"\xfd7zXZ\x00\x00",  # xz
+        b"\x28\xb5\x2f\xfd\x00",  # zstd
+        b"PK\x03\x04\x14\x00",  # zip
+    ],
+)
+def test__source_looks_processable_should_reject_known_binary_magics(magic):
+    """Test that known non-gzip compression magics are rejected.
+
+    Given:
+        A prefix beginning with a bzip2, xz, zstd, or zip magic number.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return False so a mislabeled compressed source — which
+        zcat -f cannot decompress — never reaches the pipeline.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(magic) is False
+
+
 def test__source_looks_processable_should_reject_binary_with_nul():
     """Test that NUL-containing binary is rejected.
 
@@ -617,16 +641,19 @@ class TestTabixIntervalProcessorPipelines:
         )
         assert await cache.head(data_key) is None
 
+    @pytest.mark.parametrize("fmt", ["BED", "VCF", "GTF"])
     @pytest.mark.asyncio
     async def test_run_should_reject_starch_source_before_commit(
-        self, tmp_path, mocker
+        self, tmp_path, mocker, fmt
     ):
         """Test that a starch source fails before any cache commit.
 
         Given:
-            A BED file_meta whose downloaded source is a BEDOPS starch
-            archive (magic 0xca5cade5), with the pipeline tools mocked to
-            fail if reached.
+            A BED/VCF/GTF file_meta whose downloaded source is a BEDOPS
+            starch archive (magic 0xca5cade5), with the pipeline tools
+            mocked to fail if reached. VCF and GTF take the
+            intermediate-decompress branches, so this pins that the guard
+            fires ahead of every non-bigBed path, not just the BED one.
         When:
             run is awaited.
         Then:
@@ -657,13 +684,13 @@ class TestTabixIntervalProcessorPipelines:
         # Act & assert
         with pytest.raises(RuntimeError, match="neither gzip nor text"):
             async for _event in TabixIntervalProcessor().run(
-                _file_meta("BED"), workdir, LocalFsCache(cache_root)
+                _file_meta(fmt), workdir, LocalFsCache(cache_root)
             ):
                 pass
         cache = LocalFsCache(cache_root)
         data_key = key_utils.cache_key(
             dcc="encode",
-            local_id="ENCFF-BED",
+            local_id=f"ENCFF-{fmt}",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
             processor_version=TabixIntervalProcessor().processor_version,
@@ -709,6 +736,118 @@ class TestTabixIntervalProcessorPipelines:
         # Assert
         cache = LocalFsCache(cache_root)
         assert await cache.head(artifacts["data"]) is not None
+
+    @pytest.mark.asyncio
+    async def test_run_should_not_commit_when_bigbedtobed_rejects_source(
+        self, tmp_path, mocker
+    ):
+        """Test that a bad bigBed source commits nothing when the tool fails.
+
+        Given:
+            A bigBed file_meta whose pipeline raises, modeling bigBedToBed
+            rejecting a non-bigBed source with a non-zero exit (the bigBed
+            exemption skips the sniff guard, so the tool is the backstop).
+        When:
+            run is awaited.
+        Then:
+            It should raise RuntimeError and leave the data artifact
+            uncommitted, so the exemption cannot poison the cache.
+        """
+        # Arrange
+        workdir = tmp_path / "work"
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+
+        async def fake_download(_meta, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xca\x5c\xad\xe5not-a-real-bigbed")
+            return dest
+
+        async def rejecting_shell(cmd):
+            raise RuntimeError(f"bigBedToBed exited 255: {cmd}")
+
+        async def fail_run(argv):
+            raise AssertionError(f"tabix must not run: {argv}")
+
+        mocker.patch.object(tabix_module, "download_source", fake_download)
+        mocker.patch.object(tabix_module, "run_shell", rejecting_shell)
+        mocker.patch.object(tabix_module, "run_argv", fail_run)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="bigBedToBed exited"):
+            async for _event in TabixIntervalProcessor().run(
+                _file_meta("bigBed"), workdir, LocalFsCache(cache_root)
+            ):
+                pass
+        cache = LocalFsCache(cache_root)
+        data_key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF-bigBed",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=TabixIntervalProcessor().processor_version,
+        )
+        assert await cache.head(data_key) is None
+
+    @pytest.mark.asyncio
+    async def test_run_should_not_serve_a_poisoned_v1_artifact(
+        self, tmp_path, mocker
+    ):
+        """Test that a v1-cached poisoned artifact is not served after the bump.
+
+        Given:
+            A garbage data artifact seeded under the OLD processor_version=1
+            cache key, with the current source a starch (BED-mapped) archive.
+        When:
+            run is awaited with the current processor.
+        Then:
+            It should re-key to the current version (a miss on the poisoned
+            v1 entry), re-enter the guard, raise, and never serve the v1
+            bytes — the current data key stays absent.
+        """
+        # Arrange
+        workdir = tmp_path / "work"
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+        cache = LocalFsCache(cache_root)
+
+        seed = tmp_path / "seed.bgz"
+        seed.write_bytes(b"corrupt-v1-artifact")
+        v1_key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF-BED",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=1,
+        )
+        await cache.put(v1_key, seed)
+
+        async def fake_download(_meta, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xca\x5c\xad\xe5BZh91AY&SYstarch-body")
+            return dest
+
+        async def fail_shell(cmd):
+            raise AssertionError(f"pipeline must not run: {cmd}")
+
+        mocker.patch.object(tabix_module, "download_source", fake_download)
+        mocker.patch.object(tabix_module, "run_shell", fail_shell)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="neither gzip nor text"):
+            async for _event in TabixIntervalProcessor().run(
+                _file_meta("BED"), workdir, cache
+            ):
+                pass
+        current_key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF-BED",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=TabixIntervalProcessor().processor_version,
+        )
+        assert current_key != v1_key
+        assert await cache.head(current_key) is None
 
     @pytest.mark.asyncio
     async def test_run_should_use_bed_sort_keys_for_bed(self, tmp_path, mocker):
