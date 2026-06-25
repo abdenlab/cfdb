@@ -39,6 +39,7 @@ from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
 from cfdb.workflows.backpressure import backpressure_for
 from cfdb.workflows.constants import DEFAULT_WORKER_PORT
 from cfdb.workflows.credentials import build_worker_credentials
+from cfdb.workflows.grpc_options import worker_grpc_options
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -149,6 +150,10 @@ async def serve(
         port=worker_port,
         credentials=credentials,
         backpressure=backpressure,
+        # Relaxed keepalive/ping enforcement so a long, quiet dispatch
+        # stream doesn't trip the worker's server into GOAWAY
+        # too_many_pings; see cfdb.workflows.grpc_options.
+        options=worker_grpc_options(),
     )
     await worker.start()
     try:

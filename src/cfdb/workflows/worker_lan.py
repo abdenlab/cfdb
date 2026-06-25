@@ -48,6 +48,7 @@ from wool.runtime.discovery.lan import LanDiscovery
 from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
 from cfdb.workflows.backpressure import backpressure_for
 from cfdb.workflows.credentials import build_worker_credentials
+from cfdb.workflows.grpc_options import worker_grpc_options
 
 logger = logging.getLogger(__name__)
 
@@ -104,16 +105,17 @@ async def serve(
         except NotImplementedError:
             signal.signal(sig, _signal_handler_threaded)
 
-    # Bind per-worker backpressure onto the spawn factory so each spawned
-    # LocalWorker serializes its routines (mirrors the ECS worker_main
-    # wiring). ``functools.partial(..., backpressure=hook)`` keeps wool's
+    # Bind per-worker backpressure and the relaxed keepalive/ping options
+    # onto the spawn factory so each spawned LocalWorker serializes its
+    # routines and won't trip GOAWAY too_many_pings on a quiet dispatch
+    # stream (mirrors the ECS worker_main wiring). Pre-binding only
+    # non-``host`` kwargs via ``functools.partial`` keeps wool's
     # ``declares_host`` True, so the pool still prescribes the bind host.
     backpressure = backpressure_for(WORKER_MAX_CONCURRENT_TASKS)
-    worker_factory = (
-        functools.partial(wool.LocalWorker, backpressure=backpressure)
-        if backpressure is not None
-        else wool.LocalWorker
-    )
+    worker_kwargs: dict[str, object] = {"options": worker_grpc_options()}
+    if backpressure is not None:
+        worker_kwargs["backpressure"] = backpressure
+    worker_factory = functools.partial(wool.LocalWorker, **worker_kwargs)
 
     pool = wool.WorkerPool(
         spawn=workers,
