@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from cfdb.workflows import SORT_MEMORY_CAP, keys as key_utils
 from cfdb.workflows.cache import LocalFsCache
@@ -92,6 +94,173 @@ class _PipelineHarness:
             "_count_data_lines",
             new=fake_count_data_lines,
         )
+
+
+def test__source_looks_processable_should_accept_gzip_magic():
+    """Test that a gzip/bgzip prefix is accepted.
+
+    Given:
+        A prefix beginning with the gzip magic bytes.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return True so gzip/bgzip sources flow into the pipeline.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"\x1f\x8b\x08\x00rest") is True
+
+
+def test__source_looks_processable_should_accept_plain_text():
+    """Test that a plaintext BED prefix is accepted.
+
+    Given:
+        A prefix of plain BED text.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return True.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"chr1\t0\t100\tpeak\n") is True
+
+
+def test__source_looks_processable_should_reject_starch_archive():
+    """Test that a BEDOPS starch archive prefix is rejected.
+
+    Given:
+        A prefix beginning with the starch magic (0xca5cade5) followed by
+        bzip2 bytes.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return False so starch never reaches the zcat pipeline.
+    """
+    # Act & assert
+    assert (
+        tabix_module._source_looks_processable(b"\xca\x5c\xad\xe5BZh91AY&SY") is False
+    )
+
+
+@pytest.mark.parametrize(
+    "magic",
+    [
+        b"BZh91AY&SY",  # bzip2
+        b"\xfd7zXZ\x00\x00",  # xz
+        b"\x28\xb5\x2f\xfd\x00",  # zstd
+        b"PK\x03\x04\x14\x00",  # zip
+    ],
+)
+def test__source_looks_processable_should_reject_known_binary_magics(magic):
+    """Test that known non-gzip compression magics are rejected.
+
+    Given:
+        A prefix beginning with a bzip2, xz, zstd, or zip magic number.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return False so a mislabeled compressed source — which
+        zcat -f cannot decompress — never reaches the pipeline.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(magic) is False
+
+
+def test__source_looks_processable_should_reject_binary_with_nul():
+    """Test that NUL-containing binary is rejected.
+
+    Given:
+        A prefix containing a NUL byte.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return False.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"BB\x00\x01\x02bigbed") is False
+
+
+def test__source_looks_processable_should_reject_short_invalid_binary():
+    """Test that a short non-text binary prefix is rejected.
+
+    Given:
+        A two-byte, NUL-free prefix that is not valid UTF-8 and is shorter
+        than the boundary-trim window (b"\\xff\\xfe").
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return False once trimming exhausts the prefix without a
+        successful decode.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"\xff\xfe") is False
+
+
+def test__source_looks_processable_should_accept_text_split_at_boundary():
+    """Test that text with a multi-byte char cut at the boundary is accepted.
+
+    Given:
+        Valid UTF-8 text whose final multi-byte character is truncated by
+        one byte, as a real read of N bytes can split a character.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return True by trimming the dangling bytes before
+        deciding, rather than false-rejecting valid text.
+    """
+    # Arrange
+    prefix = ("α" * 250).encode("utf-8")[:-1]
+
+    # Act & assert
+    assert tabix_module._source_looks_processable(prefix) is True
+
+
+def test__source_looks_processable_should_accept_empty_prefix():
+    """Test that an empty prefix defers to the downstream empty guard.
+
+    Given:
+        An empty byte prefix (zero-length source read).
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should return True so the empty-source case is handled by the
+        post-pipeline zero-data-line guard rather than here.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"") is True
+
+
+@settings(max_examples=50)
+@given(payload=st.binary())
+def test__source_looks_processable_should_accept_any_gzip_prefixed_payload(payload):
+    """Test that any gzip-prefixed payload is accepted.
+
+    Given:
+        Arbitrary bytes appended to the gzip magic prefix.
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should always return True, since the gzip magic alone is
+        sufficient to route the source through zcat.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"\x1f\x8b" + payload) is True
+
+
+@settings(max_examples=50)
+@given(payload=st.binary())
+def test__source_looks_processable_should_reject_any_starch_prefixed_payload(payload):
+    """Test that any starch-prefixed payload is rejected.
+
+    Given:
+        Arbitrary bytes appended to the BEDOPS starch magic (0xca5cade5).
+    When:
+        _source_looks_processable is called.
+    Then:
+        It should always return False, generalizing the starch rejection
+        beyond a single example so no starch archive reaches the pipeline.
+    """
+    # Act & assert
+    assert tabix_module._source_looks_processable(b"\xca\x5c\xad\xe5" + payload) is False
 
 
 class TestTabixIntervalProcessor:
@@ -471,6 +640,214 @@ class TestTabixIntervalProcessorPipelines:
             processor_version=TabixIntervalProcessor().processor_version,
         )
         assert await cache.head(data_key) is None
+
+    @pytest.mark.parametrize("fmt", ["BED", "VCF", "GTF"])
+    @pytest.mark.asyncio
+    async def test_run_should_reject_starch_source_before_commit(
+        self, tmp_path, mocker, fmt
+    ):
+        """Test that a starch source fails before any cache commit.
+
+        Given:
+            A BED/VCF/GTF file_meta whose downloaded source is a BEDOPS
+            starch archive (magic 0xca5cade5), with the pipeline tools
+            mocked to fail if reached. VCF and GTF take the
+            intermediate-decompress branches, so this pins that the guard
+            fires ahead of every non-bigBed path, not just the BED one.
+        When:
+            run is awaited.
+        Then:
+            It should raise RuntimeError matching "neither gzip nor text"
+            without running the pipeline and leave the data artifact
+            uncommitted in the cache.
+        """
+        # Arrange
+        workdir = tmp_path / "work"
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+
+        async def fake_download(_meta, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xca\x5c\xad\xe5BZh91AY&SYstarch-body")
+            return dest
+
+        async def fail_shell(cmd):
+            raise AssertionError(f"pipeline must not run for starch: {cmd}")
+
+        async def fail_run(argv):
+            raise AssertionError(f"tabix must not run for starch: {argv}")
+
+        mocker.patch.object(tabix_module, "download_source", fake_download)
+        mocker.patch.object(tabix_module, "run_shell", fail_shell)
+        mocker.patch.object(tabix_module, "run_argv", fail_run)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="neither gzip nor text"):
+            async for _event in TabixIntervalProcessor().run(
+                _file_meta(fmt), workdir, LocalFsCache(cache_root)
+            ):
+                pass
+        cache = LocalFsCache(cache_root)
+        data_key = key_utils.cache_key(
+            dcc="encode",
+            local_id=f"ENCFF-{fmt}",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=TabixIntervalProcessor().processor_version,
+        )
+        assert await cache.head(data_key) is None
+
+    @pytest.mark.asyncio
+    async def test_run_should_not_sniff_guard_bigbed_binary_source(
+        self, tmp_path, mocker
+    ):
+        """Test that the byte-sniff guard exempts bigBed binary sources.
+
+        Given:
+            A bigBed file_meta whose downloaded source is binary
+            (NUL-containing), with the pipeline tools mocked.
+        When:
+            run is awaited.
+        Then:
+            It should complete and commit the data artifact rather than
+            raising, because bigBed is handled by bigBedToBed and is
+            exempt from the gzip/text guard.
+        """
+        # Arrange
+        harness = _PipelineHarness()
+        harness.install(mocker)
+
+        async def binary_download(_meta, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\x00\x01\x02\x87\x89bigbed-binary")
+            return dest
+
+        mocker.patch.object(tabix_module, "download_source", binary_download)
+        workdir = tmp_path / "work"
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+
+        # Act
+        events = await _drain_run(
+            TabixIntervalProcessor(), _file_meta("bigBed"), workdir, cache_root
+        )
+        artifacts = _final_artifacts(events)
+
+        # Assert
+        cache = LocalFsCache(cache_root)
+        assert await cache.head(artifacts["data"]) is not None
+
+    @pytest.mark.asyncio
+    async def test_run_should_not_commit_when_bigbedtobed_rejects_source(
+        self, tmp_path, mocker
+    ):
+        """Test that a bad bigBed source commits nothing when the tool fails.
+
+        Given:
+            A bigBed file_meta whose pipeline raises, modeling bigBedToBed
+            rejecting a non-bigBed source with a non-zero exit (the bigBed
+            exemption skips the sniff guard, so the tool is the backstop).
+        When:
+            run is awaited.
+        Then:
+            It should raise RuntimeError and leave the data artifact
+            uncommitted, so the exemption cannot poison the cache.
+        """
+        # Arrange
+        workdir = tmp_path / "work"
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+
+        async def fake_download(_meta, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xca\x5c\xad\xe5not-a-real-bigbed")
+            return dest
+
+        async def rejecting_shell(cmd):
+            raise RuntimeError(f"bigBedToBed exited 255: {cmd}")
+
+        async def fail_run(argv):
+            raise AssertionError(f"tabix must not run: {argv}")
+
+        mocker.patch.object(tabix_module, "download_source", fake_download)
+        mocker.patch.object(tabix_module, "run_shell", rejecting_shell)
+        mocker.patch.object(tabix_module, "run_argv", fail_run)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="bigBedToBed exited"):
+            async for _event in TabixIntervalProcessor().run(
+                _file_meta("bigBed"), workdir, LocalFsCache(cache_root)
+            ):
+                pass
+        cache = LocalFsCache(cache_root)
+        data_key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF-bigBed",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=TabixIntervalProcessor().processor_version,
+        )
+        assert await cache.head(data_key) is None
+
+    @pytest.mark.asyncio
+    async def test_run_should_not_serve_a_poisoned_v1_artifact(
+        self, tmp_path, mocker
+    ):
+        """Test that a v1-cached poisoned artifact is not served after the bump.
+
+        Given:
+            A garbage data artifact seeded under the OLD processor_version=1
+            cache key, with the current source a starch (BED-mapped) archive.
+        When:
+            run is awaited with the current processor.
+        Then:
+            It should re-key to the current version (a miss on the poisoned
+            v1 entry), re-enter the guard, raise, and never serve the v1
+            bytes — the current data key stays absent.
+        """
+        # Arrange
+        workdir = tmp_path / "work"
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+        cache = LocalFsCache(cache_root)
+
+        seed = tmp_path / "seed.bgz"
+        seed.write_bytes(b"corrupt-v1-artifact")
+        v1_key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF-BED",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=1,
+        )
+        await cache.put(v1_key, seed)
+
+        async def fake_download(_meta, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xca\x5c\xad\xe5BZh91AY&SYstarch-body")
+            return dest
+
+        async def fail_shell(cmd):
+            raise AssertionError(f"pipeline must not run: {cmd}")
+
+        mocker.patch.object(tabix_module, "download_source", fake_download)
+        mocker.patch.object(tabix_module, "run_shell", fail_shell)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="neither gzip nor text"):
+            async for _event in TabixIntervalProcessor().run(
+                _file_meta("BED"), workdir, cache
+            ):
+                pass
+        current_key = key_utils.cache_key(
+            dcc="encode",
+            local_id="ENCFF-BED",
+            artifact_kind=ArtifactKind.DATA,
+            md5=FIXTURE_MD5,
+            processor_version=TabixIntervalProcessor().processor_version,
+        )
+        assert current_key != v1_key
+        assert await cache.head(current_key) is None
 
     @pytest.mark.asyncio
     async def test_run_should_use_bed_sort_keys_for_bed(self, tmp_path, mocker):
