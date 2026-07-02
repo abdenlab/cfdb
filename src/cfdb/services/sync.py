@@ -245,16 +245,9 @@ async def _enrich_4dn_api_metadata() -> None:
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Fetch API data
-    file_metadata = await fetch_file_metadata_bulk()
-    biosource_tiers = await fetch_biosource_tiers()
-
-    logger.info(
-        f"4DN enrichment: {len(file_metadata)} file entries, "
-        f"{len(biosource_tiers)} biosource tier entries"
-    )
-
-    # Build accession -> _id lookup from existing files (avoids $regex per update)
+    # Build accession -> _id lookup from existing files (avoids $regex per
+    # update) first, so enrichment metadata is fetched for exactly those
+    # accessions.
     accession_to_id: dict[str, object] = {}
     cursor = api.db.files.find(
         {"submission": "4dn"},
@@ -266,6 +259,17 @@ async def _enrich_4dn_api_metadata() -> None:
             accession_to_id[acc] = doc["_id"]
 
     logger.info(f"4DN enrichment: {len(accession_to_id)} files in DB mapped by accession")
+
+    # Fetch API data for exactly the accessions we hold. Batching the Search
+    # API query by accession bypasses its 10k result-window cap, which a
+    # blind deep-pagination scan would silently hit and truncate.
+    file_metadata = await fetch_file_metadata_bulk(accession_to_id.keys())
+    biosource_tiers = await fetch_biosource_tiers()
+
+    logger.info(
+        f"4DN enrichment: {len(file_metadata)} file entries, "
+        f"{len(biosource_tiers)} biosource tier entries"
+    )
 
     # Build bulk update operations matched by _id
     operations = []

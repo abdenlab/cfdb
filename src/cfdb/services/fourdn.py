@@ -80,6 +80,7 @@ date_created                            → collections[].extra.fourdn.date_crea
 import asyncio
 import logging
 import re
+from collections.abc import Iterable
 from typing import Optional
 
 import aiohttp
@@ -95,6 +96,12 @@ logger = logging.getLogger(__name__)
 
 # Rate limit: max 10 requests/second → 100ms between requests
 _REQUEST_INTERVAL = 0.1
+
+# Accessions per Search-API request when fetching file metadata by accession.
+# Kept well under the Fourfront 10,000-row result-window cap (and short
+# enough to keep the request URL within limits) so each batch returns every
+# requested file rather than a truncated deep-pagination window.
+_FILE_METADATA_BATCH_SIZE = 100
 
 # 4DN accession pattern: 4DNF followed by alphanumeric characters
 _ACCESSION_RE = re.compile(r"4DNF[A-Z0-9]+")
@@ -156,127 +163,138 @@ def parse_extra_files(extra_files_raw: list) -> list[dict]:
     return parsed_files
 
 
-async def fetch_file_metadata_bulk() -> dict[str, dict]:
+async def fetch_file_metadata_bulk(accessions: Iterable[str]) -> dict[str, dict]:
     """
-    Fetch file metadata from the 4DN Search API for FileProcessed and FileFastq types.
+    Fetch file metadata from the 4DN Search API for the given accessions.
 
-    Paginates through all results and returns a dict keyed by accession.
+    Queries the Search API filtered by accession in bounded batches rather
+    than deep-paginating every 4DN file. The Fourfront/Elasticsearch Search
+    API caps every result window at 10,000 rows (a ``from``-paginated scan
+    silently stops there and reports ``total`` clamped to 10,000), so the
+    old full scan retrieved only the first ~10k of each file type and left
+    the tens of thousands of remaining files un-enriched. Filtering each
+    query by a batch of accessions keeps its result set far under the
+    window, so every requested file is fetched regardless of corpus size.
+
+    A single ``type=File`` query covers both ``FileProcessed`` and
+    ``FileFastq`` (and any other file subtype).
+
+    Args:
+        accessions: 4DN file accessions (e.g. ``4DNF...``) to fetch metadata
+            for — typically the accessions of the materialized 4DN files.
 
     Returns:
         {accession: {genome_assembly, file_type, file_type_detailed, condition,
                       biosource_name, dataset, experiment_type, assay_info,
-                      replicate_info}}
+                      replicate_info, extra_files}}
     """
     config = get_dcc_config("4dn")
     api_base = config["api_base"]
     results: dict[str, dict] = {}
 
-    file_types = ["FileProcessed", "FileFastq"]
+    # Dedupe and order for deterministic batching.
+    unique = sorted({acc for acc in accessions if acc})
+    if not unique:
+        return results
 
+    field_params = (
+        "&field=accession"
+        "&field=genome_assembly"
+        "&field=file_type"
+        "&field=file_type_detailed"
+        "&field=track_and_facet_info"
+        "&field=extra_files"
+    )
+
+    failed_batches = 0
     async with aiohttp.ClientSession() as session:
-        for file_type in file_types:
-            offset = 0
-            limit = 1000
-
-            while True:
-                url = (
-                    f"{api_base}/search/"
-                    f"?type={file_type}"
-                    f"&field=accession"
-                    f"&field=genome_assembly"
-                    f"&field=file_type"
-                    f"&field=file_type_detailed"
-                    f"&field=track_and_facet_info"
-                    f"&field=extra_files"
-                    f"&limit={limit}"
-                    f"&from={offset}"
-                    f"&format=json"
-                )
-
-                try:
-                    async with session.get(
-                        url,
-                        headers={"Accept": "application/json", "User-Agent": "cfdb/1.0"},
-                        timeout=aiohttp.ClientTimeout(total=60),
-                    ) as response:
-                        if response.status != 200:
-                            logger.error(
-                                f"4DN Search API error for {file_type}: HTTP {response.status}"
-                            )
-                            break
-
-                        data = await response.json()
-
-                except aiohttp.ClientError as e:
-                    logger.error(f"4DN Search API network error: {e}")
-                    break
-
-                await asyncio.sleep(_REQUEST_INTERVAL)
-
-                graph = data.get("@graph", [])
-                if not graph:
-                    break
-
-                for item in graph:
-                    accession = item.get("accession")
-                    if not accession:
-                        continue
-
-                    entry: dict = {}
-
-                    # Direct fields
-                    genome_assembly = item.get("genome_assembly")
-                    if genome_assembly:
-                        entry["genome_assembly"] = genome_assembly
-
-                    file_type_val = item.get("file_type")
-                    if file_type_val:
-                        entry["file_type"] = file_type_val
-
-                    file_type_detailed = item.get("file_type_detailed")
-                    if file_type_detailed:
-                        entry["file_type_detailed"] = file_type_detailed
-
-                    # Fields from track_and_facet_info
-                    track_info = item.get("track_and_facet_info", {})
-                    if track_info:
-                        for key in (
-                            "condition",
-                            "biosource_name",
-                            "dataset",
-                            "experiment_type",
-                            "assay_info",
-                            "replicate_info",
-                        ):
-                            val = track_info.get(key)
-                            if val:
-                                entry[key] = val
-
-                    # Extra files (index files like .px2, .bai)
-                    extra_files = parse_extra_files(item.get("extra_files", []))
-                    if extra_files:
-                        entry["extra_files"] = extra_files
-
-                    if entry:
-                        results[accession] = entry
-
-                total = data.get("total", 0)
-                offset += limit
-
-                if offset % 5000 == 0:
-                    logger.info(
-                        f"Fetched {min(offset, total)}/{total} {file_type} records from 4DN API"
-                    )
-
-                if offset >= total:
-                    break
-
-            logger.info(
-                f"4DN API: fetched {file_type} metadata, "
-                f"{sum(1 for a, e in results.items() if e)} entries so far"
+        for start in range(0, len(unique), _FILE_METADATA_BATCH_SIZE):
+            batch = unique[start : start + _FILE_METADATA_BATCH_SIZE]
+            acc_params = "".join(f"&accession={acc}" for acc in batch)
+            url = (
+                f"{api_base}/search/"
+                f"?type=File"
+                f"{acc_params}"
+                f"{field_params}"
+                f"&limit={len(batch)}"
+                f"&format=json"
             )
 
-    logger.info(f"4DN API: {len(results)} total file metadata entries fetched")
+            try:
+                async with session.get(
+                    url,
+                    headers={"Accept": "application/json", "User-Agent": "cfdb/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as response:
+                    if response.status != 200:
+                        # Skip only this batch — never silently truncate the
+                        # whole fetch (the deep-pagination bug this replaces).
+                        logger.warning(
+                            "4DN Search API error for accession batch "
+                            f"({len(batch)} accessions): HTTP {response.status}"
+                        )
+                        failed_batches += 1
+                        continue
+
+                    data = await response.json()
+
+            except aiohttp.ClientError as e:
+                logger.warning(
+                    "4DN Search API network error for accession batch "
+                    f"({len(batch)} accessions): {e}"
+                )
+                failed_batches += 1
+                continue
+
+            await asyncio.sleep(_REQUEST_INTERVAL)
+
+            for item in data.get("@graph", []):
+                accession = item.get("accession")
+                if not accession:
+                    continue
+
+                entry: dict = {}
+
+                # Direct fields
+                genome_assembly = item.get("genome_assembly")
+                if genome_assembly:
+                    entry["genome_assembly"] = genome_assembly
+
+                file_type_val = item.get("file_type")
+                if file_type_val:
+                    entry["file_type"] = file_type_val
+
+                file_type_detailed = item.get("file_type_detailed")
+                if file_type_detailed:
+                    entry["file_type_detailed"] = file_type_detailed
+
+                # Fields from track_and_facet_info
+                track_info = item.get("track_and_facet_info", {})
+                if track_info:
+                    for key in (
+                        "condition",
+                        "biosource_name",
+                        "dataset",
+                        "experiment_type",
+                        "assay_info",
+                        "replicate_info",
+                    ):
+                        val = track_info.get(key)
+                        if val:
+                            entry[key] = val
+
+                # Extra files (index files like .px2, .bai)
+                extra_files = parse_extra_files(item.get("extra_files", []))
+                if extra_files:
+                    entry["extra_files"] = extra_files
+
+                if entry:
+                    results[accession] = entry
+
+    logger.info(
+        f"4DN API: fetched metadata for {len(results)}/{len(unique)} "
+        f"requested files ({failed_batches} batch(es) failed)"
+    )
     return results
 
 
