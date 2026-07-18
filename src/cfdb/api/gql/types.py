@@ -163,3 +163,16 @@ def annotate(model, name=None):
 @strawberry.experimental.pydantic.type(model=FileMetadataModel)
 @annotate(FileMetadataModel)
 class FileMetadataType: ...
+
+
+@strawberry.type
+class FileList:
+    """A page of files together with the total number of matches.
+
+    ``total_count`` counts every document matching the query, independent
+    of the ``page``/``page_size`` window ``items`` was drawn through, so
+    clients can size pagination controls.
+    """
+
+    total_count: int
+    items: List[FileMetadataType]

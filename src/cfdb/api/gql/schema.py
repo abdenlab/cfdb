@@ -11,6 +11,7 @@ from cfdb.api.gql.inputs import (
 )
 from cfdb.api.gql.types import (
     DistinctFieldType,
+    FileList,
     FileMetadataType,
     ObjectIdScalar,
 )
@@ -95,7 +96,7 @@ class Query:
         input: list[FileMetadataInput] | None = None,
         page: int = 0,
         page_size: int = api.PAGE_SIZE,
-    ) -> List[FileMetadataType]:
+    ) -> FileList:
         # Wait for any database cutover to complete
         await locks.wait_for_cutover()
 
@@ -103,17 +104,21 @@ class Query:
         query = to_query(to_dict(input)) if input else {}
 
         skip = page * page_size
-        files = (
-            await api.db.files.find(query)
-            .skip(skip)
-            .limit(page_size)
-            .to_list(length=None)
+        # ``count_documents`` takes its filter positionally: Motor names
+        # that parameter ``filter`` but the test double names it ``query``,
+        # so a keyword argument would break against one of the two.
+        total_count, files = await asyncio.gather(
+            api.db.files.count_documents(query),
+            api.db.files.find(query).skip(skip).limit(page_size).to_list(length=None),
         )
 
-        return [
-            from_pydantic(FileMetadataType, FileMetadataModel(**file).model_dump())
-            for file in files
-        ]
+        return FileList(
+            total_count=total_count,
+            items=[
+                from_pydantic(FileMetadataType, FileMetadataModel(**file).model_dump())
+                for file in files
+            ],
+        )
 
     @strawberry.field
     async def file(

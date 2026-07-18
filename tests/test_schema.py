@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from cfdb.api.gql.schema import from_pydantic, schema
 from cfdb.api.gql.types import FileMetadataType
@@ -85,15 +89,17 @@ class TestFilesQuery:
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
 
     @pytest.mark.asyncio
-    async def test_returns_files_via_simple_pagination(self, mock_db):
-        """Test pagination cap is applied to the files query.
+    async def test_files_should_return_page_size_items_when_more_documents_match(
+        self, mock_db
+    ):
+        """Test the pagination cap is applied to the files query.
 
         Given:
-            Three files in the database
+            Three files in the database.
         When:
-            The GraphQL files query is executed with page=0, page_size=2
+            The GraphQL files query is executed with page=0, page_size=2.
         Then:
-            Exactly 2 files are returned (no access-level over-fetch logic)
+            It should return exactly 2 files (no access-level over-fetch logic).
         """
         # Arrange
         mock_db.files.docs = [
@@ -107,7 +113,9 @@ class TestFilesQuery:
             """
             query {
                 files(page: 0, pageSize: 2) {
-                    localId
+                    items {
+                        localId
+                    }
                 }
             }
             """
@@ -115,10 +123,259 @@ class TestFilesQuery:
 
         # Assert
         assert result.errors is None
-        assert len(result.data["files"]) == 2
+        assert len(result.data["files"]["items"]) == 2
 
     @pytest.mark.asyncio
-    async def test_returns_4dn_file_with_dict_shaped_extra_file_format(self, mock_db):
+    async def test_files_should_return_total_count_independent_of_page_size(
+        self, mock_db
+    ):
+        """Test totalCount reports every match, not just the returned page.
+
+        Given:
+            Three files in the database.
+        When:
+            The GraphQL files query is executed with a page_size of 2.
+        Then:
+            It should return a totalCount of 3 alongside only 2 items.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(page: 0, pageSize: 2) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 3
+        assert len(result.data["files"]["items"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_stable_total_count_across_pages(self, mock_db):
+        """Test totalCount does not vary with the page being requested.
+
+        Given:
+            Three files in the database.
+        When:
+            The same query is executed for page 0 and then page 1.
+        Then:
+            It should report the same totalCount of 3 on both pages.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+        query = """
+            query Files($page: Int!) {
+                files(page: $page, pageSize: 2) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+
+        # Act
+        first = await schema.execute(query, variable_values={"page": 0})
+        second = await schema.execute(query, variable_values={"page": 1})
+
+        # Assert
+        assert first.errors is None
+        assert second.errors is None
+        assert first.data["files"]["totalCount"] == 3
+        assert second.data["files"]["totalCount"] == 3
+        assert len(first.data["files"]["items"]) == 2
+        assert len(second.data["files"]["items"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_true_total_count_when_page_past_end(
+        self, mock_db
+    ):
+        """Test a page beyond the last still reports the real match count.
+
+        Given:
+            Three files in the database.
+        When:
+            The GraphQL files query requests page 5 with a page_size of 2.
+        Then:
+            It should return an empty items list alongside a totalCount of 3.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(page: 5, pageSize: 2) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 3
+        assert result.data["files"]["items"] == []
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_zero_total_count_when_no_documents_match(
+        self, mock_db
+    ):
+        """Test a filter matching nothing yields an empty envelope, not null.
+
+        Given:
+            Files in the database, none matching the requested filename.
+        When:
+            The GraphQL files query filters on that absent filename.
+        Then:
+            It should return a totalCount of 0 and an empty items list.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1"), _make_file_doc("f2")]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: [{ filename: ["absent.bam"] }]) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 0
+        assert result.data["files"]["items"] == []
+
+    @pytest.mark.asyncio
+    async def test_files_should_count_only_matching_documents_when_input_filter_supplied(
+        self, mock_db
+    ):
+        """Test totalCount reflects the filter rather than the collection size.
+
+        Given:
+            Five files, of which two belong to the 4DN DCC.
+        When:
+            The GraphQL files query filters on the 4DN DCC abbreviation.
+        Then:
+            It should report a totalCount of 2, not the collection total of 5.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1", "4dn"),
+            _make_file_doc("f2", "4dn"),
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("h2", "hubmap"),
+            _make_file_doc("e1", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: [{ dcc: [{ dccAbbreviation: ["4dn"] }] }]) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 2
+        assert {f["localId"] for f in result.data["files"]["items"]} == {"f1", "f2"}
+
+    @given(page=st.integers(0, 20), page_size=st.integers(1, 20))
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_files_should_report_total_count_invariant_under_pagination(
+        self, mock_db, page, page_size
+    ):
+        """Test totalCount stays the full match count for any pagination window.
+
+        Given:
+            A fixed collection of 12 files and arbitrary page and page_size
+            requests drawn from [0, 20] and [1, 20].
+        When:
+            The GraphQL files query runs with those pagination arguments.
+        Then:
+            It should always report a totalCount of 12, and items should hold
+            exactly the requested page slice.
+        """
+        # Arrange
+        # ``mock_db`` is function-scoped, so Hypothesis reuses one instance
+        # across examples (hence the suppressed health check); reseeding the
+        # constant dataset each example keeps them independent. The resolver
+        # is async and Hypothesis does not compose with pytest-asyncio, so it
+        # is driven synchronously via asyncio.run.
+        all_ids = [f"f{i}" for i in range(12)]
+        mock_db.files.docs = [_make_file_doc(local_id) for local_id in all_ids]
+
+        # Act
+        result = asyncio.run(
+            schema.execute(
+                """
+                query Files($page: Int!, $pageSize: Int!) {
+                    files(page: $page, pageSize: $pageSize) {
+                        totalCount
+                        items {
+                            localId
+                        }
+                    }
+                }
+                """,
+                variable_values={"page": page, "pageSize": page_size},
+            )
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 12
+        skip = page * page_size
+        assert len(result.data["files"]["items"]) == len(
+            all_ids[skip : skip + page_size]
+        )
+
+    @pytest.mark.asyncio
+    async def test_files_should_expose_display_title_token_when_extra_file_format_is_cv_object(
+        self, mock_db
+    ):
         """Test the files query serializes 4DN extra_files with a CV-object format.
 
         Given:
@@ -128,7 +385,7 @@ class TestFilesQuery:
         When:
             The GraphQL files query selects extra.fourdn.extraFiles.fileFormat.
         Then:
-            It returns without errors and exposes the display_title token.
+            It should return without errors and expose the display_title token.
         """
         # Arrange
         doc = _make_file_doc("4DNFITEST", submission="4dn")
@@ -152,8 +409,10 @@ class TestFilesQuery:
             """
             query {
                 files {
-                    localId
-                    extra { fourdn { extraFiles { href fileFormat } } }
+                    items {
+                        localId
+                        extra { fourdn { extraFiles { href fileFormat } } }
+                    }
                 }
             }
             """
@@ -161,12 +420,12 @@ class TestFilesQuery:
 
         # Assert
         assert result.errors is None
-        extra_file = result.data["files"][0]["extra"]["fourdn"]["extraFiles"][0]
+        extra_file = result.data["files"]["items"][0]["extra"]["fourdn"]["extraFiles"][0]
         assert extra_file["fileFormat"] == "pairs_px2"
         assert extra_file["href"] == "/files/x.pairs_px2"
 
     @pytest.mark.asyncio
-    async def test_returns_4dn_file_with_float_collection_protocol_fields(
+    async def test_files_should_return_file_when_collection_protocol_fields_are_floats(
         self, mock_db
     ):
         """Test the files query serializes 4DN float collection protocol fields.
@@ -178,7 +437,8 @@ class TestFilesQuery:
         When:
             The GraphQL files query selects only localId.
         Then:
-            It returns without errors and the file is present (no data:null).
+            It should return without errors and the file should be present
+            (no data:null).
         """
         # Arrange
         doc = _make_file_doc("4DNFIFLOAT", submission="4dn")
@@ -201,7 +461,9 @@ class TestFilesQuery:
             """
             query {
                 files {
-                    localId
+                    items {
+                        localId
+                    }
                 }
             }
             """
@@ -209,11 +471,11 @@ class TestFilesQuery:
 
         # Assert
         assert result.errors is None
-        assert len(result.data["files"]) == 1
-        assert result.data["files"][0]["localId"] == "4DNFIFLOAT"
+        assert len(result.data["files"]["items"]) == 1
+        assert result.data["files"]["items"][0]["localId"] == "4DNFIFLOAT"
 
     @pytest.mark.asyncio
-    async def test_returns_float_collection_protocol_fields_as_strings(
+    async def test_files_should_return_string_forms_when_collection_protocol_fields_are_floats(
         self, mock_db
     ):
         """Test the files query exposes float protocol fields as string forms.
@@ -224,7 +486,8 @@ class TestFilesQuery:
         When:
             The GraphQL files query selects the nested protocol fields.
         Then:
-            It returns without errors and each value is the string form.
+            It should return without errors and each value should be the
+            string form.
         """
         # Arrange
         doc = _make_file_doc("4DNFIFLOAT2", submission="4dn")
@@ -247,13 +510,15 @@ class TestFilesQuery:
             """
             query {
                 files {
-                    localId
-                    collections {
-                        extra {
-                            fourdn {
-                                crosslinkingTemperature
-                                ligationVolume
-                                digestionTime
+                    items {
+                        localId
+                        collections {
+                            extra {
+                                fourdn {
+                                    crosslinkingTemperature
+                                    ligationVolume
+                                    digestionTime
+                                }
                             }
                         }
                     }
@@ -264,13 +529,15 @@ class TestFilesQuery:
 
         # Assert
         assert result.errors is None
-        fourdn = result.data["files"][0]["collections"][0]["extra"]["fourdn"]
+        fourdn = result.data["files"]["items"][0]["collections"][0]["extra"]["fourdn"]
         assert fourdn["crosslinkingTemperature"] == "25.0"
         assert fourdn["ligationVolume"] == "0.12"
         assert fourdn["digestionTime"] == "960.0"
 
     @pytest.mark.asyncio
-    async def test_returns_mixed_page_with_float_and_clean_docs(self, mock_db):
+    async def test_files_should_return_all_items_when_page_mixes_float_and_clean_docs(
+        self, mock_db
+    ):
         """Test a page mixing a float-protocol doc with clean docs returns all.
 
         Given:
@@ -280,7 +547,8 @@ class TestFilesQuery:
         When:
             The GraphQL files query selects localId.
         Then:
-            It returns without errors and all three files are present.
+            It should return without errors and all three files should be
+            present.
         """
         # Arrange
         float_doc = _make_file_doc("4DNFIMIX", submission="4dn")
@@ -301,7 +569,9 @@ class TestFilesQuery:
             """
             query {
                 files(page: 0, pageSize: 10) {
-                    localId
+                    items {
+                        localId
+                    }
                 }
             }
             """
@@ -309,19 +579,22 @@ class TestFilesQuery:
 
         # Assert
         assert result.errors is None
-        returned = {f["localId"] for f in result.data["files"]}
+        returned = {f["localId"] for f in result.data["files"]["items"]}
         assert returned == {"4DNFIMIX", "clean1", "clean2"}
 
     @pytest.mark.asyncio
-    async def test_returns_all_submissions_without_filtering(self, mock_db):
+    async def test_files_should_return_all_dccs_when_no_input_filter_supplied(
+        self, mock_db
+    ):
         """Test the files query returns all DCCs when no filter is supplied.
 
         Given:
-            Files from multiple DCCs including HuBMAP
+            Files from multiple DCCs including HuBMAP.
         When:
-            The GraphQL files query is executed with no input filter
+            The GraphQL files query is executed with no input filter.
         Then:
-            Files from all DCCs are returned without access-level filtering
+            It should return files from all DCCs without access-level
+            filtering.
         """
         # Arrange
         mock_db.files.docs = [
@@ -335,7 +608,9 @@ class TestFilesQuery:
             """
             query {
                 files(page: 0, pageSize: 10) {
-                    localId
+                    items {
+                        localId
+                    }
                 }
             }
             """
@@ -343,7 +618,7 @@ class TestFilesQuery:
 
         # Assert
         assert result.errors is None
-        assert len(result.data["files"]) == 3
+        assert len(result.data["files"]["items"]) == 3
 
 
 class TestDistinctValuesQuery:

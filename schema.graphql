@@ -392,6 +392,11 @@ type FileFormatType {
   description: String
 }
 
+type FileList {
+  totalCount: Int!
+  items: [FileMetadataType!]!
+}
+
 input FileMetadataInput {
   dcc: [DccInput!] = null
   collections: [CollectionInput!] = null
@@ -503,7 +508,7 @@ type ProjectType {
 }
 
 type Query {
-  files(input: [FileMetadataInput!] = null, page: Int! = 0, pageSize: Int! = 25): [FileMetadataType!]!
+  files(input: [FileMetadataInput!] = null, page: Int! = 0, pageSize: Int! = 25): FileList!
   file(id: ObjectIdScalar!): FileMetadataType
   distinctValues(fields: [String!]!, input: [FileMetadataInput!] = null): [DistinctFieldType!]!
 }
