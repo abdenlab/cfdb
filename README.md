@@ -223,9 +223,9 @@ The `cloudformation/backend.yml` `ImageURI` and `cloudformation/workers.yml` `Wo
 
 ### Queries
 
-The API exposes three queries: `files` (paginated list), `file` (single lookup by MongoDB ObjectId), and `distinctValues` (unique values for a set of queryable fields).
+The API exposes four queries: `files` (paginated list), `file` (single lookup by MongoDB ObjectId), `fileCount` (match count for a filter, without fetching any documents), and `distinctValues` (unique values for a set of queryable fields).
 
-`files` returns a `FileList` envelope rather than a bare list: `items` carries the requested page, and `totalCount` reports how many documents match `input` in total — before `page`/`pageSize` are applied — so clients can size pagination controls.
+`files` returns a `FileList` envelope rather than a bare list: `items` carries the requested page, and `totalCount` reports how many documents match `input` in total — before `page`/`pageSize` are applied — so clients can size pagination controls. Use `fileCount` when only the count is needed: it runs the same filter without materializing a page of documents.
 
 ```graphql
 query {
@@ -259,6 +259,8 @@ curl -X POST http://localhost:8000/metadata \
 ```
 
 Single file lookup: `{ file(id: "507f1f77bcf86cd799439011") { filename accessUrl } }`
+
+File count for a filter: `{ fileCount(input: [{ dcc: [{ dccAbbreviation: ["4DN"] }] }]) }` — returns the number of matching files without fetching any documents. It accepts the same `FileMetadataInput` filter shape as `files`; with no `input` it counts every file.
 
 ### Query Mechanics
 
