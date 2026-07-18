@@ -945,3 +945,357 @@ class TestDistinctValuesQuery:
         # Assert
         assert result.errors is not None
         assert "file_format" in result.errors[0].message
+
+
+# DCC abbreviations the fileCount property test draws documents and filters
+# from. Kept small so generated docs use fake-resolvable dict paths
+# (``dcc.dcc_abbreviation``).
+_DCC_POOL = ["hubmap", "4dn", "encode"]
+
+
+class TestFileCountQuery:
+    @pytest.fixture(autouse=True)
+    def _patch_cutover(self, mocker):
+        """No-op ``locks.wait_for_cutover`` for every test in this class."""
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_return_total_when_no_filter(self, mock_db):
+        """Test the file count reflects every document when no filter is supplied.
+
+        Given:
+            Three files spanning multiple DCCs
+        When:
+            The fileCount query is executed with no input filter
+        Then:
+            It should return the total number of files
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+            _make_file_doc("e1", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute("query { fileCount }")
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 3
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_count_only_matches_when_filter_applied(
+        self, mock_db
+    ):
+        """Test the file count honors an input filter.
+
+        Given:
+            Three files, two from HuBMAP and one from 4DN
+        When:
+            The fileCount query is executed with a DCC filter for HuBMAP
+        Then:
+            It should return only the count of matching files
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("h2", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                fileCount(input: [{ dcc: [{ dccAbbreviation: ["hubmap"] }] }])
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 2
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_return_zero_when_filter_matches_nothing(
+        self, mock_db
+    ):
+        """Test the file count is zero when no document satisfies the filter.
+
+        Given:
+            Three files, none from the filtered DCC
+        When:
+            The fileCount query is executed with a DCC filter for an absent DCC
+        Then:
+            It should return zero
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("h2", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                fileCount(input: [{ dcc: [{ dccAbbreviation: ["encode"] }] }])
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 0
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_return_zero_when_database_empty(self, mock_db):
+        """Test the file count is zero against an empty collection.
+
+        Given:
+            An empty database
+        When:
+            The fileCount query is executed with no input filter
+        Then:
+            It should return zero
+        """
+        # Arrange
+        mock_db.files.docs = []
+
+        # Act
+        result = await schema.execute("query { fileCount }")
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 0
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_count_all_when_input_is_an_empty_list(
+        self, mock_db
+    ):
+        """Test a present-but-empty input list counts every document.
+
+        Given:
+            Three files and an explicitly empty input list
+        When:
+            The fileCount query is executed with input: []
+        Then:
+            It should return the total, since an empty list is falsy and
+            builds no filter (distinct from an omitted/null input)
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+            _make_file_doc("e1", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute("query { fileCount(input: []) }")
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 3
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_count_the_union_when_a_field_lists_multiple_values(
+        self, mock_db
+    ):
+        """Test multiple values in one field are combined as an OR union.
+
+        Given:
+            Three files, one each from HuBMAP, 4DN, and ENCODE
+        When:
+            The fileCount query is executed with a DCC filter listing two
+            abbreviations (["hubmap", "4dn"])
+        Then:
+            It should return the union count of the two DCCs, excluding ENCODE
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+            _make_file_doc("e1", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                fileCount(input: [{ dcc: [{ dccAbbreviation: ["hubmap", "4dn"] }] }])
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 2
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_count_the_union_when_input_has_multiple_entries(
+        self, mock_db
+    ):
+        """Test multiple entries in the outer input list are combined as an OR.
+
+        Given:
+            Three files with distinct local IDs
+        When:
+            The fileCount query is executed with two separate input entries,
+            each filtering a different local ID
+        Then:
+            It should return the union count of the two entries
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+            _make_file_doc("e1", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                fileCount(input: [{ localId: ["h1"] }, { localId: ["f1"] }])
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 2
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_count_the_intersection_when_multiple_fields_filter(
+        self, mock_db
+    ):
+        """Test multiple fields in one entry are combined as an AND intersection.
+
+        Given:
+            Three files: a public HuBMAP file, a non-public HuBMAP file, and a
+            public 4DN file
+        When:
+            The fileCount query is executed with a filter combining a DCC field
+            and a data-access-level field (HuBMAP AND public)
+        Then:
+            It should return only the file matching both conditions, excluding
+            the non-public HuBMAP file and the public 4DN file
+        """
+        # Arrange
+        public_hubmap = _make_file_doc("h1", "hubmap")
+        protected_hubmap = _make_file_doc("h2", "hubmap")
+        protected_hubmap["data_access_level"] = "protected"
+        public_4dn = _make_file_doc("f1", "4dn")
+        mock_db.files.docs = [public_hubmap, protected_hubmap, public_4dn]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                fileCount(input: [{
+                    dcc: [{ dccAbbreviation: ["hubmap"] }],
+                    dataAccessLevel: ["public"]
+                }])
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 1
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_equal_the_files_result_length_for_the_same_filter(
+        self, mock_db
+    ):
+        """Test fileCount agrees with the number of files the same filter returns.
+
+        Given:
+            A mixed multi-DCC dataset smaller than one page
+        When:
+            The fileCount and files queries are executed with the same filter
+        Then:
+            fileCount should equal the length of the files result
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("h1", "hubmap"),
+            _make_file_doc("h2", "hubmap"),
+            _make_file_doc("f1", "4dn"),
+            _make_file_doc("e1", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                fileCount(input: [{ dcc: [{ dccAbbreviation: ["hubmap"] }] }])
+                files(input: [{ dcc: [{ dccAbbreviation: ["hubmap"] }] }], pageSize: 100) {
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == len(result.data["files"]["items"])
+        assert result.data["fileCount"] == 2
+
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
+    )
+    @given(
+        abbreviations=st.lists(st.sampled_from(_DCC_POOL), max_size=15),
+        selected=st.lists(st.sampled_from(_DCC_POOL), unique=True),
+    )
+    def test_file_count_should_equal_the_number_of_matching_documents(
+        self, mock_db, abbreviations, selected
+    ):
+        """Test the count equals the number of documents matching the filter.
+
+        Given:
+            An arbitrary set of files each tagged with a DCC abbreviation drawn
+            from a small pool, and an arbitrary (possibly empty) subset of
+            abbreviations as the filter
+        When:
+            The fileCount query is executed with that filter (or no filter when
+            the subset is empty)
+        Then:
+            It should equal the number of files whose abbreviation is in the
+            subset, and the total when the subset is empty
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc(f"f{i}", abbr) for i, abbr in enumerate(abbreviations)
+        ]
+        variables = (
+            {"input": [{"dcc": [{"dccAbbreviation": selected}]}]} if selected else None
+        )
+        expected = (
+            sum(1 for abbr in abbreviations if abbr in selected)
+            if selected
+            else len(abbreviations)
+        )
+
+        # Act
+        result = asyncio.run(
+            schema.execute(
+                "query FileCount($input: [FileMetadataInput!]) {"
+                " fileCount(input: $input) }",
+                variable_values=variables,
+            )
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == expected
