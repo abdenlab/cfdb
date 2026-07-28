@@ -1,5 +1,10 @@
 name: Deploy CFDB to ECR
 
+# DEV ONLY. This pipeline is the dev environment's auto-deploy: every push to
+# master builds, scans, pushes, and rolls the dev service via the moving :dev
+# tag. Production never advances from here — it is promoted manually by
+# .github/workflows/promote-to-prod.yml, which re-tags a SHA this pipeline
+# already shipped onto :prod. Keep MOVING_TAG below as `dev`.
 on:
   push:
     branches:

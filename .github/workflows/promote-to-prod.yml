@@ -1,0 +1,145 @@
+name: Promote CFDB to prod
+
+# MANUAL ONLY. Unlike deploy-to-ecr.yml — which fires on every push to master
+# and ships dev — this workflow has no automatic trigger: production only ever
+# advances because a human dispatched this run and an environment reviewer
+# approved it.
+#
+# It does not build anything. Promotion re-tags an image that the dev pipeline
+# already built, scanned, and shipped, so prod runs bytes byte-identical to
+# what dev exercised. Rebuilding from source could produce a different image
+# than the one validated, which is the failure mode this avoids.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >
+          Short commit SHA tag to promote (the 8-character :<sha> tag the dev
+          deploy pushed, e.g. 8816b30a). Must already exist in BOTH the cfdb
+          and cfdb-wool repositories.
+        required: true
+        type: string
+
+# AWS_REGION pins the ECR/ECS region. MOVING_TAG is the environment-scoped
+# mutable tag the PROD task definitions reference — rolling the prod service
+# makes it re-pull this tag, which is the whole deploy.
+env:
+  AWS_REGION: us-east-2
+  MOVING_TAG: prod
+
+# Serialize promotions so two dispatches cannot interleave their re-tag and
+# roll steps. cancel-in-progress is false for the same reason as the dev
+# pipeline: a promotion in flight must finish rather than leave :prod pointing
+# at a half-applied state.
+concurrency:
+  group: promote-prod
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.repository == 'abdenlab/cfdb'
+    runs-on: ubuntu-24.04
+    # Gates the run on the `prod` GitHub Environment's protection rules
+    # (required reviewers), and scopes the PROD_BACKEND_* variables below.
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # Fail before touching ECR if the deploy target is unconfigured, rather
+      # than discovering it at the roll step with :prod already moved.
+      - name: Pre-flight — required environment variables
+        env:
+          CLUSTER: ${{ vars.PROD_BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.PROD_BACKEND_SERVICE }}
+        run: |
+          [ -n "$CLUSTER" ] && [ -n "$SERVICE" ] || {
+            echo "::error::Set PROD_BACKEND_CLUSTER and PROD_BACKEND_SERVICE on the prod environment"
+            exit 1
+          }
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@50ac8dd1e1b10d09dac7b8727528b91bed831ac0 # v3.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Confirm the requested SHA exists in BOTH repositories before moving
+      # either tag. The API and worker must advance together — promoting one
+      # while the other's tag is missing would leave prod split across two
+      # commits, which the dispatch contract does not guarantee to survive.
+      - name: Verify source images exist
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          for repo in cfdb cfdb-wool; do
+            aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$repo" \
+              --image-ids imageTag="$SHA" >/dev/null || {
+              echo "::error::$repo:$SHA not found in ECR — promote a SHA the dev pipeline shipped"
+              exit 1
+            }
+            echo "found $repo:$SHA"
+          done
+
+      # Re-tag by copying the existing manifest rather than pulling and
+      # re-pushing: the promoted image is the same digest dev validated, and
+      # the step needs only ecr:BatchGetImage + ecr:PutImage.
+      - name: Re-tag images to :prod
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          for repo in cfdb cfdb-wool; do
+            manifest="$(aws ecr batch-get-image \
+              --region "$AWS_REGION" \
+              --repository-name "$repo" \
+              --image-ids imageTag="$SHA" \
+              --query 'images[0].imageManifest' \
+              --output text)"
+            aws ecr put-image \
+              --region "$AWS_REGION" \
+              --repository-name "$repo" \
+              --image-tag "$MOVING_TAG" \
+              --image-manifest "$manifest" >/dev/null
+            echo "re-tagged $repo:$SHA -> :$MOVING_TAG"
+          done
+
+      # Ship the API: the prod task definition references :$MOVING_TAG, so a
+      # forced deployment launches fresh Fargate tasks that re-pull the tag
+      # just moved. Needs only ecs:UpdateService — no RegisterTaskDefinition,
+      # CloudFormation, or iam:PassRole.
+      - name: Roll prod API service
+        env:
+          CLUSTER: ${{ vars.PROD_BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.PROD_BACKEND_SERVICE }}
+        run: |
+          aws ecs update-service \
+            --region "$AWS_REGION" \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --force-new-deployment
+
+      - name: Wait for prod rollout
+        env:
+          CLUSTER: ${{ vars.PROD_BACKEND_CLUSTER }}
+          SERVICE: ${{ vars.PROD_BACKEND_SERVICE }}
+        run: |
+          aws ecs wait services-stable \
+            --region "$AWS_REGION" \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+
+      - name: Record promoted image
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          echo "Promoted cfdb:$SHA and cfdb-wool:$SHA -> :$MOVING_TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      # No ECS step for the worker fleet: the prod worker task definition also
+      # references :$MOVING_TAG and the workers are ephemeral, so the next
+      # EcsProvisioner RunTask pulls the freshly-tagged image. Note this means
+      # the API rolls immediately while in-flight workers may still be running
+      # the previous image until they drain — keep the API<->worker dispatch
+      # contract compatible across adjacent promotions.
