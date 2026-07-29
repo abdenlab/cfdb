@@ -91,16 +91,91 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 
 ### Deploying the CloudFormation stacks
 
-Production runs on four CloudFormation stacks under `cloudformation/`. Deploy them in dependency order (each imports exports from the earlier ones):
+Each deployed environment runs on the same four CloudFormation stacks under `cloudformation/`, deployed under environment-specific stack names. Deploy them in dependency order (each imports exports from the earlier ones):
 
 1. `network.yml` — VPC, subnets, security groups (including the worker SG), S3 gateway endpoint.
 2. `database.yml` — DocumentDB cluster and connection-URL secret.
 3. `workers.yml` — wool worker task definition, S3 artifact cache, worker IAM roles.
 4. `backend.yml` — API service, ALB, and the IAM/env wiring that dispatches to the worker fleet.
 
-Tear down in the reverse order (`backend` → `workers` → `database` → `network`); `backend` imports the worker exports, so it must be deleted first. Both the `cfdb` and `cfdb-wool` ECR repositories are prerequisites created out of band. Each MUST allow tag mutability (`MUTABLE`), because the moving-tag CI deploy re-pushes the `:dev` tag on every merge and an `IMMUTABLE` repository would reject the second `:dev` push. If you want `:<sha>` tags to stay immutable while still allowing the moving `:dev` tag to be re-pushed, configure ECR `IMMUTABLE_WITH_EXCLUSION` with a wildcard filter exempting `dev` (so `:<sha>` is immutable and `:dev` is mutable). Give both repositories a lifecycle policy to prune untagged images.
+Tear down in the reverse order (`backend` → `workers` → `database` → `network`); `backend` imports the worker exports, so it must be deleted first. Both the `cfdb` and `cfdb-wool` ECR repositories are prerequisites created out of band. Each MUST allow tag mutability (`MUTABLE`), because the moving-tag deploys re-push the `:dev` and `:prod` tags and an `IMMUTABLE` repository would reject the second push of either. If you want `:<sha>` tags to stay immutable while still allowing the moving tags to be re-pushed, configure ECR `IMMUTABLE_WITH_EXCLUSION` with wildcard filters exempting both `dev` and `prod` (so `:<sha>` is immutable and the moving tags are mutable). Give both repositories a lifecycle policy to prune untagged images.
 
-**CI auto-deploy (moving-tag steady state).** Every merge to `master` runs `.github/workflows/deploy-to-ecr.yml`, which builds the API (`cfdb`) and worker (`cfdb-wool`) images, trivy-scans the worker image, pushes both images, then rolls the API service — using only the permissions the `cfdb-deploy` CI role already holds (ECR push/pull on both repos, and `ecs:UpdateService`/`DescribeServices`/`DescribeTasks`/`ListTasks` on `cfdb-backend-dev-cluster`). Only the worker (`cfdb-wool`) image is trivy-scanned for HIGH/CRITICAL vulnerabilities — the worker shells out to `samtools`/`tabix`/`bigBedToBed` over untrusted upstream bytes — and that scan gates both pushes, so a scan failure leaves ECR fully on the prior images; the API image is not scanned. The role has **no** `cloudformation:*`, `ecs:RegisterTaskDefinition`, or `iam:PassRole`, so deploys no longer run `aws cloudformation deploy`; they use the **moving-tag** pattern instead. Each image is pushed to two tags: the immutable `:<sha>` (traceable to a commit, used for audit and rollback) and a moving, environment-scoped `:dev`. The ECS task definitions reference `:dev`. The workflow then runs `aws ecs update-service --force-new-deployment` on the backend service, which launches fresh Fargate tasks that re-pull `:dev` — shipping the new API code without registering a task definition — and waits for the rollout to stabilize with `aws ecs wait services-stable`. The worker fleet needs no ECS step: the worker task def also references `:dev`, and the workers are ephemeral, so the next `EcsProvisioner` `RunTask` (issued by the API role at workflow dispatch) pulls the freshly-pushed image. **Rollback is an ECR re-tag, not a redeploy:** re-tag the desired `:<sha>` onto `:dev` (`docker pull` the old `:<sha>`, re-tag it `:dev`, `docker push`; or `aws ecr batch-get-image` + `put-image`, both granted to the role), then `aws ecs update-service --force-new-deployment` to roll the API onto it (the workers re-pull on their next dispatch).
+#### Environments
+
+Two environments share the account `605134458779` and region `us-east-2`. Every cross-stack export is `${AWS::StackName}`-scoped, so the two sets of stacks coexist without collisions — but the physical names that AWS requires to be account- and region-unique (the ALB target group in particular) MUST be passed per environment, which is why `TargetGroupName` is a parameter.
+
+| | dev | prod |
+|---|---|---|
+| Stack names | `cfdb-network-dev`, `cfdb-db-dev`, `cfdb-workers-dev`, `cfdb-backend-dev` | `cfdb-network-prod`, `cfdb-db-prod`, `cfdb-workers-prod`, `cfdb-backend-prod` |
+| Domain | `dev.cfdb.vis-api.link` | `cfdb.visualizationhub.org` |
+| Hosted zone | `vis-api.link` (`Z09477406JQAR0KB7G87`) | `visualizationhub.org` (`Z02332581YW11QLMXBXY4`) |
+| Moving tag | `:dev` | `:prod` |
+| VPC CIDR | `10.2.0.0/21` | `10.3.0.0/21` |
+| Ships when | every merge to `master`, automatically | a human dispatches **Promote CFDB to prod** and a reviewer approves |
+
+Note the templates' parameter defaults (`cfdb.vis-api.link`, `10.2.0.0/21`, `cfdb-tg`) match *neither* live environment — they exist only so a bare `cloudformation deploy` is not rejected for missing parameters. Always pass explicit overrides.
+
+#### Deploying the prod stacks
+
+One-time, run by an IAM-capable principal (not the `cfdb-deploy` CI role, which has no `cloudformation:*` or `iam:PassRole`). The CIDRs deliberately do not overlap dev's so the two VPCs can be peered later if needed.
+
+```bash
+aws cloudformation deploy --region us-east-2 \
+  --stack-name cfdb-network-prod \
+  --template-file cloudformation/network.yml \
+  --parameter-overrides \
+    CidrBlock=10.3.0.0/21 \
+    CidrPublicSubnetA=10.3.0.0/24 CidrPublicSubnetB=10.3.1.0/24 \
+    CidrPrivateSubnetA=10.3.2.0/24 CidrPrivateSubnetB=10.3.3.0/24 \
+  --capabilities CAPABILITY_IAM
+
+aws cloudformation deploy --region us-east-2 \
+  --stack-name cfdb-db-prod \
+  --template-file cloudformation/database.yml \
+  --parameter-overrides \
+    NetworkStackName=cfdb-network-prod \
+    DBMasterUsername=<username> \
+  --capabilities CAPABILITY_IAM
+
+aws cloudformation deploy --region us-east-2 \
+  --stack-name cfdb-workers-prod \
+  --template-file cloudformation/workers.yml \
+  --parameter-overrides \
+    WorkerImageURI=605134458779.dkr.ecr.us-east-2.amazonaws.com/cfdb-wool:prod \
+  --capabilities CAPABILITY_IAM
+
+aws cloudformation deploy --region us-east-2 \
+  --stack-name cfdb-backend-prod \
+  --template-file cloudformation/backend.yml \
+  --parameter-overrides \
+    NetworkStackName=cfdb-network-prod \
+    DatabaseStackName=cfdb-db-prod \
+    WorkersStackName=cfdb-workers-prod \
+    ImageURI=605134458779.dkr.ecr.us-east-2.amazonaws.com/cfdb:prod \
+    DomainName=cfdb.visualizationhub.org \
+    HostedZoneName=visualizationhub.org \
+    HostedZoneId=Z02332581YW11QLMXBXY4 \
+    TargetGroupName=cfdb-prod-tg \
+  --capabilities CAPABILITY_IAM
+```
+
+Because both prod task definitions already reference `:prod`, this doubles as the prod bootstrap — but the `:prod` tags must exist in ECR *before* the stacks can pull them, so run one promotion (below) first, or seed `:prod` by re-tagging a known-good `:<sha>`.
+
+#### Promoting to prod
+
+Production never advances automatically. `.github/workflows/promote-to-prod.yml` is `workflow_dispatch`-only and gated on the `prod` GitHub Environment's required reviewers. Dispatch it with the 8-character `:<sha>` tag that the dev pipeline already built, scanned, and shipped; it verifies that tag exists in **both** `cfdb` and `cfdb-wool`, re-tags each onto `:prod` by copying the ECR manifest, rolls the prod API service, and waits for `services-stable`.
+
+Promotion re-tags rather than rebuilds, so prod runs bytes byte-identical to what dev validated. **Rollback is the same operation with an older SHA:** dispatch the workflow again naming the previous `:<sha>`. As on dev, the worker fleet needs no ECS step — the prod worker task def also references `:prod` and workers are ephemeral, so the next `EcsProvisioner` `RunTask` pulls the new image. That does mean the API rolls immediately while in-flight workers may still run the prior image until they drain, so keep the API↔worker dispatch contract compatible across adjacent promotions.
+
+Prod requires this one-time setup before the first promotion:
+
+- A `prod` **GitHub Environment** with required reviewers, carrying two environment variables: `PROD_BACKEND_CLUSTER` (`cfdb-backend-prod-cluster`) and `PROD_BACKEND_SERVICE` (`cfdb-backend-prod-service`). The workflow fails its pre-flight before touching ECR if either is unset.
+- The `cfdb-deploy` CI role's `ecs:UpdateService`/`DescribeServices`/`DescribeTasks`/`ListTasks` extended to `cfdb-backend-prod-cluster` — it is currently scoped to the dev cluster only. It already holds the `ecr:BatchGetImage`/`PutImage` the re-tag needs. This role is created out of band, not in this repo.
+- Both ECR repositories accepting the `:prod` moving tag (see the mutability note above).
+
+As with dev, confirm after the first promotion that the running prod tasks reference `:prod`. If the task definitions still pin a `:<sha>`, promotions will report success while the live code never advances.
+
+**CI auto-deploy to dev (moving-tag steady state).** This pipeline ships **dev only**; prod is promoted manually as described above. Every merge to `master` runs `.github/workflows/deploy-to-ecr.yml`, which builds the API (`cfdb`) and worker (`cfdb-wool`) images, trivy-scans the worker image, pushes both images, then rolls the API service — using only the permissions the `cfdb-deploy` CI role already holds (ECR push/pull on both repos, and `ecs:UpdateService`/`DescribeServices`/`DescribeTasks`/`ListTasks` on `cfdb-backend-dev-cluster`). Only the worker (`cfdb-wool`) image is trivy-scanned for HIGH/CRITICAL vulnerabilities — the worker shells out to `samtools`/`tabix`/`bigBedToBed` over untrusted upstream bytes — and that scan gates both pushes, so a scan failure leaves ECR fully on the prior images; the API image is not scanned. The role has **no** `cloudformation:*`, `ecs:RegisterTaskDefinition`, or `iam:PassRole`, so deploys no longer run `aws cloudformation deploy`; they use the **moving-tag** pattern instead. Each image is pushed to two tags: the immutable `:<sha>` (traceable to a commit, used for audit and rollback) and a moving, environment-scoped `:dev`. The ECS task definitions reference `:dev`. The workflow then runs `aws ecs update-service --force-new-deployment` on the backend service, which launches fresh Fargate tasks that re-pull `:dev` — shipping the new API code without registering a task definition — and waits for the rollout to stabilize with `aws ecs wait services-stable`. The worker fleet needs no ECS step: the worker task def also references `:dev`, and the workers are ephemeral, so the next `EcsProvisioner` `RunTask` (issued by the API role at workflow dispatch) pulls the freshly-pushed image. **Rollback is an ECR re-tag, not a redeploy:** re-tag the desired `:<sha>` onto `:dev` (`docker pull` the old `:<sha>`, re-tag it `:dev`, `docker push`; or `aws ecr batch-get-image` + `put-image`, both granted to the role), then `aws ecs update-service --force-new-deployment` to roll the API onto it (the workers re-pull on their next dispatch).
 
 A few operational caveats of the moving-tag pattern:
 

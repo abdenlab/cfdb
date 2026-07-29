@@ -46,15 +46,39 @@ Parameters:
       dispatches them as workers free up). This bounds WORKERS, not the
       queue — the queue/admission bound is CFDB_WORKFLOW_MAX_ACTIVE. 0
       disables the cap (rely on the Fargate vCPU quota).
+  # ---------- Per-environment DNS + naming ----------
+  # These four defaults are NOT the value any live environment uses — dev
+  # serves dev.cfdb.vis-api.link and prod serves cfdb.visualizationhub.org
+  # out of a different hosted zone. Every environment MUST pass its own
+  # overrides; the defaults exist only so a bare `cloudformation deploy`
+  # is not rejected for missing parameters.
   HostedZoneName:
     Type: String
     Default: vis-api.link
+    Description: >
+      Route 53 hosted zone the DNS record is created in, without a trailing
+      dot. Per-environment — prod uses a different zone from dev, so this
+      MUST be overridden.
   HostedZoneId:
     Type: String
     Default: Z09477406JQAR0KB7G87
+    Description: >
+      Hosted zone ID matching HostedZoneName, used for ACM DNS validation.
+      Per-environment — MUST be overridden alongside HostedZoneName.
   DomainName:
     Type: String
     Default: cfdb.vis-api.link
+    Description: >
+      Fully-qualified domain the ALB serves and the ACM certificate covers.
+      Per-environment — MUST be overridden.
+  TargetGroupName:
+    Type: String
+    Default: cfdb-tg
+    Description: >
+      ELB target group name. Target group names must be unique per account
+      and region, so each environment MUST pass its own value or the second
+      stack fails to create. The default preserves the original dev name so
+      that an existing stack is not forced to replace its target group.
   # ---------- Worker mTLS (optional, off by default) ----------
   # ARNs of Secrets Manager secrets holding the API's client-side PEM
   # material for mutual TLS on the API<->worker gRPC channel: the shared
@@ -124,7 +148,7 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "cfdb-tg"
+      Name: !Ref TargetGroupName
       Port: 8000
       Protocol: HTTP
       TargetType: ip
