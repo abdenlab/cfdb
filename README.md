@@ -223,24 +223,29 @@ The `cloudformation/backend.yml` `ImageURI` and `cloudformation/workers.yml` `Wo
 
 ### Queries
 
-The API exposes two queries: `files` (paginated list) and `file` (single lookup by MongoDB ObjectId).
+The API exposes three queries: `files` (paginated list), `file` (single lookup by MongoDB ObjectId), and `distinctValues` (unique values for a set of queryable fields).
+
+`files` returns a `FileList` envelope rather than a bare list: `items` carries the requested page, and `totalCount` reports how many documents match `input` in total — before `page`/`pageSize` are applied — so clients can size pagination controls.
 
 ```graphql
 query {
   files(
     input: [FileMetadataInput]
     page: Int = 0
-    pageSize: Int = 100
+    pageSize: Int = 25
   ) {
-    idNamespace
-    localId
-    filename
-    sizeInBytes
-    dcc { dccAbbreviation }
-    fileFormat { name }
-    collections {
-      name
-      biosamples { anatomy { name } }
+    totalCount
+    items {
+      idNamespace
+      localId
+      filename
+      sizeInBytes
+      dcc { dccAbbreviation }
+      fileFormat { name }
+      collections {
+        name
+        biosamples { anatomy { name } }
+      }
     }
   }
 }
@@ -250,7 +255,7 @@ query {
 # Query files from a specific DCC
 curl -X POST http://localhost:8000/metadata \
   -H "Content-Type: application/json" \
-  -d '{"query": "{ files(input: [{ dcc: [{ dccAbbreviation: [\"4DN\"] }] }]) { filename dcc { dccAbbreviation } } }"}'
+  -d '{"query": "{ files(input: [{ dcc: [{ dccAbbreviation: [\"4DN\"] }] }]) { totalCount items { filename dcc { dccAbbreviation } } } }"}'
 ```
 
 Single file lookup: `{ file(id: "507f1f77bcf86cd799439011") { filename accessUrl } }`
@@ -262,7 +267,7 @@ The GraphQL API uses an implicit OR/AND clause system for building MongoDB queri
 1. **Lists become OR clauses**: Multiple values in an array are combined with `$or`
 2. **Dict keys become AND clauses**: Multiple fields in an object are combined with `$and`
 
-Pagination is supported via `page` and `pageSize` parameters (defaults: 0 and 100).
+Pagination is supported via `page` and `pageSize` parameters (defaults: 0 and 25). `totalCount` is unaffected by both — it always reports the full number of matches for the filter.
 
 #### OR Query - Multiple Values in a List
 
@@ -271,7 +276,10 @@ Find files with either filename:
 ```graphql
 query {
   files(input: [{ filename: ["data.csv", "results.tsv"] }]) {
-    filename
+    totalCount
+    items {
+      filename
+    }
   }
 }
 ```
@@ -291,9 +299,12 @@ query {
     ],
     fileFormat: { name: "FASTQ" }
   }]) {
-    filename
-    dcc { dccAbbreviation }
-    fileFormat { name }
+    totalCount
+    items {
+      filename
+      dcc { dccAbbreviation }
+      fileFormat { name }
+    }
   }
 }
 ```
@@ -324,8 +335,11 @@ query {
       }
     }
   }]) {
-    filename
-    collections { biosamples { anatomy { name } } }
+    totalCount
+    items {
+      filename
+      collections { biosamples { anatomy { name } } }
+    }
   }
 }
 ```
