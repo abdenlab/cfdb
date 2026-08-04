@@ -4,6 +4,11 @@ from typing import TYPE_CHECKING, Final
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+# A leaf module with no third-party imports of its own, so this stays
+# clear of the runtime workflow (and wool) dependency the rest of
+# ``cfdb.workflows`` carries — see the TYPE_CHECKING block below.
+from cfdb.workflows.constants import DEFAULT_TLS_IDENTITY, TLS_IDENTITY_ENV
+
 if TYPE_CHECKING:
     from cfdb.workflows.cache import CacheBackend
     from cfdb.workflows.executor import JobExecutor
@@ -83,7 +88,12 @@ WORKFLOW_POOL_NAMESPACE: Final = os.getenv("WORKFLOW_POOL_NAMESPACE", "cfdb-work
 # ``cfdb.workflows.credentials.build_worker_credentials``. The
 # ``CFDB_WORKER_TLS_*`` names are shared with the worker entrypoints
 # (``worker_main`` / ``worker_lan``); each process points CERT/KEY at
-# its own leaf material while the CA is common.
+# its own leaf material while the CA is common. The fourth setting,
+# ``CFDB_WORKER_TLS_IDENTITY``, is shared too: it names the peer a
+# *dialing* process expects to be talking to, which is the API on the
+# dispatch channel — and also each worker on the one channel wool opens
+# back to its own subprocess to drain it (roles are per-connection, not
+# per-process; see ``cfdb.workflows.credentials``).
 
 #: Path to the shared CA certificate the API verifies workers against
 #: (and that signed the API's own client certificate). Unset disables
@@ -97,6 +107,17 @@ CFDB_WORKER_TLS_CERT: Final = os.getenv("CFDB_WORKER_TLS_CERT")
 #: Path to the API's PEM client private key paired with
 #: ``CFDB_WORKER_TLS_CERT``.
 CFDB_WORKER_TLS_KEY: Final = os.getenv("CFDB_WORKER_TLS_KEY")
+
+#: Logical name the API verifies worker certificates against, in place
+#: of the address it dialed — workers answer on dynamic addresses (an
+#: awsvpc IP on ECS, a bridge IP in local containers) that no static SAN
+#: can enumerate. Defaults to the SAN ``certs/generate-worker-certs.sh``
+#: mints, so a freshly generated cert set needs no extra configuration.
+#: Set it to the empty string to verify against the dialed address
+#: instead. Ignored entirely while mTLS is off.
+CFDB_WORKER_TLS_IDENTITY: Final = os.getenv(
+    TLS_IDENTITY_ENV, DEFAULT_TLS_IDENTITY
+)
 
 # AWS / ECS profile. These knobs are optional — when none of them are
 # set the API runs the PoC profile (``LocalFsCache`` + ``LanDiscovery``

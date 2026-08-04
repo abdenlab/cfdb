@@ -315,10 +315,16 @@ async def lifespan(_: FastAPI):
             # the three cert-path env vars. None (all unset) keeps the
             # plaintext PoC path; a partial config raises here so a
             # half-wired channel can't silently fall back to plaintext.
+            #
+            # The identity makes the worker cert verifiable at all: every
+            # profile dials workers at addresses assigned at launch, so
+            # without it the handshake would check the cert against an
+            # awsvpc or bridge IP no static SAN can name.
             worker_credentials = build_worker_credentials(
                 api.CFDB_WORKER_TLS_CA,
                 api.CFDB_WORKER_TLS_CERT,
                 api.CFDB_WORKER_TLS_KEY,
+                identity=api.CFDB_WORKER_TLS_IDENTITY,
             )
 
             async with _build_discovery(profile) as discovery:
@@ -375,13 +381,26 @@ async def lifespan(_: FastAPI):
                     log.info(
                         "Workflow subsystem enabled: profile=%s cache=%s "
                         "workdir=%s discovery=%s provisioner=%s "
-                        "worker_mtls=%s",
+                        "worker_mtls=%s worker_tls_identity=%s",
                         profile.kind,
                         type(api.cache).__name__,
                         profile.workdir_root,
                         type(discovery).__name__,
                         "EcsProvisioner" if provisioner is not None else "none",
                         "enabled" if worker_credentials is not None else "disabled",
+                        # Records what the API will match a worker
+                        # certificate against, so a handshake rejected
+                        # for the wrong expected name is diagnosable
+                        # without shelling into a Fargate task. wool
+                        # itself logs the failure and its gRPC cause at
+                        # WARNING under ``wool.runtime.worker.proxy``;
+                        # this line says what was expected, not what
+                        # went wrong. Reported as n/a rather than as a
+                        # name when mTLS is off, since the setting has
+                        # no effect without credentials.
+                        (api.CFDB_WORKER_TLS_IDENTITY or "<address>")
+                        if worker_credentials is not None
+                        else "n/a",
                     )
                     # Stack each teardown step as an async callback so a
                     # failure earlier in the chain (e.g. ``drain`` raises
