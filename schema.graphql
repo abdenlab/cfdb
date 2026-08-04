@@ -511,6 +511,7 @@ type Query {
   files(input: [FileMetadataInput!] = null, page: Int! = 0, pageSize: Int! = 25): FileList!
   file(id: ObjectIdScalar!): FileMetadataType
   distinctValues(fields: [String!]!, input: [FileMetadataInput!] = null): [DistinctFieldType!]!
+  fileCount(input: [FileMetadataInput!] = null): Int!
 }
 
 input SubjectInput {

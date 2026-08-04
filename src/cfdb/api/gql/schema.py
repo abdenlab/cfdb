@@ -161,5 +161,19 @@ class Query:
             for field, values in zip(fields, all_values)
         ]
 
+    @strawberry.field
+    async def file_count(
+        self,
+        _: strawberry.Info,
+        input: list[FileMetadataInput] | None = None,
+    ) -> int:
+        # Wait for any database cutover to complete
+        await locks.wait_for_cutover()
+
+        assert api.db is not None
+        query = to_query(to_dict(input)) if input else {}
+
+        return await api.db.files.count_documents(query)
+
 
 schema = strawberry.Schema(query=Query)
