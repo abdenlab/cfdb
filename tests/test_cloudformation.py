@@ -194,3 +194,288 @@ def test_backend_per_environment_parameters_should_be_documented():
         assert parameters[name].get("Description", "").strip(), (
             f"{name} needs a Description marking it as a per-environment value"
         )
+
+
+def test_worker_task_role_should_allow_the_worker_to_tag_its_own_task():
+    """Test that the worker task role can publish its metadata.
+
+    Given:
+        The workers template, whose container publishes its wool version
+        and TLS flag by tagging its own ECS task.
+    When:
+        The worker task role's policies are read.
+    Then:
+        They should grant ``ecs:TagResource``, without which the worker
+        exits at startup and EcsDiscovery never advertises a worker.
+    """
+    # Arrange
+    template = _load_template("workers.yml")
+
+    # Act
+    policies = template["Resources"]["WorkerTaskRole"]["Properties"]["Policies"]
+    actions = [
+        statement.get("Action")
+        for policy in policies
+        for statement in policy["PolicyDocument"]["Statement"]
+    ]
+
+    # Assert
+    assert "ecs:TagResource" in actions
+
+
+def test_worker_tag_grant_should_be_scoped_to_the_cluster_and_wool_keys():
+    """Test that the tagging grant cannot reach the other environment.
+
+    Given:
+        The workers template's ecs:TagResource statement. These tags are
+        load-bearing — discovery trusts them to build the metadata wool
+        gates admission on — and dev and prod share the account and
+        region, so an account-wide grant would let a compromised dev
+        worker rewrite prod's tags and silently empty its pool.
+    When:
+        The statement's Resource and Condition are read.
+    Then:
+        The Resource should be confined to the parameterized cluster
+        (not a bare ``task/*``) and the Condition should confine the
+        writable keys to exactly the two ``wool.*`` tags.
+    """
+    # Arrange
+    template = _load_template("workers.yml")
+    policies = template["Resources"]["WorkerTaskRole"]["Properties"]["Policies"]
+
+    # Act
+    statement = next(
+        statement
+        for policy in policies
+        for statement in policy["PolicyDocument"]["Statement"]
+        if statement.get("Action") == "ecs:TagResource"
+    )
+    resource_template = statement["Resource"]["Fn::Sub"]
+    tag_keys = statement["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"]
+
+    # Assert
+    assert "task/${BackendClusterName}/*" in resource_template
+    assert "task/*" not in resource_template.replace(
+        "task/${BackendClusterName}/*", ""
+    )
+    assert sorted(tag_keys) == ["wool.secure", "wool.version"]
+    assert "BackendClusterName" in (template.get("Parameters") or {})
+
+
+def test_worker_container_should_declare_aws_region():
+    """Test that the worker container is told its region.
+
+    Given:
+        The workers template's container definition. The worker's
+        metadata publish builds a boto3 client, and Fargate injects no
+        region — without this variable (or the code-side ARN fallback)
+        every worker exits at startup with NoRegionError and the fleet
+        stays empty.
+    When:
+        The container's Environment entries are read.
+    Then:
+        ``AWS_REGION`` should be present and derive from the stack's
+        own region, mirroring the backend container.
+    """
+    # Arrange
+    template = _load_template("workers.yml")
+    container = template["Resources"]["WorkerTaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    plain_env = {
+        entry["Name"]: entry.get("Value")
+        for entry in container["Environment"]
+        if isinstance(entry, dict) and "Name" in entry
+    }
+
+    # Assert
+    assert plain_env.get("AWS_REGION") == {"Ref": "AWS::Region"}
+
+
+def test_worker_tls_identity_should_only_render_when_mtls_is_enabled():
+    """Test that the worker identity env var is gated on mTLS.
+
+    Given:
+        The workers template's container definition and its
+        WorkerTlsIdentity parameter — the worker's half of identity
+        verification on wool's graceful-stop channel.
+    When:
+        The conditional Environment entry is read.
+    Then:
+        ``CFDB_WORKER_TLS_IDENTITY`` should render under the
+        WorkerMtlsEnabled condition and reference the parameter, so the
+        plaintext template stays unchanged while an mTLS deployment can
+        align the worker with the backend stack's identity.
+    """
+    # Arrange
+    template = _load_template("workers.yml")
+    container = template["Resources"]["WorkerTaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    conditional = next(
+        entry["Fn::If"]
+        for entry in container["Environment"]
+        if isinstance(entry, dict) and "Fn::If" in entry
+    )
+    condition_name, enabled_value, disabled_value = conditional
+
+    # Assert
+    assert condition_name == "WorkerMtlsEnabled"
+    assert enabled_value == {
+        "Name": "CFDB_WORKER_TLS_IDENTITY",
+        "Value": {"Ref": "WorkerTlsIdentity"},
+    }
+    assert disabled_value == {"Ref": "AWS::NoValue"}
+
+
+def test_worker_tls_identity_defaults_should_agree_across_both_stacks():
+    """Test that the two templates cannot drift on the identity default.
+
+    Given:
+        The WorkerTlsIdentity parameters of the backend and workers
+        templates. The API verifies the worker leaf's SAN against the
+        backend value; the worker verifies the same SAN on its own
+        graceful-stop channel via the workers value.
+    When:
+        Both defaults are compared to the application constant.
+    Then:
+        All three should be equal — a drift between them fails only at
+        runtime, as a force-reaped worker losing in-flight work, with
+        no TLS error anywhere client-side.
+    """
+    # Arrange
+    from cfdb.workflows.constants import DEFAULT_TLS_IDENTITY
+
+    backend = _load_template("backend.yml")["Parameters"]["WorkerTlsIdentity"]
+    workers = _load_template("workers.yml")["Parameters"]["WorkerTlsIdentity"]
+
+    # Act & assert
+    assert backend["Default"] == DEFAULT_TLS_IDENTITY
+    assert workers["Default"] == DEFAULT_TLS_IDENTITY
+
+
+def test_worker_tls_identity_pattern_should_reject_ip_literals():
+    """Test that the identity patterns reject what cannot be a SAN.
+
+    Given:
+        The identical AllowedPattern on both templates' WorkerTlsIdentity
+        parameters. The cert generator refuses an IP-literal identity
+        because it would mint DNS:<ip>, which gRPC never matches against
+        an address — so the deploy boundary must refuse it too, or the
+        one symptom is NoWorkersAvailable.
+    When:
+        The pattern is evaluated against representative values.
+    Then:
+        It should accept DNS-safe names (with at least one letter, in
+        any position) and the empty opt-out, and reject IP literals,
+        all-numeric names, and separator-edged names.
+    """
+    # Arrange
+    import re
+
+    backend = _load_template("backend.yml")["Parameters"]["WorkerTlsIdentity"]
+    workers = _load_template("workers.yml")["Parameters"]["WorkerTlsIdentity"]
+    pattern = re.compile(backend["AllowedPattern"])
+
+    # Act & assert
+    assert backend["AllowedPattern"] == workers["AllowedPattern"]
+    for accepted in ("", "cfdb-worker", "a.b-c", "9lives", "cfdb-worker-prod"):
+        assert pattern.fullmatch(accepted), f"{accepted!r} should be accepted"
+    for rejected in ("10.0.0.5", "1.2.3.4", "1234", ".abc", "abc.", "-a", "a b"):
+        assert not pattern.fullmatch(rejected), f"{rejected!r} should be rejected"
+
+
+def test_cert_generator_default_identity_should_match_the_application_default():
+    """Test that the cert script and the code agree on the default identity.
+
+    Given:
+        The ``IDENTITY=`` default in certs/generate-worker-certs.sh —
+        the value that decides what SAN locally-minted worker leaves
+        actually carry.
+    When:
+        The default is extracted from the script source.
+    Then:
+        It should equal DEFAULT_TLS_IDENTITY, because a drift means the
+        API verifies against a name the certificates do not carry, and
+        the only symptom is NoWorkersAvailable.
+    """
+    # Arrange
+    import re
+
+    from cfdb.workflows.constants import DEFAULT_TLS_IDENTITY
+
+    script = (
+        Path(__file__).resolve().parents[1] / "certs" / "generate-worker-certs.sh"
+    ).read_text()
+
+    # Act
+    match = re.search(r'^IDENTITY="([^"]*)"', script, flags=re.MULTILINE)
+
+    # Assert
+    assert match is not None, "IDENTITY= default not found in the script"
+    assert match.group(1) == DEFAULT_TLS_IDENTITY
+
+
+def test_backend_worker_tls_identity_should_match_the_application_default():
+    """Test that the template and the code agree on the default identity.
+
+    Given:
+        The backend template's WorkerTlsIdentity parameter and the
+        application constant the API reads.
+    When:
+        The parameter's default is compared to DEFAULT_TLS_IDENTITY.
+    Then:
+        They should be equal — a drift means the API expects a name the
+        deployed certificates do not carry, and every handshake fails
+        with nothing in the error naming TLS.
+    """
+    # Arrange
+    from cfdb.workflows.constants import DEFAULT_TLS_IDENTITY
+
+    template = _load_template("backend.yml")
+
+    # Act
+    parameter = template["Parameters"]["WorkerTlsIdentity"]
+
+    # Assert
+    assert parameter["Default"] == DEFAULT_TLS_IDENTITY
+
+
+def test_backend_worker_tls_identity_should_only_render_when_mtls_is_enabled():
+    """Test that the identity env var is gated on the mTLS condition.
+
+    Given:
+        The backend template's API container definition.
+    When:
+        Its Environment entries are searched for the identity variable.
+    Then:
+        It should appear inside an Fn::If over ApiMtlsEnabled, so a
+        plaintext deployment does not advertise a setting that has no
+        effect.
+    """
+    # Arrange
+    template = _load_template("backend.yml")
+    container = template["Resources"]["TaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    conditional = [
+        entry
+        for entry in container["Environment"]
+        if isinstance(entry, dict) and "Fn::If" in entry
+    ]
+
+    # Assert
+    identity_entries = [
+        entry
+        for entry in conditional
+        if entry["Fn::If"][0] == "ApiMtlsEnabled"
+        and entry["Fn::If"][1].get("Name") == "CFDB_WORKER_TLS_IDENTITY"
+    ]
+    assert len(identity_entries) == 1
+    assert identity_entries[0]["Fn::If"][1]["Value"] == {"Ref": "WorkerTlsIdentity"}
