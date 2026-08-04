@@ -22,7 +22,7 @@ dependencies = [
     "requests",
     "strawberry-graphql",
     "uvicorn",
-    "wool==0.9.3",
+    "wool==0.12.0",
 ]
 description = "A Python utility for parsing and normalizing various DCC datapackages."
 dynamic = ["version"]
