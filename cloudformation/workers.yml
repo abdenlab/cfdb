@@ -74,12 +74,13 @@ Parameters:
   # PEM). Leave all three empty (default) to run the channel plaintext —
   # the worker SG is the only access control in that case.
   #
-  # NOTE: enforced mTLS over the ECS path is currently blocked upstream:
-  # EcsDiscovery dials the worker at its dynamic awsvpc IP and wool does
-  # not override the gRPC authority, so a static worker cert's SAN cannot
-  # match the dialed IP. Populating these turns the channel on but the
-  # handshake will not validate until wool gains a target-name override.
-  # Keep empty until then.
+  # The worker leaf cert MUST carry the backend stack's
+  # WorkerTlsIdentity as a SAN. EcsDiscovery reaches each worker at the
+  # awsvpc IP assigned at launch, so the API verifies against that
+  # logical name rather than the dialed address; a cert without the SAN
+  # fails the handshake. certs/generate-worker-certs.sh mints it by
+  # default. There is no identity parameter on this stack — the worker
+  # is the TLS server, and its half of the arrangement is the SAN.
   WorkerTlsCaSecretArn:
     Type: String
     Default: ""
