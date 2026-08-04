@@ -7,23 +7,35 @@ than maintaining a parallel registry. ``EcsDiscovery`` implements Wool's
 
 1. ``ecs.list_tasks`` enumerates every task in the cluster matching the
    worker task family with ``desiredStatus="RUNNING"``.
-2. ``ecs.describe_tasks`` (batched 100 ARNs at a time) hydrates each
-   into its full state, including ``healthStatus`` and ``attachments``.
-3. We filter for ``lastStatus == "RUNNING"`` and (where reported)
-   ``healthStatus == "HEALTHY"`` — tasks whose container definition
-   omits a ``healthCheck`` are accepted as healthy so a deployment that
-   hasn't yet wired up health checks still surfaces workers.
+2. ``ecs.describe_tasks`` (batched 100 ARNs at a time, with
+   ``include=["TAGS"]``) hydrates each into its full state, including
+   ``healthStatus``, ``attachments``, and the tags the worker published.
+3. We filter for ``lastStatus == "RUNNING"``, ``healthStatus ==
+   "HEALTHY"``, and the presence of the worker's own published metadata.
 4. The poller diffs the resolved set against the previous one and
    publishes ``worker-added`` / ``worker-dropped`` events to a Wool
    ``DiscoveryPublisherLike``.
 
-The worker side does nothing for discovery — no heartbeat thread, no
-Mongo write, no registration RPC. ECS reports ``healthStatus: HEALTHY``
-once the container's health check passes, which is the "ready to
-dispatch" signal the discovery filters on. The worker task definition
-MUST declare a ``healthCheck`` against the gRPC port; without one
-ECS reports ``healthStatus: UNKNOWN`` indefinitely and the worker is
-never advertised.
+**Where the metadata comes from.** ECS can report an address and a
+health status; it cannot report what is running inside the container.
+Two fields of :class:`wool.WorkerMetadata` are knowable only to the
+worker process — the wool protocol version it runs and whether it
+configured TLS — and wool gates worker admission on both, so a value
+this module invented for them would be a value that silently rejects
+the whole fleet (issue #90). The worker therefore publishes what it
+knows: it tags its own ECS task with the metadata wool authored for it
+(see :mod:`cfdb.workflows.worker_main`), and this poller reads those
+tags back off the task it is already describing. ECS supplies liveness;
+the worker supplies identity.
+
+A consequence worth stating: a task can be ``RUNNING`` and ``HEALTHY``
+for a moment before its tags land. Such a task is deliberately **not**
+advertised — "hasn't published yet" is not the same as "has default
+metadata", and conflating them is the bug this arrangement fixes.
+
+The worker task definition MUST declare a ``healthCheck`` against the
+gRPC port; without one ECS reports ``healthStatus: UNKNOWN``
+indefinitely and the worker is never advertised.
 """
 
 from __future__ import annotations
@@ -44,7 +56,13 @@ from wool.runtime.discovery.base import (
     WorkerMetadata,
 )
 
-from cfdb.workflows.constants import DEFAULT_WORKER_PORT
+from cfdb.workflows.constants import (
+    DEFAULT_WORKER_PORT,
+    WORKER_TAG_SECURE,
+    WORKER_TAG_TRUE,
+    WORKER_TAG_VERSION,
+)
+from cfdb.workflows.grpc_options import worker_grpc_options
 from cfdb.workflows.provisioner import build_ecs_client
 
 logger = logging.getLogger(__name__)
@@ -57,6 +75,11 @@ _DESCRIBE_BATCH_SIZE = 100
 #: page "Rate of cluster resource read API calls"). 5s leaves ample
 #: headroom for many concurrent clusters.
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+
+#: Minimum spacing between "tasks exist but none advertisable"
+#: warnings, so a persistently unpublished fleet logs once a minute
+#: rather than once per 5 s poll.
+_UNRESOLVED_WARNING_INTERVAL_S = 60.0
 
 
 class EcsDiscovery(Discovery):
@@ -77,8 +100,12 @@ class EcsDiscovery(Discovery):
         worker_port: gRPC port the worker binds — used to construct
             the address string passed to Wool. Shares the worker_main
             default so a deployment that changes one changes both.
-        version: Wool worker version string passed through into
-            ``WorkerMetadata``. Free-form; useful for filtering.
+
+    There is deliberately no ``version`` parameter. It existed, defaulted
+    to ``"0"``, and was passed straight into ``WorkerMetadata`` — where
+    wool reads it as the protocol version and rejects any worker failing
+    ``client <= server``, which ``"0"`` always does. The version now comes
+    from the task tag the worker publishes; see the module docstring.
 
     Lifecycle: enter ``async with EcsDiscovery(...)`` to start the
     background poller. Exiting the context cancels the poller and
@@ -95,7 +122,6 @@ class EcsDiscovery(Discovery):
         region_name: Optional[str] = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         worker_port: int = DEFAULT_WORKER_PORT,
-        version: str = "0",
     ) -> None:
         if not cluster:
             raise ValueError("EcsDiscovery requires a cluster name")
@@ -123,10 +149,26 @@ class EcsDiscovery(Discovery):
         )
         self._poll_interval = poll_interval
         self._worker_port = worker_port
-        self._version = version
 
         self._subscribers: list[_EcsSubscriber] = []
         self._known: dict[str, WorkerMetadata] = {}
+        #: Last successfully-read metadata tags per worker uid (hex),
+        #: as ``(version, secure)``. ECS resource tags are read through
+        #: a secondary ``include=["TAGS"]`` lookup that is not
+        #: documented as strongly consistent, so a single describe
+        #: response can transiently omit tags a task has already
+        #: published. Falling back to the last-known values keeps an
+        #: already-advertised worker in the pool — mirroring this
+        #: module's retain-on-transient-failure posture for the
+        #: list/describe calls themselves — while "never seen
+        #: published" remains unadvertised (see ``_task_to_metadata``).
+        #: Pruned alongside ``_known`` so entries age out with the task.
+        self._published: dict[str, tuple[str, bool]] = {}
+        #: Monotonic timestamp of the last none-resolved warning, so a
+        #: persistently unpublished fleet logs once a minute rather
+        #: than once per poll. ``-inf`` fires the first warning
+        #: immediately.
+        self._last_unresolved_warning = float("-inf")
         self._poll_task: Optional[asyncio.Task[None]] = None
         #: Guards ``_subscribers`` / ``_known`` / ``_closed`` and the
         #: sentinel-push fan-out during ``__aexit__``. Held only
@@ -180,6 +222,7 @@ class EcsDiscovery(Discovery):
             "_poll_task",
             "_subscribers",
             "_known",
+            "_published",
             "_closed",
         ):
             state.pop(transient, None)
@@ -212,6 +255,7 @@ class EcsDiscovery(Discovery):
             )
         self._subscribers = []
         self._known = {}
+        self._published = {}
         self._poll_task = None
         self._closed = False
         self._state_lock = asyncio.Lock()
@@ -350,6 +394,32 @@ class EcsDiscovery(Discovery):
                     metadata = self._task_to_metadata(task)
                     if metadata is not None:
                         resolved[str(metadata.uid)] = metadata
+                if tasks and not resolved:
+                    # Tasks exist but none is advertisable. Individually
+                    # each cause is deliberate silence (unhealthy tasks
+                    # are visible in the ECS console, unpublished ones
+                    # are a startup window) — but a *fleet-wide* zero is
+                    # the signature of a systemic failure the console
+                    # does not show: an old worker image, a missing
+                    # ecs:TagResource grant, a tag-key rename on one
+                    # side. Warn (rate-limited) so the incident is a
+                    # grep instead of a bisect; the API-side symptom is
+                    # otherwise just NoWorkersAvailable.
+                    now = asyncio.get_running_loop().time()
+                    if (
+                        now - self._last_unresolved_warning
+                        >= _UNRESOLVED_WARNING_INTERVAL_S
+                    ):
+                        self._last_unresolved_warning = now
+                        logger.warning(
+                            "EcsDiscovery: %d task(s) in cluster=%s but none "
+                            "advertisable (not RUNNING+HEALTHY, or metadata "
+                            "tags never published). If this persists, check "
+                            "the worker task logs and the ecs:TagResource "
+                            "grant.",
+                            len(tasks),
+                            self._cluster,
+                        )
 
             # Diff, mutate, and dispatch under ``self._state_lock`` so a
             # concurrent ``_register_subscriber`` cannot replay a
@@ -363,6 +433,16 @@ class EcsDiscovery(Discovery):
             async with self._state_lock:
                 events = list(_diff(self._known, resolved))
                 self._known = resolved
+                # Age the sticky metadata cache out with the fleet: a
+                # uid absent from this cycle's resolved set is a task
+                # that is gone (or fell unhealthy), not one suffering a
+                # transient tag miss — those were just resolved *via*
+                # the cache and so appear in ``resolved``.
+                self._published = {
+                    uid: published
+                    for uid, published in self._published.items()
+                    if uid in resolved
+                }
                 if events:
                     for sub in self._subscribers:
                         for event in events:
@@ -416,13 +496,19 @@ class EcsDiscovery(Discovery):
         return arns
 
     def _describe_tasks_batched(self, arns: list[str]) -> list[dict[str, Any]]:
-        """Call ``DescribeTasks`` in batches of ``_DESCRIBE_BATCH_SIZE``."""
+        """Call ``DescribeTasks`` in batches of ``_DESCRIBE_BATCH_SIZE``.
+
+        ``include=["TAGS"]`` is required: without it ECS omits ``tags``
+        from the response entirely, every task reads as unpublished, and
+        no worker is ever advertised.
+        """
         out: list[dict[str, Any]] = []
         for i in range(0, len(arns), _DESCRIBE_BATCH_SIZE):
             batch = arns[i : i + _DESCRIBE_BATCH_SIZE]
             response = self._client.describe_tasks(
                 cluster=self._cluster,
                 tasks=batch,
+                include=["TAGS"],
             )
             out.extend(response.get("tasks") or [])
         return out
@@ -430,13 +516,18 @@ class EcsDiscovery(Discovery):
     def _task_to_metadata(self, task: dict[str, Any]) -> Optional[WorkerMetadata]:
         """Convert an ECS task description to a Wool ``WorkerMetadata``.
 
-        Returns None when the task is not RUNNING + HEALTHY or we
-        cannot extract a usable IP address. Worker task definitions
-        MUST declare a ``healthCheck``; tasks without one surface as
+        Returns None when the task is not RUNNING + HEALTHY, when we
+        cannot extract a usable IP address, or when the worker has not
+        yet published its metadata tags. Worker task definitions MUST
+        declare a ``healthCheck``; tasks without one surface as
         ``healthStatus: UNKNOWN`` and are filtered out, since their
         gRPC readiness is unknowable. Tasks whose ``healthStatus`` is
         absent from the describe-tasks response are also filtered —
         same reason.
+
+        The version and secure flag come from the task's tags rather
+        than from anything this module knows, because only the worker
+        process knows them; see the module docstring.
         """
         if task.get("lastStatus") != "RUNNING":
             return None
@@ -461,12 +552,49 @@ class EcsDiscovery(Discovery):
             uid = uuid.UUID(task_id)
         except (ValueError, AttributeError):
             uid = uuid.uuid5(uuid.NAMESPACE_URL, task_arn)
+        uid_key = str(uid)
+
+        tags = _extract_tags(task)
+        version = tags.get(WORKER_TAG_VERSION)
+        if version:
+            secure = (
+                tags.get(WORKER_TAG_SECURE, "").strip().lower() == WORKER_TAG_TRUE
+            )
+            self._published[uid_key] = (version, secure)
+        elif uid_key in self._published:
+            # This task has published before, so an absent tag here is a
+            # transient of the ``include=["TAGS"]`` secondary lookup —
+            # not the pre-publish window. Fall back to the last-read
+            # values instead of flapping an already-advertised worker
+            # out of the pool (metadata is written once at startup and
+            # never changes, so the cache cannot go stale).
+            version, secure = self._published[uid_key]
+        else:
+            # Healthy but not yet published — the window between the
+            # container passing its health check and its TagResource
+            # call landing. Advertising it now would mean advertising
+            # metadata we invented, which is precisely what wool's
+            # admission gate then rejects.
+            return None
 
         return WorkerMetadata(
             uid=uid,
             address=f"{ip}:{self._worker_port}",
+            # The worker's real pid is meaningless to the API — it names
+            # a process in another container — and nothing reads it, so
+            # it is left at 0 rather than published. ``version`` and
+            # ``secure`` are different: wool gates admission on both.
             pid=0,
-            version=self._version,
+            version=version,
+            secure=secure,
+            # Channel options are the third worker-authored field, but
+            # unlike version/secure they need no tag: the API and the
+            # worker ship from the same image tag and import the same
+            # module, so one shared definition keeps the dispatch
+            # channel's keepalive cadence (see grpc_options) in
+            # lockstep without serializing a rich object into a
+            # 256-char tag value.
+            options=worker_grpc_options().channel,
         )
 
     async def _register_subscriber(self, sub: "_EcsSubscriber") -> None:
@@ -668,6 +796,25 @@ class _RaisingPublisher:
         raise RuntimeError(
             "EcsDiscovery is read-only — workers register implicitly via ECS"
         )
+
+
+def _extract_tags(task: dict[str, Any]) -> dict[str, str]:
+    """Flatten a task's ``tags`` list into a ``{key: value}`` mapping.
+
+    ECS returns tags as ``[{"key": ..., "value": ...}, ...]``, and omits
+    the field entirely both when the task has no tags and when
+    ``DescribeTasks`` was called without ``include=["TAGS"]``. Entries
+    missing a key are skipped rather than raising — a malformed tag
+    should cost one worker, not the whole poll cycle.
+    """
+    tags: dict[str, str] = {}
+    for tag in task.get("tags") or ():
+        if not isinstance(tag, dict):
+            continue
+        key = tag.get("key")
+        if key:
+            tags[key] = tag.get("value") or ""
+    return tags
 
 
 def _extract_eni_ip(task: dict[str, Any]) -> Optional[str]:

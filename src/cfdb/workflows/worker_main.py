@@ -6,9 +6,21 @@ the ECS health check probes, handles SIGTERM cleanly so ``ecs.stop_task``
 cycles drain in-flight work, and self-terminates after a configurable
 maximum lifetime so workers don't accumulate when the dispatch rate falls.
 
-No discovery registration code lives here. ``EcsDiscovery`` polls ECS's
-own task state to surface running workers; the worker only needs to
-bind its gRPC port and respond ``200 OK`` to the health probe.
+ECS owns the worker *lifecycle* — registration, IP, status, health — and
+``EcsDiscovery`` polls it for all of that. But two fields of the wool
+``WorkerMetadata`` the API needs are knowable only in here: the wool
+protocol version this process runs, and whether it configured TLS. wool
+gates worker admission on both, so a value the API invented for them is
+a value that silently rejects the whole fleet (issue #90). After the
+worker starts, this module therefore publishes what wool authored for it
+(``LocalWorker.metadata``) onto its own ECS task as tags, which
+``EcsDiscovery`` reads back. ECS supplies liveness; the worker supplies
+identity.
+
+Publishing is skipped outside ECS — ``ECS_CONTAINER_METADATA_URI_V4``
+is injected only into Fargate tasks — so running this module locally is
+unaffected, and the LAN path (:mod:`cfdb.workflows.worker_lan`) uses
+wool's own publisher instead.
 
 Environment variables (single source of truth; CLI flags mirror them):
 
@@ -22,12 +34,17 @@ Environment variables (single source of truth; CLI flags mirror them):
 * ``CFDB_WORKER_DRAIN_GRACE_SECONDS`` — how long ``/health`` returns
   503 after SIGTERM before tearing down the gRPC port. A second
   SIGTERM short-circuits.
+* ``CFDB_WORKER_PUBLISH_ATTEMPTS`` — attempts to publish metadata
+  before giving up and exiting (default 5).
+* ``CFDB_WORKER_PUBLISH_BACKOFF_SECONDS`` — base of the exponential
+  backoff between publish attempts (default 0.5).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
@@ -37,9 +54,15 @@ import wool
 
 from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
 from cfdb.workflows.backpressure import backpressure_for
-from cfdb.workflows.constants import DEFAULT_WORKER_PORT
-from cfdb.workflows.credentials import build_worker_credentials
+from cfdb.workflows.constants import (
+    DEFAULT_WORKER_PORT,
+    WORKER_TAG_SECURE,
+    WORKER_TAG_TRUE,
+    WORKER_TAG_VERSION,
+)
+from cfdb.workflows.credentials import build_worker_credentials, identity_from_env
 from cfdb.workflows.grpc_options import worker_grpc_options
+from cfdb.workflows.provisioner import _is_retryable_error, build_ecs_client
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -81,6 +104,229 @@ DEFAULT_DRAIN_GRACE_SECONDS = 120.0
 #: (SIGTERM-on-stop_task, ~hours-scale max-lifetime) don't need it.
 _STOP_POLL_INTERVAL_SECONDS = 1.0
 
+#: Env var ECS injects into every Fargate task (platform 1.4.0+). Its
+#: absence is how this module tells "running on ECS" from "running on a
+#: laptop", and it is the only signal needed — no profile flag.
+_ECS_METADATA_URI_ENV = "ECS_CONTAINER_METADATA_URI_V4"
+
+#: Default attempts to publish metadata before giving up. ``TagResource``
+#: shares the ECS API's account-wide rate limit, and the task metadata
+#: endpoint is busiest during exactly the cold-start burst that spawns
+#: workers — so a burst of simultaneous starts can throttle a few;
+#: retrying costs a few seconds and saves a task that would otherwise be
+#: discarded. Overridable via ``CFDB_WORKER_PUBLISH_ATTEMPTS``.
+DEFAULT_PUBLISH_ATTEMPTS = 5
+
+#: Default base of the exponential backoff between publish attempts, in
+#: seconds. Overridable via ``CFDB_WORKER_PUBLISH_BACKOFF_SECONDS``.
+DEFAULT_PUBLISH_BACKOFF_SECONDS = 0.5
+
+#: How long to wait on the task metadata endpoint. It is a link-local
+#: HTTP server in the same task, so a slow response means something is
+#: wrong rather than merely busy.
+_METADATA_TIMEOUT_SECONDS = 5.0
+
+
+async def _task_arn() -> Optional[str]:
+    """Return this task's ARN from the ECS metadata endpoint, or None.
+
+    None means the worker is not running on ECS, which is the normal
+    case for local development. A malformed or unreachable endpoint
+    while the env var *is* set raises instead — that is a broken task,
+    not a laptop.
+    """
+    base = os.getenv(_ECS_METADATA_URI_ENV)
+    if not base:
+        return None
+
+    from aiohttp import ClientSession, ClientTimeout
+
+    timeout = ClientTimeout(total=_METADATA_TIMEOUT_SECONDS)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.get(f"{base.rstrip('/')}/task") as response:
+            response.raise_for_status()
+            # The endpoint serves application/json but has historically
+            # been served with a text content type; don't let aiohttp's
+            # content-type check reject a valid body.
+            payload = await response.json(content_type=None)
+
+    arn = payload.get("TaskARN")
+    if not arn:
+        raise RuntimeError(
+            "ECS task metadata endpoint returned no TaskARN; cannot "
+            "publish worker metadata"
+        )
+    return arn
+
+
+def _region_from_arn(arn: str) -> Optional[str]:
+    """Return the region segment of an ECS task ARN, or None.
+
+    ``arn:aws:ecs:us-east-2:...:task/<cluster>/<id>`` — the fourth
+    colon-delimited field. Used as the region fallback when
+    ``AWS_REGION`` is unset in the environment: the ARN names the
+    region the task actually runs in, so it cannot drift from the
+    resource being tagged, and it makes publishing independent of the
+    task definition's env block (see the readiness discussion in
+    ``_publish_worker_metadata``).
+    """
+    parts = arn.split(":")
+    if len(parts) > 4 and parts[3]:
+        return parts[3]
+    return None
+
+
+def _is_access_denied(exc: BaseException) -> bool:
+    """Return True when an ECS error is an authorization failure."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = (response.get("Error") or {}).get("Code")
+        return code in ("AccessDeniedException", "AccessDenied")
+    return False
+
+
+def _is_retryable_publish_error(exc: BaseException) -> bool:
+    """Return True when a publish failure is worth another attempt.
+
+    The publish path crosses two boundaries with distinct failure
+    vocabularies: the link-local task metadata endpoint (aiohttp
+    errors, timeouts — throttled or busy during a cold-start burst)
+    and the ECS control plane (botocore errors, classified by the
+    provisioner's shared :func:`_is_retryable_error`). Authorization
+    failures are permanent by definition and are excluded so a missing
+    ``ecs:TagResource`` grant fails in one attempt with a message
+    naming the fix, rather than after the full backoff budget.
+    """
+    if _is_access_denied(exc):
+        return False
+    from aiohttp import ClientError
+
+    if isinstance(exc, (ClientError, asyncio.TimeoutError)):
+        return True
+    return _is_retryable_error(exc)
+
+
+async def _publish_worker_metadata(
+    worker: "wool.LocalWorker",
+    *,
+    stop_event: Optional[asyncio.Event] = None,
+    attempts: int = DEFAULT_PUBLISH_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_PUBLISH_BACKOFF_SECONDS,
+) -> None:
+    """Publish this worker's wool metadata onto its own ECS task tags.
+
+    ``EcsDiscovery`` reads these back to build the ``WorkerMetadata`` it
+    advertises. Only the fields it cannot otherwise know are published:
+    the wool protocol version and the TLS flag, both of which wool's
+    admission gate tests (see the module docstring).
+
+    Returns without doing anything when not running on ECS, and returns
+    early (without publishing) when ``stop_event`` is set mid-retry —
+    the worker is exiting anyway, so becoming discoverable would only
+    invite a dispatch it cannot honor.
+
+    Every step that can fail transiently — the task-metadata fetch, the
+    client construction, and the ``TagResource`` call — sits inside the
+    retry loop, because all three share the same burst profile: a fleet
+    cold start is exactly when the metadata endpoint and the ECS API
+    are busiest. The region falls back to the task ARN's own region
+    segment when ``AWS_REGION`` is unset, so publishing works even if
+    the task definition's env block loses the variable.
+
+    Raises when the metadata cannot be published within ``attempts``
+    tries, or immediately on a permanent error (an ``AccessDenied``
+    from a missing ``ecs:TagResource`` grant). That is deliberate: a
+    worker whose metadata never lands is invisible to the API forever,
+    so it would hold a Fargate slot and count against
+    ``ECS_MAX_WORKERS`` while being incapable of receiving work.
+    Exiting frees both immediately and the provisioner launches a
+    replacement on the next dispatch; standalone ``RunTask`` tasks are
+    not restarted, so there is no crash-loop.
+    """
+    if not os.getenv(_ECS_METADATA_URI_ENV):
+        logger.debug(
+            "%s unset — not running on ECS, skipping metadata publish",
+            _ECS_METADATA_URI_ENV,
+        )
+        return
+
+    metadata = worker.metadata
+    if metadata is None:  # pragma: no cover — start() precedes this call
+        raise RuntimeError("Worker has no metadata; publish called before start")
+
+    tags = [
+        {"key": WORKER_TAG_VERSION, "value": metadata.version},
+        {
+            "key": WORKER_TAG_SECURE,
+            "value": WORKER_TAG_TRUE if metadata.secure else "false",
+        },
+    ]
+
+    arn: Optional[str] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            arn = await _task_arn()
+            assert arn is not None  # env var is set, so _task_arn cannot skip
+            client = build_ecs_client(
+                endpoint_url=os.getenv("AWS_ENDPOINT_URL"),
+                region_name=os.getenv("AWS_REGION") or _region_from_arn(arn),
+            )
+            # boto3 is synchronous; keep it off the event loop so the
+            # health server stays responsive while we retry.
+            await asyncio.to_thread(client.tag_resource, resourceArn=arn, tags=tags)
+        except Exception as exc:
+            if _is_access_denied(exc):
+                logger.error(
+                    "ecs:TagResource denied while publishing worker metadata "
+                    "to %s — the worker task role is missing the grant the "
+                    "workers stack (cloudformation/workers.yml) provides. "
+                    "Deploy the workers stack before shipping this image; "
+                    "this worker can never be discovered, exiting: %s",
+                    arn,
+                    exc,
+                )
+                raise
+            if attempt == attempts or not _is_retryable_publish_error(exc):
+                logger.error(
+                    "Failed to publish worker metadata to %s after %d attempt(s); "
+                    "this worker can never be discovered, exiting: %s",
+                    arn,
+                    attempt,
+                    exc,
+                )
+                raise
+            delay = backoff_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "Publishing worker metadata to %s failed (attempt %d/%d), "
+                "retrying in %.1fs: %s",
+                arn,
+                attempt,
+                attempts,
+                delay,
+                exc,
+            )
+            if stop_event is not None:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                if stop_event.is_set():
+                    logger.info(
+                        "Stop requested during metadata publish — abandoning "
+                        "publish and shutting down"
+                    )
+                    return
+            else:
+                await asyncio.sleep(delay)
+        else:
+            logger.info(
+                "Published worker metadata to %s (version %s, secure %s)",
+                arn,
+                metadata.version,
+                metadata.secure,
+            )
+            return
+
 
 async def serve(
     *,
@@ -91,6 +337,8 @@ async def serve(
     tls_ca: Optional[str] = None,
     tls_cert: Optional[str] = None,
     tls_key: Optional[str] = None,
+    publish_attempts: int = DEFAULT_PUBLISH_ATTEMPTS,
+    publish_backoff_seconds: float = DEFAULT_PUBLISH_BACKOFF_SECONDS,
 ) -> int:
     """Run the worker until SIGTERM or maximum lifetime elapses.
 
@@ -108,8 +356,20 @@ async def serve(
     worker requires mutual TLS (a CA-signed client certificate);
     unset leaves the gRPC channel plaintext. Partial cert config raises
     before the worker binds (see :func:`build_worker_credentials`).
+
+    The identity comes from the environment rather than a flag because
+    it is inert on the serving side — it applies only to the one channel
+    wool opens back to this worker's subprocess to drain it.
+
+    ``publish_attempts`` and ``publish_backoff_seconds`` bound the
+    metadata-publish retry loop (see ``_publish_worker_metadata``);
+    they are exposed here — like every other operational knob in this
+    module — so tests and operators configure the budget through the
+    public surface rather than by patching module state.
     """
-    credentials = build_worker_credentials(tls_ca, tls_cert, tls_key)
+    credentials = build_worker_credentials(
+        tls_ca, tls_cert, tls_key, identity=identity_from_env()
+    )
     stop_event = asyncio.Event()
     force_stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -157,6 +417,18 @@ async def serve(
     )
     await worker.start()
     try:
+        # Publish before entering the serve loop. The worker is already
+        # accepting gRPC by now, but until its tags land EcsDiscovery
+        # deliberately will not advertise it, so there is no window in
+        # which the API dispatches to a worker whose metadata is unknown.
+        # stop_event lets a SIGTERM landing mid-retry short-circuit the
+        # backoff and proceed straight to drain.
+        await _publish_worker_metadata(
+            worker,
+            stop_event=stop_event,
+            attempts=publish_attempts,
+            backoff_seconds=publish_backoff_seconds,
+        )
         logger.info(
             "Wool worker listening on port %d (health on %d, mTLS %s, "
             "max concurrent tasks %s)",
@@ -328,6 +600,22 @@ async def _shutdown_health_server(runner: Optional["web.AppRunner"]) -> None:
     default=None,
     help="Path to this worker's PEM private key.",
 )
+@click.option(
+    "--publish-attempts",
+    type=click.IntRange(min=1),
+    envvar="CFDB_WORKER_PUBLISH_ATTEMPTS",
+    default=DEFAULT_PUBLISH_ATTEMPTS,
+    show_default=True,
+    help="Attempts to publish worker metadata before exiting.",
+)
+@click.option(
+    "--publish-backoff-seconds",
+    type=click.FloatRange(min=0),
+    envvar="CFDB_WORKER_PUBLISH_BACKOFF_SECONDS",
+    default=DEFAULT_PUBLISH_BACKOFF_SECONDS,
+    show_default=True,
+    help="Base of the exponential backoff between publish attempts.",
+)
 def main(
     worker_port: int,
     health_port: int,
@@ -336,6 +624,8 @@ def main(
     tls_ca: Optional[str],
     tls_cert: Optional[str],
     tls_key: Optional[str],
+    publish_attempts: int,
+    publish_backoff_seconds: float,
 ) -> None:
     """ECS Fargate worker entrypoint — invoked by the container CMD.
 
@@ -355,6 +645,8 @@ def main(
                 tls_ca=tls_ca,
                 tls_cert=tls_cert,
                 tls_key=tls_key,
+                publish_attempts=publish_attempts,
+                publish_backoff_seconds=publish_backoff_seconds,
             )
         )
     )
