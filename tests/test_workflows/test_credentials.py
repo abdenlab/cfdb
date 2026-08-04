@@ -10,7 +10,6 @@ from cfdb.workflows.credentials import (
     TLS_CERT_ENV,
     TLS_KEY_ENV,
     build_worker_credentials,
-    worker_credentials_from_env,
 )
 
 
@@ -167,59 +166,114 @@ class TestBuildWorkerCredentials:
         # Assert
         assert from_files.call_args.kwargs["mutual"] is False
 
-
-class TestWorkerCredentialsFromEnv:
-    def test_worker_credentials_from_env_should_return_none_when_unset(
-        self, monkeypatch
+    def test_build_worker_credentials_should_return_plain_credentials_when_identity_unset(
+        self, tmp_path, mocker
     ):
-        """Test that an unconfigured environment yields plaintext.
+        """Test that omitting an identity leaves verification untouched.
 
         Given:
-            None of the ``CFDB_WORKER_TLS_*`` env vars are set.
+            Complete cert config and no identity.
         When:
-            ``worker_credentials_from_env`` is called.
+            ``build_worker_credentials`` is called.
         Then:
-            It should return None.
-        """
-        # Arrange
-        for var in (TLS_CA_ENV, TLS_CERT_ENV, TLS_KEY_ENV):
-            monkeypatch.delenv(var, raising=False)
-
-        # Act
-        result = worker_credentials_from_env()
-
-        # Assert
-        assert result is None
-
-    def test_worker_credentials_from_env_should_read_the_env_vars(
-        self, tmp_path, monkeypatch, mocker
-    ):
-        """Test that the builder reads cert paths from the environment.
-
-        Given:
-            The three ``CFDB_WORKER_TLS_*`` env vars point at existing
-            files.
-        When:
-            ``worker_credentials_from_env`` is called.
-        Then:
-            It should delegate to ``wool.WorkerCredentials.from_files``
-            with the env-supplied paths.
+            It should return wool's credentials unadapted, so the peer
+            is verified against the dialed address as it was before
+            identities existed.
         """
         # Arrange
         ca = _write_pem(tmp_path, "ca.pem")
         cert = _write_pem(tmp_path, "cert.pem")
         key = _write_pem(tmp_path, "key.pem")
-        monkeypatch.setenv(TLS_CA_ENV, ca)
-        monkeypatch.setenv(TLS_CERT_ENV, cert)
-        monkeypatch.setenv(TLS_KEY_ENV, key)
-        from_files = mocker.patch.object(
-            wool.WorkerCredentials, "from_files", return_value=object()
+        credentials = mocker.Mock(spec=wool.WorkerCredentials)
+        mocker.patch.object(
+            wool.WorkerCredentials, "from_files", return_value=credentials
         )
 
         # Act
-        worker_credentials_from_env()
+        result = build_worker_credentials(ca, cert, key)
 
         # Assert
-        from_files.assert_called_once_with(
-            ca_path=ca, key_path=key, cert_path=cert, mutual=True
+        assert result is credentials
+        credentials.as_provider.assert_not_called()
+
+    def test_build_worker_credentials_should_adapt_to_a_provider_when_identity_set(
+        self, tmp_path, mocker
+    ):
+        """Test that an identity produces a provider carrying it.
+
+        Given:
+            Complete cert config and a logical identity.
+        When:
+            ``build_worker_credentials`` is called with that identity.
+        Then:
+            It should return the provider from ``as_provider``, which is
+            what makes wool verify the peer against the name rather than
+            the address it dialed.
+        """
+        # Arrange
+        ca = _write_pem(tmp_path, "ca.pem")
+        cert = _write_pem(tmp_path, "cert.pem")
+        key = _write_pem(tmp_path, "key.pem")
+        provider = mocker.Mock(spec=wool.WorkerCredentialsProvider)
+        credentials = mocker.Mock(spec=wool.WorkerCredentials)
+        credentials.as_provider.return_value = provider
+        mocker.patch.object(
+            wool.WorkerCredentials, "from_files", return_value=credentials
         )
+
+        # Act
+        result = build_worker_credentials(ca, cert, key, identity="cfdb-worker")
+
+        # Assert
+        assert result is provider
+        credentials.as_provider.assert_called_once_with(identity="cfdb-worker")
+
+    def test_build_worker_credentials_should_return_plain_credentials_when_identity_empty(
+        self, tmp_path, mocker
+    ):
+        """Test that an empty identity is the documented opt-out.
+
+        Given:
+            Complete cert config and an empty-string identity, as an
+            operator sets to fall back to address verification.
+        When:
+            ``build_worker_credentials`` is called.
+        Then:
+            It should return the plain credentials rather than a
+            provider bearing a meaningless empty name.
+        """
+        # Arrange
+        ca = _write_pem(tmp_path, "ca.pem")
+        cert = _write_pem(tmp_path, "cert.pem")
+        key = _write_pem(tmp_path, "key.pem")
+        credentials = mocker.Mock(spec=wool.WorkerCredentials)
+        mocker.patch.object(
+            wool.WorkerCredentials, "from_files", return_value=credentials
+        )
+
+        # Act
+        result = build_worker_credentials(ca, cert, key, identity="")
+
+        # Assert
+        assert result is credentials
+        credentials.as_provider.assert_not_called()
+
+    def test_build_worker_credentials_should_return_none_when_identity_set_without_certs(
+        self,
+    ):
+        """Test that an identity alone never enables mTLS.
+
+        Given:
+            No cert paths at all, but an identity.
+        When:
+            ``build_worker_credentials`` is called.
+        Then:
+            It should return None for the plaintext path — an identity
+            constrains a certificate, so on its own it has nothing to
+            act on and must not be mistaken for partial cert config.
+        """
+        # Act
+        result = build_worker_credentials(None, None, None, identity="cfdb-worker")
+
+        # Assert
+        assert result is None
