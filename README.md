@@ -24,6 +24,7 @@ Requires Python 3.11 or later.
 | `CFDB_WORKER_TLS_CA` | Path to the shared CA certificate for the wool worker gRPC channel. When this and the cert/key below are all set, the API↔worker dispatch channel uses mutual TLS (`mutual=True`); when all three are unset the channel stays plaintext. Partial config fails fast at startup. The API and every worker MUST use certs signed by the same CA. See [Worker mTLS](#worker-mtls). | - |
 | `CFDB_WORKER_TLS_CERT` | Path to this process's PEM certificate on the worker gRPC channel — the worker leaf cert on a worker (`worker_main`/`worker_lan`), the API client cert on the API. Must be signed by `CFDB_WORKER_TLS_CA`. | - |
 | `CFDB_WORKER_TLS_KEY` | Path to this process's PEM private key paired with `CFDB_WORKER_TLS_CERT`. | - |
+| `CFDB_WORKER_TLS_IDENTITY` | Logical name the **API** verifies worker certificates against, in place of the address it dialed. Workers answer on addresses assigned at launch — an awsvpc IP on Fargate, a bridge IP in local containers — that no certificate minted ahead of time can name, so without this the handshake cannot succeed. The worker leaf must carry this value as a SAN; `certs/generate-worker-certs.sh` mints the default. Set to the empty string to verify against the dialed address instead. Read by the API only — a worker is the TLS server and has no peer name to override. Ignored while mTLS is off. See [Worker mTLS](#worker-mtls). | `cfdb-worker` |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
 | `DATABASE_URL` | MongoDB connection string | `mongodb://127.0.0.1:27017` |
 | `DATABASE_NAME` | Name of the MongoDB database to use | `cfdb` |
@@ -209,13 +210,71 @@ aws cloudformation deploy \
 The `cloudformation/backend.yml` `ImageURI` and `cloudformation/workers.yml` `WorkerImageURI` parameters now **default** to these `:dev` URIs. Note what that default does and does not do: on a stack **UPDATE**, CloudFormation reuses each parameter's **previous** value, not its default — so the `:dev` default only governs a fresh stack **CREATE**. The point is that a later infra `cloudformation deploy` (an update) keeps whatever value the bootstrap set — `:dev` — rather than reverting to a stale SHA, so the moving-tag CI deploy stays the source of truth for what code runs. Because the task defs pin `:dev` rather than a SHA, task-definition-level traceability to a commit is intentionally given up; it is recovered by the immutable `:<sha>` tag pushed alongside `:dev` and by SHA-based rollback via ECR re-tag.
 
 **Tearing down the cache.** CloudFormation cannot delete a non-empty S3 bucket, so empty the `CacheBucket` before deleting the workers stack or the delete will fail and roll back.
+**Worker mTLS on ECS (optional, off by default — and deliberately left off).** The same `CFDB_WORKER_TLS_*` gating that secures the local channel ([Worker mTLS](#worker-mtls)) is wired into the Fargate task definitions, but disabled unless you supply cert ARNs. Fargate cannot mount a Secrets Manager secret as a file, so the mechanism is: store each PEM as a Secrets Manager secret, inject them as env vars via the task definition's `Secrets:`, and let the image entrypoint (`scripts/cfdb-tls-entrypoint.sh`) write them to files and point `CFDB_WORKER_TLS_CA/CERT/KEY` at them before the app starts.
 
-**Worker mTLS on ECS (optional, off by default).** The same `CFDB_WORKER_TLS_*` gating that secures the local channel ([Worker mTLS](#worker-mtls)) is wired into the Fargate task definitions, but disabled unless you supply cert ARNs. Fargate cannot mount a Secrets Manager secret as a file, so the mechanism is: store each PEM as a Secrets Manager secret, inject them as env vars via the task definition's `Secrets:`, and let the image entrypoint (`scripts/cfdb-tls-entrypoint.sh`) write them to files and point `CFDB_WORKER_TLS_CA/CERT/KEY` at them before the app starts. To enable:
+**Why it stays off.** On AWS the marginal value is small and the operational cost is not. The worker security group already restricts inbound `50051` to the API's security group alone — there is no worker-to-worker rule, so a compromised worker cannot reach its peers — and only public data enters the pipeline, since `enforce_hubmap_access` rejects anything whose `data_access_level` is not `public` before dispatch. Fargate runs on Nitro, where intra-VPC traffic between tasks is already encrypted at the link layer, so this is not the difference between plaintext and encrypted. What mTLS would add is a backstop if the security group is ever widened, and authentication that does not depend on network position. What it costs is a CA to guard, a non-atomic rotation procedure, certificates that expire with nothing watching them, and a failure mode whose only symptom is a job that never moves. The capability is here so the decision can be revisited; the recommendation is to leave the cert ARNs empty.
 
-1. Generate certs (`make worker-certs`) and upload each PEM to Secrets Manager, e.g. `aws secretsmanager create-secret --name cfdb/worker-tls/ca --secret-string file://certs/worker-ca/ca.pem` (and the worker + API leaf cert/key).
-2. Pass the ARNs to the workers stack (`WorkerTlsCaSecretArn`, `WorkerTlsCertSecretArn`, `WorkerTlsKeySecretArn`) and the backend stack (`ApiTlsCaSecretArn`, `ApiTlsCertSecretArn`, `ApiTlsKeySecretArn` — reuse the same CA secret). Supplying a CA ARN flips the per-stack condition that adds the `Secrets:` env and the least-privilege `secretsmanager:GetSecretValue` IAM. Leave them empty to keep dispatch plaintext.
+Locally the calculation is different — there is no security group, developer machines share networks, and it is the configuration the tests exercise. See [Worker mTLS](#worker-mtls).
 
-> **Caveat — not yet functional on Fargate.** `EcsDiscovery` dials each worker at its *dynamic* awsvpc IP and wool does not override the gRPC authority, so a static worker cert's SAN cannot match the dialed address and the mTLS handshake will fail verification. The wiring above is in place, but **leave the cert ARNs empty** until wool gains a client-side target-name override (tracked separately). Until then, the worker security group is the access control on ECS.
+**If you do enable it**, three things have to be true together, and the middle one is the part that is easy to miss:
+
+1. Every PEM is in Secrets Manager and the ARNs are passed to both stacks — the workers stack (`WorkerTlsCaSecretArn`, `WorkerTlsCertSecretArn`, `WorkerTlsKeySecretArn`) and the backend stack (`ApiTlsCaSecretArn`, `ApiTlsCertSecretArn`, `ApiTlsKeySecretArn`, reusing the same CA secret). Supplying a CA ARN flips the per-stack condition that adds the `Secrets:` env and the least-privilege `secretsmanager:GetSecretValue` IAM.
+2. The worker leaf carries the backend stack's `WorkerTlsIdentity` (default `cfdb-worker`) as a SAN. `EcsDiscovery` reaches each worker at the awsvpc IP assigned at launch, so the API verifies the certificate against that logical name rather than the dialed address; a leaf without the SAN cannot be verified at all. There is no identity parameter on the workers stack — a worker is the TLS server on the dispatch channel, and its half of the arrangement is the certificate.
+3. Both stacks are enabled together. wool's admission gate is symmetric: a proxy holding credentials admits only workers advertising `secure=true`, and a proxy without credentials admits only workers without. Turning mTLS on in one stack and not the other empties the pool.
+
+**Diagnosing a failed handshake.** wool logs it. `WorkerProxy` emits a rate-limited warning per worker under the `wool.runtime.worker.proxy` logger, carrying the gRPC status and detail, and the API's root logger is at `INFO` so it reaches CloudWatch:
+
+```
+WARNING wool.runtime.worker.proxy Skipping worker 0b49fcd9-… at 10.3.2.7:50051 after handshake failure:
+UNAVAILABLE: … UNAUTHENTICATED: Hostname Verification Check failed.
+```
+
+Grep for `after handshake failure`. The detail distinguishes the cases — `Hostname Verification Check failed` is a SAN mismatch, a CA mismatch and an expired leaf read differently. The API also logs `worker_tls_identity=` at startup, which tells you what it expected to match; that is corroboration, not the diagnosis. One genuine blind spot remains: a *worker* rejecting the API's client certificate surfaces as a plain `UNAVAILABLE` with no TLS evidence, observable only on the worker.
+
+Note what a handshake failure looks like from outside: `HandshakeError` is transient in wool, so the worker is skipped rather than evicted, and dispatch reports `NoWorkersAvailable`. Nothing in the client-visible error names TLS.
+
+#### Operating the worker certificates
+
+The mechanics below are not recoverable from the code, and they are needed exactly when someone first enables mTLS. There is no tooling for any of it beyond `generate-worker-certs.sh`, which is local-dev tooling — it mints usable material, but its CA key is unencrypted and lands wherever you ran it, so treat production material as something you mint deliberately (CloudShell, or an offline host) rather than as a by-product of `make`.
+
+**Give each environment its own CA.** dev and prod share account `605134458779`. A CA is a trust root, so one CA across both environments means a leaked *dev* worker certificate authenticates to *prod* workers — the blast radius of the less-guarded environment becomes the blast radius of the guarded one. Mint and upload two independent sets, and never point a prod stack at a dev ARN.
+
+**Archive each CA key before minting the next.** The script writes the CA to the fixed path `certs/worker-ca/ca-key.pem` and regenerates it in place under `--force`, and the CA key is deliberately *not* uploaded to Secrets Manager. So minting a second environment overwrites the first environment's CA key, after which no replacement leaf can ever be issued for it and the only recovery is the full CA rotation below. Copy `ca-key.pem` somewhere durable first — a password manager, or its own Secrets Manager secret readable by neither task role nor the `cfdb-deploy` CI role.
+
+**Regenerating requires `--force`.** Both the CA block and `mint_leaf` skip when the files already exist, and `make worker-certs` passes no arguments, so `make worker-certs` on a machine that already has certs prints "already exists" and changes nothing. Call the script directly when you mean to replace material:
+
+```bash
+./certs/generate-worker-certs.sh --force                      # replace everything
+./certs/generate-worker-certs.sh --force --identity NAME      # …with a different SAN
+```
+
+**What a compromised task can reach.** The templates scope `secretsmanager:GetSecretValue` to the *execution* role — the one the ECS agent uses to inject the container's `Secrets:` — and to exactly the cert ARNs, so the **task** role holds no `GetSecretValue` at all. That bounds a task compromise to the material that task was already given: the entrypoint writes its own leaf and key to `/tmp/cfdb-tls/`, so a compromised task trivially holds those. What it cannot reach is the other side's leaf, the other environment's material, or the CA key.
+
+Related, and worth stating because an operator will otherwise assume otherwise: under a shared CA these certificates prove **fleet membership, not peer role**. The API verifies a worker by name, but a worker verifies its client by chain alone, so any CA-signed leaf can act as a client. A compromised worker — the component that shells out to `samtools`/`tabix`/`bigBedToBed` over untrusted upstream bytes — therefore holds a credential the API accepts. mTLS does not contain a worker compromise. The generator mitigates the reverse direction by giving the API leaf `clientAuth` only, so the API's certificate cannot terminate a server side.
+
+**Rotating a leaf** is two commands, because the entrypoint materializes the PEMs once at container start:
+
+```bash
+aws secretsmanager put-secret-value --secret-id <api-cert-secret> \
+  --secret-string file://certs/api/api-cert.pem
+aws ecs update-service --cluster cfdb-backend-prod-cluster \
+  --service cfdb-backend-prod-service --force-new-deployment
+```
+
+Workers need no step at all — they are ephemeral, so the next `EcsProvisioner` `RunTask` pulls the new secret. (wool 0.13 can adopt rotated material without a restart via a reloadable credential provider; cfdb has not adopted it, because on ECS the redeploy above is cheap.)
+
+**Rotating the CA is not atomic**, and the obvious approach breaks dispatch: a rolled API trusting only the new CA rejects every in-flight worker still holding a leaf signed by the old one. gRPC accepts a *bundle* of roots, so stage it instead — publish both CAs concatenated, roll everything onto it, then drop the old:
+
+```bash
+cat certs/worker-ca/ca.pem /path/to/new-ca.pem > /tmp/ca-bundle.pem
+aws secretsmanager put-secret-value --secret-id <ca-secret> \
+  --secret-string file:///tmp/ca-bundle.pem
+# Roll the API onto the bundle and let in-flight workers cycle out, then
+# reissue both leaves under the new CA, roll again, and only then publish
+# the new CA alone.
+```
+
+**Nothing watches expiry.** `generate-worker-certs.sh` mints 825-day leaves, and an expired certificate is skipped as a transient handshake failure like any other — wool's warning does name it, but only if someone is reading. Either put rotation on a schedule short enough that this runbook stays exercised, or record the expiry somewhere that will page you: `openssl x509 -enddate -noout -in certs/worker/worker-cert.pem`.
 
 ## GraphQL API
 
@@ -814,14 +873,16 @@ By default the API↔worker gRPC dispatch channel is plaintext, gated only by ne
 
 The configuration is gating-by-presence: when all three of `CFDB_WORKER_TLS_CA`, `CFDB_WORKER_TLS_CERT`, and `CFDB_WORKER_TLS_KEY` are unset the plaintext path is used unchanged (local PoC dev needs no certs); when all three are set mTLS is enforced. A *partial* configuration (some set, some not) fails fast at startup rather than silently degrading to plaintext.
 
+**Identity.** TLS normally verifies a server's certificate against the address the client dialed, which is a problem here: workers answer wherever they happen to come up. `EcsDiscovery` reaches each Fargate worker at the awsvpc IP assigned at launch, and a containerized local worker answers on a bridge IP — neither is knowable when the certificate is minted. `CFDB_WORKER_TLS_IDENTITY` (default `cfdb-worker`) points the API at a fixed logical name instead, so the worker leaf carries one stable SAN rather than an enumeration of every address it might be reached at. Chain and SAN verification both still happen; only the name being matched changes. It is a client-side setting, so it belongs to the API alone — a worker's half of the arrangement is the SAN baked into its certificate. Setting it to the empty string restores address verification, which is only workable when workers are reached at a fixed, certified address.
+
 Generate a local CA and the worker + API leaf certs with:
 
 ```bash
 make worker-certs
-# wraps ./certs/generate-worker-certs.sh — see --help for SAN options.
+# wraps ./certs/generate-worker-certs.sh — see --help for --identity and SAN options.
 # Writes (all git-ignored):
 #   certs/worker-ca/ca.pem            shared CA
-#   certs/worker/worker-cert.pem,-key.pem   worker leaf
+#   certs/worker/worker-cert.pem,-key.pem   worker leaf (SAN: cfdb-worker)
 #   certs/api/api-cert.pem,-key.pem         API client leaf
 ```
 
@@ -835,7 +896,7 @@ python -m cfdb.workflows.worker_lan
 # or, with these env vars baked in: make worker-local-tls
 ```
 
-…and the API process, with the **same** `CFDB_WORKER_TLS_CA` but the API leaf:
+…and the API process, with the **same** `CFDB_WORKER_TLS_CA` but the API leaf. `CFDB_WORKER_TLS_IDENTITY` already defaults to the SAN `make worker-certs` mints, so it only needs setting when you passed a different `--identity`:
 
 ```bash
 export CFDB_WORKER_TLS_CA=certs/worker-ca/ca.pem
@@ -843,7 +904,11 @@ export CFDB_WORKER_TLS_CERT=certs/api/api-cert.pem
 export CFDB_WORKER_TLS_KEY=certs/api/api-key.pem
 ```
 
-The same three env vars configure the ECS worker entrypoint (`worker_main`) and the API on Fargate; distributing the certs to the ECS task definitions is tracked as follow-up work and is not yet wired into the CloudFormation deploy.
+The same env vars configure the ECS worker entrypoint (`worker_main`) and the API on Fargate — see [Worker mTLS on ECS](#deploying-the-cloudformation-stacks) for distributing the material through Secrets Manager.
+
+> **Upgrading an existing mTLS deployment.** Worker certificates minted before identity support have no `cfdb-worker` SAN, so the API will now fail to verify them. Regenerate with `./certs/generate-worker-certs.sh --force` — plain `make worker-certs` passes no arguments and the script skips material that already exists, so it will report success and change nothing. Use `--force --identity NAME` to match a SAN your certificates already carry instead. Alternatively set `CFDB_WORKER_TLS_IDENTITY=""` to keep verifying against the dialed address. Deployments running the plaintext channel are unaffected.
+
+> **Rolling back past this change.** The reverse is also breaking, and less obvious. Once workers hold identity-carrying certificates, an API rolled back to a pre-identity image drops the target-name override and verifies against the dialed address again — which for a leaf whose only SAN is the identity fails every handshake. wool's version gate does not catch this, because an older API against newer workers passes `client <= server`: the workers are admitted and then fail at the handshake. Roll back with `CFDB_WORKER_TLS_IDENTITY=""` set, or revert to address-verifiable certificates first.
 
 **URL:** `GET /jobs/{job_id}`
 
