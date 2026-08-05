@@ -14,6 +14,13 @@ Function scope:
     real ``LocalFsCache`` and the real BAM / tabix processors, keyed on
     a tmp cache root per test so state does not leak between tests.
 
+  - ``worker_certs`` — a CA plus the worker and API leaves the wool
+    mutual-TLS tests mint. Shared here rather than per-module because
+    the *shape* of that material is load-bearing (the worker leaf's
+    sole SAN is the logical identity; the API leaf has none), and two
+    hand-copied minters are how two tests start disagreeing about what
+    a worker certificate is.
+
 Scenario model:
   - The ``Scenario`` dataclass + ``Format``/``Endpoint``/``Method``/...
     enums encode the cross-dimension axes that integration tests sweep
@@ -28,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import datetime
 import http.server
 import os
 import shutil
@@ -42,6 +50,10 @@ from typing import Any
 import pytest
 import pytest_asyncio
 import wool
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Permit ``http://127.0.0.1`` access from workers — the integration
 # suite serves sample fixtures over an in-process HTTP server because
@@ -623,3 +635,128 @@ def make_file_meta(
     if extra_files is not None:
         meta["extra"] = {"extra_files": list(extra_files)}
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Worker mutual-TLS material.
+#
+# Shared across the mTLS integration modules because the *shape* of this
+# material is what those tests assert on: the worker leaf's only SAN is
+# the logical identity (so it is unverifiable by address, which is what
+# makes an identity-carried handshake provable), and the API leaf has no
+# SAN at all and clientAuth only (so a worker authenticating its client
+# by chain alone is exercised, and the API's certificate cannot
+# terminate a server side). A second hand-copied minter is how two test
+# modules start disagreeing about what a worker certificate is.
+# ---------------------------------------------------------------------------
+
+
+def _generate_key() -> rsa.RSAPrivateKey:
+    # 2048 rather than the 4096 the shipped script uses: these certs live
+    # for one test, and key generation dominates its runtime.
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _common_name(value: str) -> x509.Name:
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, value)])
+
+
+def _sign(subject, subject_key, issuer, issuer_key, *, sans=None, eku=None, ca=False):
+    """Mint a certificate, self-signed when issuer and subject coincide."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(subject_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+    )
+    if sans is not None:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName(sans), critical=False
+        )
+    if eku is not None:
+        builder = builder.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
+    return builder.sign(issuer_key, hashes.SHA256())
+
+
+def _write(path, data: bytes) -> str:
+    path.write_bytes(data)
+    return str(path)
+
+
+def _write_leaf(tmp_path, stem, ca_name, ca_key, *, common_name, sans, eku):
+    """Mint a CA-signed leaf and return its ``(cert_path, key_path)``."""
+    key = _generate_key()
+    cert = _sign(_common_name(common_name), key, ca_name, ca_key, sans=sans, eku=eku)
+    return (
+        _write(
+            tmp_path / f"{stem}-cert.pem",
+            cert.public_bytes(serialization.Encoding.PEM),
+        ),
+        _write(
+            tmp_path / f"{stem}-key.pem",
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+        ),
+    )
+
+
+@pytest.fixture
+def worker_certs(tmp_path):
+    """Mint a CA plus the separate worker and API leaves it signs.
+
+    Returns ``(ca_path, worker_cert, worker_key, api_cert, api_key)``,
+    mirroring the deployed arrangement where each process holds its own
+    leaf and only the CA is shared.
+
+    The worker leaf's sole SAN is the logical identity — no
+    ``localhost``, no ``127.0.0.1`` — so it is unverifiable by address.
+    The API leaf gets none at all, which is the point: a worker
+    authenticates its client by chain, with no name check.
+
+    The extended key usages mirror what ``certs/generate-worker-certs.sh``
+    mints, so these tests fail if a ``clientAuth``-only API leaf turns
+    out not to work as a client. Withholding ``serverAuth`` from the API
+    is what stops its certificate doubling as a worker's.
+    """
+    from cfdb.workflows.credentials import DEFAULT_TLS_IDENTITY
+
+    ca_key = _generate_key()
+    ca_name = _common_name("cfdb-worker-ca")
+    ca_cert = _sign(ca_name, ca_key, ca_name, ca_key, ca=True)
+
+    worker_cert, worker_key = _write_leaf(
+        tmp_path,
+        "worker",
+        ca_name,
+        ca_key,
+        common_name="cfdb-worker",
+        sans=[x509.DNSName(DEFAULT_TLS_IDENTITY)],
+        # serverAuth to terminate dispatch; clientAuth because wool's
+        # graceful-stop RPC dials the worker's own subprocess.
+        eku=[ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+    )
+    api_cert, api_key = _write_leaf(
+        tmp_path,
+        "api",
+        ca_name,
+        ca_key,
+        common_name="cfdb-api",
+        sans=None,
+        eku=[ExtendedKeyUsageOID.CLIENT_AUTH],
+    )
+
+    return (
+        _write(tmp_path / "ca.pem", ca_cert.public_bytes(serialization.Encoding.PEM)),
+        worker_cert,
+        worker_key,
+        api_cert,
+        api_key,
+    )
