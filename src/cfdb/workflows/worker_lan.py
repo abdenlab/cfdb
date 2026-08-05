@@ -47,7 +47,7 @@ from wool.runtime.discovery.lan import LanDiscovery
 
 from cfdb.workflows import WORKER_MAX_CONCURRENT_TASKS
 from cfdb.workflows.backpressure import backpressure_for
-from cfdb.workflows.credentials import build_worker_credentials
+from cfdb.workflows.credentials import build_worker_credentials, identity_from_env
 from cfdb.workflows.grpc_options import worker_grpc_options
 
 logger = logging.getLogger(__name__)
@@ -85,8 +85,14 @@ async def serve(
     plaintext. The API leasing these workers must hold a certificate
     signed by the same CA. Partial cert config raises before the pool
     starts (see :func:`build_worker_credentials`).
+
+    The identity comes from the environment rather than a flag because
+    it is inert on the serving side — it applies only to the channels
+    wool opens back to the pool's own workers to drain them.
     """
-    credentials = build_worker_credentials(tls_ca, tls_cert, tls_key)
+    credentials = build_worker_credentials(
+        tls_ca, tls_cert, tls_key, identity=identity_from_env()
+    )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 

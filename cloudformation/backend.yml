@@ -84,9 +84,6 @@ Parameters:
   # material for mutual TLS on the API<->worker gRPC channel: the shared
   # CA cert (same secret the workers stack uses), the API leaf cert, and
   # its key. Leave all three empty (default) to dispatch over plaintext.
-  # See the workers stack for the upstream-blocker caveat (wool does not
-  # override the gRPC authority, so enforced mTLS over the ECS path does
-  # not validate yet) — keep empty until that lands.
   ApiTlsCaSecretArn:
     Type: String
     Default: ""
@@ -99,6 +96,37 @@ Parameters:
     Type: String
     Default: ""
     Description: Secrets Manager ARN of the API client private-key PEM.
+  # The API verifies each worker's certificate against this logical name
+  # instead of the address it dialed. That indirection is what makes the
+  # ECS path work at all: EcsDiscovery reaches every worker at the
+  # awsvpc IP assigned at launch, which no certificate minted ahead of
+  # time can name. The worker leaf must carry this as a SAN — see
+  # certs/generate-worker-certs.sh --identity, whose default matches.
+  # Empty falls back to address verification, which on Fargate means the
+  # handshake fails; only set it empty if workers are reached at a fixed
+  # name. Ignored entirely while mTLS is off.
+  WorkerTlsIdentity:
+    Type: String
+    Default: cfdb-worker
+    # Constrained to what can survive being both a certificate SAN and a
+    # gRPC target name. A value with a space or comma yields an override
+    # that matches no SAN, and the only symptom is NoWorkersAvailable —
+    # so reject it at deploy time instead. An IP literal is rejected for
+    # the same reason (the generator would mint it as DNS:<ip>, which
+    # gRPC never matches against an address), by requiring at least one
+    # letter. The empty string is allowed because it is the documented
+    # opt-out.
+    AllowedPattern: "^$|^([0-9][A-Za-z0-9._-]*)?[A-Za-z]([A-Za-z0-9._-]*[A-Za-z0-9])?$"
+    ConstraintDescription: >
+      Must be empty or a DNS-safe name (letters, digits, dot, hyphen,
+      underscore; not starting or ending with a separator) containing
+      at least one letter. IP literals are rejected — they cannot be
+      minted as a matchable SAN.
+    Description: >
+      Logical identity the API verifies worker certificates against,
+      matching the SAN in the worker leaf certificate. MUST equal the
+      workers stack's WorkerTlsIdentity — the worker verifies the same
+      SAN on its own graceful-stop channel.
 
 Conditions:
   # mTLS is wired only when a CA secret ARN is supplied; otherwise the
@@ -277,6 +305,16 @@ Resources:
             # rather than spawning past this. Bounds workers, not the queue.
             - Name: ECS_MAX_WORKERS
               Value: !Ref EcsMaxWorkers
+            # Only meaningful alongside the cert Secrets below, so it is
+            # rendered away when mTLS is off rather than advertising a
+            # setting that does nothing. The workers stack has no
+            # counterpart: a worker is the TLS server here, and its half
+            # of the identity is the SAN in its certificate.
+            - !If
+              - ApiMtlsEnabled
+              - Name: CFDB_WORKER_TLS_IDENTITY
+                Value: !Ref WorkerTlsIdentity
+              - !Ref AWS::NoValue
           # The cert PEMs (when mTLS is enabled) are injected as env vars
           # and written to files by the image entrypoint
           # (cfdb-tls-entrypoint.sh), which points CFDB_WORKER_TLS_CA/CERT/KEY

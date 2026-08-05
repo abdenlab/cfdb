@@ -19,6 +19,7 @@ import inspect
 import pytest
 import wool
 
+from cfdb import api
 from cfdb.api import main
 from cfdb.api import profile as profile_mod
 
@@ -81,7 +82,7 @@ async def test_lifespan_should_construct_worker_pool_with_quorum_zero(
     mocker.patch.object(main, "_build_provisioner", return_value=None)
     mocker.patch.object(main, "_build_discovery", new=_fake_build_discovery)
     mocker.patch.object(main, "default_registry", return_value=mocker.MagicMock())
-    mocker.patch.object(
+    build_credentials = mocker.patch.object(
         main, "build_worker_credentials", return_value="CREDS-SENTINEL"
     )
     mocker.patch.object(main, "WoolExecutor", return_value=fake_executor)
@@ -97,6 +98,17 @@ async def test_lifespan_should_construct_worker_pool_with_quorum_zero(
     assert kwargs["quorum"] == 0
     assert kwargs["discovery"] is sentinel_discovery
     assert kwargs["credentials"] == "CREDS-SENTINEL"
+    # Pin the credential call itself, not just its result. The identity
+    # kwarg is the only thing connecting CFDB_WORKER_TLS_IDENTITY to the
+    # wire, and dropping it reverts every mTLS deployment to address
+    # verification — which on ECS can never succeed, and surfaces only
+    # as NoWorkersAvailable with nothing naming TLS.
+    build_credentials.assert_called_once_with(
+        api.CFDB_WORKER_TLS_CA,
+        api.CFDB_WORKER_TLS_CERT,
+        api.CFDB_WORKER_TLS_KEY,
+        identity=api.CFDB_WORKER_TLS_IDENTITY,
+    )
     # The priority/leaky-bucket balancer must be wired in (issue #45). This
     # file exists to pin pool kwargs against silent regressions, so the
     # load balancer belongs here alongside quorum/discovery/credentials.

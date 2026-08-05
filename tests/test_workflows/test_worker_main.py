@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import patch
 
 import pytest
+import pytest_asyncio
+from botocore.exceptions import ClientError
 from click.testing import CliRunner
 
 from cfdb.workflows import worker_main
+from cfdb.workflows.constants import TLS_IDENTITY_ENV
 
 
 def _invoke(args: list[str]) -> tuple[int, dict[str, object]]:
@@ -265,3 +269,283 @@ class TestServeBackpressureWiring:
 
         # Assert
         assert local_worker.call_args.kwargs["backpressure"] is None
+
+
+#: Task ARN the fake ECS metadata endpoint reports.
+_TASK_ARN = "arn:aws:ecs:us-east-2:605134458779:task/cfdb-cluster/abc123"
+
+
+@pytest_asyncio.fixture()
+async def ecs_metadata_endpoint():
+    """Serve a stand-in for the ECS task metadata endpoint.
+
+    Yields the base URL to export as ``ECS_CONTAINER_METADATA_URI_V4``.
+    A real HTTP server rather than a patched fetch, so the request and
+    the ``TaskARN`` parsing are both exercised.
+
+    A loopback socket makes these tests borderline integration by the
+    letter of the test guide, but they stay in the unit suite
+    deliberately: the server stands in for a link-local endpoint that
+    only exists inside an ECS task (there is no real counterpart to
+    integrate with off ECS), everything else in the tests is mocked,
+    and the alternative — patching ``aiohttp.ClientSession`` — would
+    un-test the two things this fixture exists to exercise.
+    """
+    from aiohttp import web
+
+    async def _task(_request: web.Request) -> web.Response:
+        return web.json_response({"TaskARN": _TASK_ARN, "Cluster": "cfdb-cluster"})
+
+    app = web.Application()
+    app.router.add_get("/task", _task)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = runner.addresses[0][1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        await runner.cleanup()
+
+
+def _arrange_started_worker(mocker, *, version: str = "1.2.3", secure: bool = False):
+    """Patch ``wool.LocalWorker`` with one that starts and reports metadata."""
+    worker_instance = mocker.Mock()
+    worker_instance.start = mocker.AsyncMock()
+    worker_instance.stop = mocker.AsyncMock()
+    worker_instance.metadata = mocker.Mock(version=version, secure=secure)
+    mocker.patch.object(
+        worker_main.wool, "LocalWorker", return_value=worker_instance
+    )
+    return worker_instance
+
+
+class TestServeMetadataPublishing:
+    @pytest.mark.asyncio
+    async def test_serve_should_not_publish_metadata_when_not_running_on_ecs(
+        self, mocker, monkeypatch
+    ):
+        """Test that a worker off ECS makes no tagging call.
+
+        Given:
+            ``ECS_CONTAINER_METADATA_URI_V4`` unset, as on a laptop.
+        When:
+            ``serve`` runs to its max-lifetime exit.
+        Then:
+            No ECS client is built and nothing is tagged, so running the
+            entrypoint locally is unaffected by the publish step.
+        """
+        # Arrange
+        monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+        _arrange_started_worker(mocker)
+        build_client = mocker.patch.object(worker_main, "build_ecs_client")
+
+        # Act
+        await worker_main.serve(
+            worker_port=0, health_port=0, max_lifetime_seconds=0.01
+        )
+
+        # Assert
+        build_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_serve_should_publish_the_metadata_the_worker_authored(
+        self, mocker, monkeypatch, ecs_metadata_endpoint
+    ):
+        """Test that the worker tags its own task with wool's metadata.
+
+        Given:
+            A running ECS task metadata endpoint and a worker whose wool
+            metadata reports a version and a TLS flag.
+        When:
+            ``serve`` runs to its max-lifetime exit.
+        Then:
+            It should tag its own task ARN with exactly those values —
+            they are what ``EcsDiscovery`` reads back, and wool admits
+            the worker only if they are right.
+        """
+        # Arrange
+        monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", ecs_metadata_endpoint)
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+        _arrange_started_worker(mocker, version="9.9.9", secure=True)
+        client = mocker.Mock()
+        build_client = mocker.patch.object(
+            worker_main, "build_ecs_client", return_value=client
+        )
+
+        # Act
+        await worker_main.serve(
+            worker_port=0, health_port=0, max_lifetime_seconds=0.01
+        )
+
+        # Assert
+        client.tag_resource.assert_called_once_with(
+            resourceArn=_TASK_ARN,
+            tags=[
+                {"key": "wool.version", "value": "9.9.9"},
+                {"key": "wool.secure", "value": "true"},
+            ],
+        )
+        # With AWS_REGION unset the region comes from the task ARN
+        # itself, so publishing cannot die of NoRegionError on a task
+        # definition that lost the variable.
+        build_client.assert_called_once_with(
+            endpoint_url=None, region_name="us-east-2"
+        )
+
+    @pytest.mark.asyncio
+    async def test_serve_should_raise_when_metadata_cannot_be_published(
+        self, mocker, monkeypatch, ecs_metadata_endpoint
+    ):
+        """Test that an unpublishable worker exits instead of serving.
+
+        Given:
+            A metadata endpoint but an ECS client whose ``tag_resource``
+            is throttled on every attempt, exhausting the retry budget.
+        When:
+            ``serve`` runs with a two-attempt publish budget.
+        Then:
+            It should retry the transient failure once and then
+            propagate rather than serve, because a worker whose metadata
+            never lands is invisible to the API and would hold a Fargate
+            slot without being able to receive work.
+        """
+        # Arrange
+        monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", ecs_metadata_endpoint)
+        _arrange_started_worker(mocker)
+        client = mocker.Mock()
+        client.tag_resource.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
+            "TagResource",
+        )
+        mocker.patch.object(worker_main, "build_ecs_client", return_value=client)
+
+        # Act & assert
+        with pytest.raises(ClientError, match="Throttling"):
+            await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                max_lifetime_seconds=0.01,
+                publish_attempts=2,
+                publish_backoff_seconds=0.0,
+            )
+        assert client.tag_resource.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_serve_should_raise_without_retrying_when_tagging_is_denied(
+        self, mocker, monkeypatch, ecs_metadata_endpoint, caplog
+    ):
+        """Test that a missing ecs:TagResource grant fails in one attempt.
+
+        Given:
+            An ECS client whose ``tag_resource`` raises AccessDenied —
+            the signature of a workers stack deployed without the
+            ``ecs:TagResource`` grant.
+        When:
+            ``serve`` runs with the full five-attempt budget available.
+        Then:
+            It should raise after a single attempt — authorization
+            failures are permanent, so burning the backoff budget only
+            delays the exit — and the error log should name the grant
+            and the stack that provides it, so the operator's first
+            grep answers "what do I deploy".
+        """
+        # Arrange
+        monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", ecs_metadata_endpoint)
+        _arrange_started_worker(mocker)
+        client = mocker.Mock()
+        client.tag_resource.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "TagResource",
+        )
+        mocker.patch.object(worker_main, "build_ecs_client", return_value=client)
+
+        # Act & assert
+        with caplog.at_level(logging.ERROR, logger=worker_main.__name__):
+            with pytest.raises(ClientError, match="AccessDenied"):
+                await worker_main.serve(
+                    worker_port=0,
+                    health_port=0,
+                    max_lifetime_seconds=0.01,
+                    publish_backoff_seconds=0.0,
+                )
+        assert client.tag_resource.call_count == 1
+        assert "ecs:TagResource" in caplog.text
+        assert "workers.yml" in caplog.text
+
+
+class _StopAtCredentials(Exception):
+    """Sentinel raised from the patched credentials builder.
+
+    ``serve`` builds credentials as its very first statement, so raising
+    here exits the coroutine before the signal, health, worker, or
+    publish machinery is touched — the call arguments are the entire
+    subject.
+    """
+
+
+class TestServeIdentityWiring:
+    @pytest.mark.asyncio
+    async def test_serve_should_pass_the_configured_identity_to_the_credentials_builder(
+        self, mocker, monkeypatch
+    ):
+        """Test that the ECS worker gets the environment identity.
+
+        Given:
+            ``CFDB_WORKER_TLS_IDENTITY`` set to a non-default name.
+        When:
+            ``serve`` builds its worker credentials.
+        Then:
+            It should pass that identity through, because wool's
+            graceful-stop RPC dials this worker's own subprocess and
+            verifies an identity-only certificate on that channel —
+            dropping the kwarg turns every graceful drain into a
+            force-reap that loses in-flight work, with no TLS error
+            anywhere.
+        """
+        # Arrange
+        monkeypatch.setenv(TLS_IDENTITY_ENV, "custom-name")
+        build = mocker.patch.object(
+            worker_main, "build_worker_credentials", side_effect=_StopAtCredentials
+        )
+
+        # Act
+        with pytest.raises(_StopAtCredentials):
+            await worker_main.serve(
+                worker_port=0, health_port=0, tls_ca="/ca", tls_cert="/c", tls_key="/k"
+            )
+
+        # Assert
+        build.assert_called_once_with("/ca", "/c", "/k", identity="custom-name")
+
+    @pytest.mark.asyncio
+    async def test_serve_should_verify_by_address_when_identity_opted_out(
+        self, mocker, monkeypatch
+    ):
+        """Test that the empty-string opt-out reaches the ECS worker.
+
+        Given:
+            ``CFDB_WORKER_TLS_IDENTITY`` exported as the empty string,
+            the documented opt-out.
+        When:
+            ``serve`` builds its worker credentials.
+        Then:
+            It should pass ``identity=None`` so verification falls back
+            to the dialed address on both sides of the channel.
+        """
+        # Arrange
+        monkeypatch.setenv(TLS_IDENTITY_ENV, "")
+        build = mocker.patch.object(
+            worker_main, "build_worker_credentials", side_effect=_StopAtCredentials
+        )
+
+        # Act
+        with pytest.raises(_StopAtCredentials):
+            await worker_main.serve(
+                worker_port=0, health_port=0, tls_ca="/ca", tls_cert="/c", tls_key="/k"
+            )
+
+        # Assert
+        build.assert_called_once_with("/ca", "/c", "/k", identity=None)

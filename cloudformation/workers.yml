@@ -67,6 +67,20 @@ Parameters:
     Description: >
       Seconds /health returns 503 after SIGTERM before the gRPC port is
       torn down (CFDB_WORKER_DRAIN_GRACE_SECONDS).
+  BackendClusterName:
+    Type: String
+    # NOTE: like every default in these templates, this matches neither
+    # live environment — pass <backend-stack>-cluster explicitly
+    # (cfdb-backend-dev-cluster / cfdb-backend-prod-cluster).
+    Default: cfdb-backend-cluster
+    Description: >
+      Name of the ECS cluster the backend stack creates
+      (${BackendStackName}-cluster). Used only to scope the worker task
+      role's ecs:TagResource grant to this environment's own tasks. A
+      plain name rather than an import because this stack deploys
+      before the backend stack exists; the cluster name is
+      deterministic, and IAM resource ARNs need not name an existing
+      resource.
   # ---------- Worker mTLS (optional, off by default) ----------
   # ARNs of Secrets Manager secrets holding the PEM material for mutual
   # TLS on the API<->worker gRPC channel. Supply the shared CA cert, the
@@ -74,12 +88,11 @@ Parameters:
   # PEM). Leave all three empty (default) to run the channel plaintext —
   # the worker SG is the only access control in that case.
   #
-  # NOTE: enforced mTLS over the ECS path is currently blocked upstream:
-  # EcsDiscovery dials the worker at its dynamic awsvpc IP and wool does
-  # not override the gRPC authority, so a static worker cert's SAN cannot
-  # match the dialed IP. Populating these turns the channel on but the
-  # handshake will not validate until wool gains a target-name override.
-  # Keep empty until then.
+  # The worker leaf cert MUST carry WorkerTlsIdentity as a SAN.
+  # EcsDiscovery reaches each worker at the awsvpc IP assigned at
+  # launch, so the API verifies against that logical name rather than
+  # the dialed address; a cert without the SAN fails the handshake.
+  # certs/generate-worker-certs.sh mints it by default.
   WorkerTlsCaSecretArn:
     Type: String
     Default: ""
@@ -92,6 +105,30 @@ Parameters:
     Type: String
     Default: ""
     Description: Secrets Manager ARN of the worker leaf private-key PEM.
+  WorkerTlsIdentity:
+    Type: String
+    Default: cfdb-worker
+    # Same pattern as backend.yml's WorkerTlsIdentity: empty, or a
+    # DNS-safe name that contains at least one letter. An IP literal is
+    # rejected because it would be minted as DNS:<ip>, which gRPC never
+    # matches against an address — a value that deploys cleanly but can
+    # never handshake, whose only symptom is NoWorkersAvailable.
+    AllowedPattern: "^$|^([0-9][A-Za-z0-9._-]*)?[A-Za-z]([A-Za-z0-9._-]*[A-Za-z0-9])?$"
+    ConstraintDescription: >
+      Must be empty or a DNS-safe name (letters, digits, dot, hyphen,
+      underscore; not starting or ending with a separator) containing
+      at least one letter. IP literals are rejected — they cannot be
+      minted as a matchable SAN.
+    Description: >
+      Logical TLS identity (CFDB_WORKER_TLS_IDENTITY) for the worker
+      process. A worker is the TLS *server* on the dispatch channel,
+      but wool's graceful-stop RPC dials the worker's own subprocess —
+      on that one connection the worker is a client verifying a
+      certificate whose only SAN may be this logical name. MUST match
+      the backend stack's WorkerTlsIdentity and the SAN minted into the
+      worker leaf, or graceful drain fails its name check and wool
+      force-reaps the subprocess, losing in-flight work. Rendered only
+      when mTLS is enabled; empty opts back into address verification.
 
 Conditions:
   # mTLS is wired only when a CA secret ARN is supplied; otherwise every
@@ -245,6 +282,36 @@ Resources:
                 Action:
                   - s3:ListBucket
                 Resource: !GetAtt CacheBucket.Arn
+        # The worker publishes its own wool metadata (protocol version,
+        # TLS flag) by tagging its ECS task; EcsDiscovery reads the tags
+        # back. Only the worker knows those values, and wool rejects any
+        # worker whose advertised metadata it cannot verify, so without
+        # this grant the worker exits at startup and the pool stays
+        # empty. See cfdb.workflows.worker_main.
+        #
+        # Scoped tight, because these tags are load-bearing: discovery
+        # trusts them to build the metadata wool gates admission on, so
+        # an unscoped grant would let a compromised worker — the
+        # component that shells out over untrusted upstream bytes —
+        # rewrite wool.version/wool.secure on every task in the account,
+        # including the *other environment's* (dev and prod share the
+        # account and region), silently emptying its pool. The Resource
+        # confines the grant to this environment's own cluster (the name
+        # is a parameter, not an import — see BackendClusterName), and
+        # the aws:TagKeys condition confines it to the two wool.* keys
+        # so cost-allocation and ownership tags stay out of reach.
+        - PolicyName: worker-metadata
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${BackendClusterName}/*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - wool.version
+                      - wool.secure
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-worker-task-role"
@@ -288,6 +355,22 @@ Resources:
               Value: !Ref WorkerMaxLifetimeSeconds
             - Name: CFDB_WORKER_DRAIN_GRACE_SECONDS
               Value: !Ref WorkerDrainGraceSeconds
+            # The worker tags its own task at startup (worker-metadata
+            # policy above); boto3 needs a region and Fargate does not
+            # inject one. The code also falls back to the task ARN's
+            # region segment, but the explicit variable mirrors
+            # backend.yml and keeps the two containers configured alike.
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            # The worker's half of identity verification on wool's
+            # graceful-stop channel (see the WorkerTlsIdentity
+            # parameter). Rendered only under mTLS so the plaintext
+            # template stays byte-identical to the pre-mTLS one.
+            - !If
+              - WorkerMtlsEnabled
+              - Name: CFDB_WORKER_TLS_IDENTITY
+                Value: !Ref WorkerTlsIdentity
+              - !Ref AWS::NoValue
           # mTLS PEMs (optional). ECS injects each secret as an env var;
           # the image entrypoint (cfdb-tls-entrypoint.sh) writes them to
           # files and points CFDB_WORKER_TLS_CA/CERT/KEY at them. Absent

@@ -4,9 +4,20 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from cfdb.workflows import worker_lan
+from cfdb.workflows.constants import TLS_IDENTITY_ENV
+
+
+class _StopServe(Exception):
+    """Sentinel raised from the patched credentials builder.
+
+    ``serve`` builds credentials as its very first statement, so raising
+    here exits the coroutine before any pool, discovery, or signal
+    machinery is touched — the call arguments are the entire subject.
+    """
 
 
 def _invoke(args: list[str]) -> tuple[int, dict[str, object]]:
@@ -236,3 +247,67 @@ def test_backpressure_bound_factory_should_survive_cloudpickle():
 
     # Assert
     assert restored.keywords["backpressure"].threshold == 1
+
+
+class TestServeIdentityWiring:
+    @pytest.mark.asyncio
+    async def test_serve_should_pass_the_configured_identity_to_the_credentials_builder(
+        self, mocker, monkeypatch
+    ):
+        """Test that the LAN pool's workers get the environment identity.
+
+        Given:
+            ``CFDB_WORKER_TLS_IDENTITY`` set to a non-default name.
+        When:
+            ``serve`` builds its worker credentials.
+        Then:
+            It should pass that identity through, because each pooled
+            worker dials its own subprocess to drain it and verifies an
+            identity-only certificate on that channel — dropping the
+            kwarg turns every graceful drain into a force-reap that
+            loses in-flight work, with no TLS error anywhere.
+        """
+        # Arrange
+        monkeypatch.setenv(TLS_IDENTITY_ENV, "custom-name")
+        build = mocker.patch.object(
+            worker_lan, "build_worker_credentials", side_effect=_StopServe
+        )
+
+        # Act
+        with pytest.raises(_StopServe):
+            await worker_lan.serve(
+                namespace="ns", workers=1, tls_ca="/ca", tls_cert="/c", tls_key="/k"
+            )
+
+        # Assert
+        build.assert_called_once_with("/ca", "/c", "/k", identity="custom-name")
+
+    @pytest.mark.asyncio
+    async def test_serve_should_verify_by_address_when_identity_opted_out(
+        self, mocker, monkeypatch
+    ):
+        """Test that the empty-string opt-out reaches the pool's workers.
+
+        Given:
+            ``CFDB_WORKER_TLS_IDENTITY`` exported as the empty string,
+            the documented opt-out.
+        When:
+            ``serve`` builds its worker credentials.
+        Then:
+            It should pass ``identity=None`` so verification falls back
+            to the dialed address on both sides of the channel.
+        """
+        # Arrange
+        monkeypatch.setenv(TLS_IDENTITY_ENV, "")
+        build = mocker.patch.object(
+            worker_lan, "build_worker_credentials", side_effect=_StopServe
+        )
+
+        # Act
+        with pytest.raises(_StopServe):
+            await worker_lan.serve(
+                namespace="ns", workers=1, tls_ca="/ca", tls_cert="/c", tls_key="/k"
+            )
+
+        # Assert
+        build.assert_called_once_with("/ca", "/c", "/k", identity=None)

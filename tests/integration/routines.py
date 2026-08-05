@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Final
 
+import wool
+
 from cfdb.workflows.cache import CacheBackend
 from cfdb.workflows.events import Complete, StageComplete, WorkflowEvent
 from cfdb.workflows.models import ArtifactKind
@@ -100,6 +102,17 @@ class StubProcessor(Processor):
             if self.sleep_between_yields > 0:
                 await asyncio.sleep(self.sleep_between_yields)
         yield Complete(artifacts=dict(self.artifacts))
+
+
+@wool.routine
+async def echo(value: str) -> str:
+    """Return ``value`` from inside the worker process.
+
+    The smallest thing that can cross the dispatch channel. Used by the
+    mTLS tests, where the payload is irrelevant and the only question is
+    whether the gRPC handshake succeeded at all.
+    """
+    return value
 
 
 def stub_file_meta() -> dict[str, Any]:

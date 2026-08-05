@@ -20,15 +20,33 @@ def _task_arn(task_id: str | None = None) -> str:
     return f"arn:aws:ecs:us-east-1:123:task/cluster/{task_id or uuid.uuid4().hex}"
 
 
+#: Stand-in for the wool version a worker publishes. Any parsable
+#: version works; the poller passes it through verbatim.
+_PUBLISHED_VERSION = "1.2.3"
+
+
 def _running_task(
     task_id: str,
     *,
     ip: str = "10.0.0.5",
     health: str = "HEALTHY",
     status: str = "RUNNING",
+    version: str | None = _PUBLISHED_VERSION,
+    secure: bool | None = None,
 ) -> dict[str, Any]:
-    """Construct a fake ECS DescribeTasks entry."""
-    return {
+    """Construct a fake ECS DescribeTasks entry.
+
+    Tags carry the metadata the worker publishes about itself. Pass
+    ``version=None`` to model a task that is healthy but has not yet
+    published — the poller treats that as not-ready.
+    """
+    tags: list[dict[str, str]] = []
+    if version is not None:
+        tags.append({"key": "wool.version", "value": version})
+    if secure is not None:
+        tags.append({"key": "wool.secure", "value": "true" if secure else "false"})
+
+    task: dict[str, Any] = {
         "taskArn": _task_arn(task_id),
         "lastStatus": status,
         "healthStatus": health,
@@ -42,6 +60,9 @@ def _running_task(
             }
         ],
     }
+    if tags:
+        task["tags"] = tags
+    return task
 
 
 class _FakeEcsClient:
@@ -50,11 +71,17 @@ class _FakeEcsClient:
     def __init__(self) -> None:
         self.task_arns: list[str] = []
         self.tasks: list[dict[str, Any]] = []
+        #: ``include`` values seen by ``describe_tasks``, so a test can
+        #: assert tags were actually requested.
+        self.describe_includes: list[list[str] | None] = []
 
     def list_tasks(self, **_kwargs):
         return {"taskArns": list(self.task_arns)}
 
-    def describe_tasks(self, *, cluster: str, tasks: list[str]):
+    def describe_tasks(
+        self, *, cluster: str, tasks: list[str], include: list[str] | None = None
+    ):
+        self.describe_includes.append(include)
         wanted = set(tasks)
         return {
             "tasks": [t for t in self.tasks if t["taskArn"] in wanted],
@@ -158,6 +185,289 @@ class TestEcsDiscovery:
         assert events[0].type == "worker-added"
         assert events[0].metadata.address == "10.0.0.5:4242"
         assert len(resolved) == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_surface_the_metadata_the_worker_published(self):
+        """Test that version and secure come from the task's tags.
+
+        Given:
+            A healthy task tagged with the wool version and TLS flag its
+            worker published.
+        When:
+            poll_once is awaited.
+        Then:
+            It should advertise exactly those values rather than a
+            default — wool admits a worker only when its version and
+            secure flag match the proxy, so anything synthesized here
+            silently rejects the whole fleet.
+        """
+        # Arrange
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id, version="9.9.9", secure=True)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        _events, resolved = await discovery.poll_once()
+
+        # Assert
+        metadata = next(iter(resolved.values()))
+        assert metadata.version == "9.9.9"
+        assert metadata.secure is True
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_treat_a_task_without_a_secure_tag_as_insecure(
+        self,
+    ):
+        """Test that an absent secure tag means an insecure worker.
+
+        Given:
+            A healthy task that published its version but no TLS flag.
+        When:
+            poll_once is awaited.
+        Then:
+            It should advertise ``secure=False``, matching a worker that
+            configured no credentials, so a plaintext proxy still admits
+            it.
+        """
+        # Arrange
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id, secure=None)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        _events, resolved = await discovery.poll_once()
+
+        # Assert
+        assert next(iter(resolved.values())).secure is False
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_not_surface_a_task_that_has_not_published(self):
+        """Test that a healthy but unpublished task is not advertised.
+
+        Given:
+            A RUNNING and HEALTHY task carrying no metadata tags, as in
+            the window between its health check passing and its own
+            TagResource call landing.
+        When:
+            poll_once is awaited.
+        Then:
+            It should advertise nothing — "has not published yet" is not
+            "has default metadata", and conflating them is what made
+            every worker unadmittable.
+        """
+        # Arrange
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id, version=None)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        events, resolved = await discovery.poll_once()
+
+        # Assert
+        assert events == []
+        assert resolved == {}
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_request_tags_from_describe_tasks(self):
+        """Test that DescribeTasks is asked for tags.
+
+        Given:
+            A discovery with one running task.
+        When:
+            poll_once is awaited.
+        Then:
+            It should call describe_tasks with ``include=["TAGS"]`` —
+            without it ECS omits tags entirely, every task reads as
+            unpublished, and no worker is ever advertised.
+        """
+        # Arrange
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        await discovery.poll_once()
+
+        # Assert
+        assert client.describe_includes == [["TAGS"]]
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_advertise_the_workers_channel_options(self):
+        """Test that advertised metadata carries the shared channel options.
+
+        Given:
+            A healthy, published task. The worker serves under
+            ``worker_grpc_options()`` — a 60s keepalive cadence chosen
+            to clear the server's ping floor — and wool builds the
+            dispatch channel from ``metadata.options``.
+        When:
+            poll_once is awaited.
+        Then:
+            The advertised options should carry the same cadence, so the
+            client actually pings at the rate the worker was configured
+            for rather than wool's default that sits on the floor.
+        """
+        # Arrange
+        from cfdb.workflows.grpc_options import KEEPALIVE_TIME_MS
+
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        _events, resolved = await discovery.poll_once()
+
+        # Assert
+        metadata = next(iter(resolved.values()))
+        assert metadata.options.keepalive_time_ms == KEEPALIVE_TIME_MS
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_keep_a_published_worker_when_tags_go_missing(
+        self,
+    ):
+        """Test that a transient tag miss does not flap a known worker.
+
+        Given:
+            A task that was advertised with published tags on one poll,
+            whose next describe response omits the tags — the signature
+            of the eventually-consistent ``include=["TAGS"]`` secondary
+            lookup, not of the pre-publish window.
+        When:
+            poll_once is awaited again.
+        Then:
+            The worker should stay advertised with its last-read
+            metadata and no ``worker-dropped`` event should be emitted,
+            mirroring the poller's retain-on-transient-failure posture
+            for the list/describe calls themselves.
+        """
+        # Arrange
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id, version="9.9.9", secure=True)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+        await discovery.poll_once()
+        untagged = _running_task(task_id, version=None)
+        untagged["taskArn"] = client.task_arns[0]
+        client.tasks = [untagged]
+
+        # Act
+        events, resolved = await discovery.poll_once()
+
+        # Assert
+        assert events == []
+        metadata = next(iter(resolved.values()))
+        assert metadata.version == "9.9.9"
+        assert metadata.secure is True
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_warn_when_no_task_is_advertisable(self, caplog):
+        """Test that a fleet-wide zero is loud rather than silent.
+
+        Given:
+            Tasks that exist but none advertisable — every one healthy
+            yet unpublished, as a missing ecs:TagResource grant or an
+            old worker image produces fleet-wide.
+        When:
+            poll_once is awaited twice in quick succession.
+        Then:
+            It should log one rate-limited warning naming the count, so
+            the incident is a grep on the API logs instead of a bisect
+            of NoWorkersAvailable causes — and not repeat it on the
+            immediately following poll.
+        """
+        # Arrange
+        import logging
+
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [_running_task(task_id, version=None)]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="cfdb.workflows.discovery"):
+            await discovery.poll_once()
+            await discovery.poll_once()
+
+        # Assert
+        warnings = [
+            record
+            for record in caplog.records
+            if "none advertisable" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "1 task(s)" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_poll_once_should_advertise_metadata_wools_gate_admits(self):
+        """Test that a real worker's published version passes wool's gate.
+
+        Given:
+            A task tagged with the wool protocol version an actual
+            worker would publish (``wool.protocol.__version__``).
+        When:
+            poll_once resolves it into advertised metadata.
+        Then:
+            wool's version-compatibility predicate should admit it
+            against a proxy of the same version — the contract whose
+            silent violation (an invented ``"0"``) rejected the entire
+            fleet while every narrower test stayed green.
+        """
+        # Arrange
+        import wool.protocol
+        from wool.runtime.worker.proxy import is_version_compatible, parse_version
+
+        client = _FakeEcsClient()
+        task_id = uuid.uuid4().hex
+        client.task_arns = [_task_arn(task_id)]
+        client.tasks = [
+            _running_task(task_id, version=wool.protocol.__version__)
+        ]
+        client.tasks[0]["taskArn"] = client.task_arns[0]
+        discovery = EcsDiscovery(
+            cluster="c", task_definition_family="worker", client=client
+        )
+
+        # Act
+        _events, resolved = await discovery.poll_once()
+
+        # Assert
+        advertised = parse_version(next(iter(resolved.values())).version)
+        proxy_side = parse_version(wool.protocol.__version__)
+        assert advertised is not None
+        assert is_version_compatible(proxy_side, advertised)
 
     @pytest.mark.asyncio
     async def test_poll_once_with_unhealthy_task_filtered(self):
@@ -552,6 +862,48 @@ class TestEcsDiscoveryAgainstMoto:
         assert ip is not None
         parts = ip.split(".")
         assert len(parts) == 4 and all(p.isdigit() for p in parts)
+
+    def test_tag_resource_should_round_trip_through_describe_tasks(
+        self, moto_ecs_env_for_discovery
+    ):
+        """Test that the publish and read halves agree on the wire shape.
+
+        Given:
+            A moto-backed task tagged with exactly the request shape
+            ``worker_main._publish_worker_metadata`` sends — lowercase
+            ``key``/``value`` entries (ECS's shape, unlike EC2's
+            ``Key``/``Value``), which a pure ``Mock`` accepts in any
+            spelling.
+        When:
+            The same discovery client reads it back through
+            ``_describe_tasks_batched``.
+        Then:
+            The tags should surface on the described task, proving both
+            halves of the wool.version/wool.secure contract against a
+            real boto3 surface rather than against each other's mocks.
+        """
+        # Arrange
+        arn = moto_ecs_env_for_discovery["task_arns"][0]
+        client = moto_ecs_env_for_discovery["client"]
+        client.tag_resource(
+            resourceArn=arn,
+            tags=[
+                {"key": "wool.version", "value": "1.2.3"},
+                {"key": "wool.secure", "value": "true"},
+            ],
+        )
+        discovery = EcsDiscovery(
+            cluster=moto_ecs_env_for_discovery["cluster"],
+            task_definition_family=moto_ecs_env_for_discovery["family"],
+            client=client,
+        )
+
+        # Act
+        described = discovery._describe_tasks_batched([arn])[0]
+
+        # Assert
+        tags = {t["key"]: t["value"] for t in described.get("tags", [])}
+        assert tags == {"wool.version": "1.2.3", "wool.secure": "true"}
 
 
 class TestWoolReduceContract:
@@ -1163,21 +1515,20 @@ class TestEcsDiscoveryGetstateNonMutation:
 class TestEcsDiscoveryPickleEdges:
     """Completeness/edge coverage for the pickle round-trip (issue #54)."""
 
-    def test___setstate___should_preserve_poll_interval_and_version(
+    def test___setstate___should_preserve_poll_interval_and_worker_port(
         self, monkeypatch
     ):
-        """Test that non-default ``_poll_interval`` / ``_version`` survive.
+        """Test that non-default tuning config survives the round-trip.
 
         Given:
             An EcsDiscovery built with a non-default ``poll_interval`` and
-            ``version``, with ``build_ecs_client`` stubbed.
+            ``worker_port``, with ``build_ecs_client`` stubbed.
         When:
             The instance is cloudpickle round-tripped.
         Then:
-            Both ``_poll_interval`` and ``_version`` survive — config the
-            in-diff setstate test does not assert — confirming the full
-            config payload (not just cluster/family/port) crosses the
-            boundary.
+            Both survive — config the in-diff setstate test does not
+            assert — confirming the full config payload, not just
+            cluster and family, crosses the boundary.
         """
         # Arrange
         monkeypatch.setattr(
@@ -1189,7 +1540,7 @@ class TestEcsDiscoveryPickleEdges:
             task_definition_family="worker",
             client=_FakeEcsClient(),
             poll_interval=12.5,
-            version="cfdb-1.2.3",
+            worker_port=50999,
         )
 
         # Act
@@ -1197,7 +1548,7 @@ class TestEcsDiscoveryPickleEdges:
 
         # Assert
         assert restored._poll_interval == 12.5
-        assert restored._version == "cfdb-1.2.3"
+        assert restored._worker_port == 50999
 
     def test___setstate___should_rebuild_with_none_endpoint_and_region(
         self, monkeypatch
