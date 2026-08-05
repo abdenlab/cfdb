@@ -20,6 +20,8 @@ Function scope:
     sole SAN is the logical identity; the API leaf has none), and two
     hand-copied minters are how two tests start disagreeing about what
     a worker certificate is.
+  - ``offline_aws_env`` — environment that lets a wool worker
+    subprocess construct a boto3 client without reaching AWS.
 
 Scenario model:
   - The ``Scenario`` dataclass + ``Format``/``Endpoint``/``Method``/...
@@ -759,4 +761,32 @@ def worker_certs(tmp_path):
         worker_key,
         api_cert,
         api_key,
+    )
+
+
+@pytest.fixture
+def offline_aws_env(monkeypatch, tmp_path):
+    """Let a wool worker subprocess build a boto3 client without AWS.
+
+    Dispatch cloudpickles the proxy into the worker, so an
+    ``EcsDiscovery`` riding along has its ``__setstate__`` rebuild a
+    real boto3 ECS client *inside the worker* — even though nothing
+    there ever calls it. Without resolvable credentials botocore's
+    chain falls through to the login provider and raises
+    ``MissingDependencyException`` (this venv carries no
+    ``botocore[crt]``); with a developer's ``AWS_PROFILE`` exported it
+    raises ``ProfileNotFound``. Both surface as a failed dispatch,
+    indistinguishable from an mTLS fault — hence the belt-and-braces.
+
+    MUST be set before the worker spawns: the subprocess inherits
+    ``os.environ`` at spawn time.
+    """
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "absent-aws-config"))
+    monkeypatch.setenv(
+        "AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "absent-aws-credentials")
     )
