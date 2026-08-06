@@ -262,6 +262,37 @@ def test_worker_tag_grant_should_be_scoped_to_the_cluster_and_wool_keys():
     assert "BackendClusterName" in (template.get("Parameters") or {})
 
 
+def test_backend_cluster_name_should_have_no_default():
+    """Test that a deploy cannot silently mis-scope the tagging grant.
+
+    Given:
+        The workers template's BackendClusterName parameter, which
+        scopes the ecs:TagResource grant to one environment's cluster.
+    When:
+        The parameter is inspected for a default.
+    Then:
+        It should have none, so CloudFormation rejects a deploy that
+        omits it. A placeholder default deploys cleanly and attaches the
+        policy to a cluster that does not exist, leaving every worker
+        failing the same AccessDenied the grant exists to prevent — with
+        UPDATE_COMPLETE on screen and no signal that anything is wrong.
+        Every other parameter here may carry a placeholder because a
+        wrong value fails visibly; this one may not.
+    """
+    # Arrange
+    template = _load_template("workers.yml")
+
+    # Act
+    parameter = template["Parameters"]["BackendClusterName"]
+
+    # Assert
+    assert "Default" not in parameter, (
+        "BackendClusterName must have no default — see the comment in "
+        "workers.yml. A default makes a forgotten override deploy "
+        "successfully while granting nothing usable."
+    )
+
+
 def test_worker_container_should_declare_aws_region():
     """Test that the worker container is told its region.
 
