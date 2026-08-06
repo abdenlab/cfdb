@@ -116,9 +116,11 @@ Two environments share the account `605134458779` and region `us-east-2`. Every 
 
 Note the templates' parameter defaults (`cfdb.vis-api.link`, `10.2.0.0/21`, `cfdb-tg`) match *neither* live environment — they exist only so a bare `cloudformation deploy` is not rejected for missing parameters. Always pass explicit overrides.
 
+One parameter deliberately breaks that convention: `workers.yml`'s `BackendClusterName` has **no default**, so a deploy that omits it is rejected outright. The convention rests on a wrong value failing visibly — a wrong `DomainName` is the wrong DNS, a wrong `TargetGroupName` collides — and that does not hold for a value which scopes an IAM grant. A placeholder there deploys cleanly, attaches `ecs:TagResource` to a cluster that does not exist, and leaves every worker failing the same `AccessDenied` the grant exists to prevent, with `UPDATE_COMPLETE` on screen. CloudFormation reuses stored parameter values on update, so it only has to be supplied on a stack's first deploy.
+
 #### Deploying the prod stacks
 
-One-time, run by an IAM-capable principal (not the `cfdb-deploy` CI role, which has no `cloudformation:*` or `iam:PassRole`). The CIDRs deliberately do not overlap dev's so the two VPCs can be peered later if needed.
+One-time, run by a principal holding `cloudformation:*`, `iam:PassRole`, and `iam:PutRolePolicy` — see [Which principal can run a privileged deploy](#which-principal-can-run-a-privileged-deploy), because the obvious candidate is not sufficient. The CIDRs deliberately do not overlap dev's so the two VPCs can be peered later if needed.
 
 ```bash
 aws cloudformation deploy --region us-east-2 \
@@ -172,7 +174,6 @@ Promotion re-tags rather than rebuilds, so prod runs bytes byte-identical to wha
 Prod requires this one-time setup before the first promotion:
 
 - A `prod` **GitHub Environment** with required reviewers, carrying two environment variables: `PROD_BACKEND_CLUSTER` (`cfdb-backend-prod-cluster`) and `PROD_BACKEND_SERVICE` (`cfdb-backend-prod-service`). The workflow fails its pre-flight before touching ECR if either is unset.
-- The `cfdb-deploy` CI role's `ecs:UpdateService`/`DescribeServices`/`DescribeTasks`/`ListTasks` extended to `cfdb-backend-prod-cluster` — it is currently scoped to the dev cluster only. It already holds the `ecr:BatchGetImage`/`PutImage` the re-tag needs. This role is created out of band, not in this repo.
 - Both ECR repositories accepting the `:prod` moving tag (see the mutability note above).
 
 As with dev, confirm after the first promotion that the running prod tasks reference `:prod`. If the task definitions still pin a `:<sha>`, promotions will report success while the live code never advances.
@@ -190,7 +191,7 @@ A few operational caveats of the moving-tag pattern:
 This needs two pieces of one-time configuration:
 
 - **GitHub repo variables** (in addition to the existing `AWS_IAM_ROLE` secret): `BACKEND_CLUSTER` (= `cfdb-backend-dev-cluster`) and `BACKEND_SERVICE` (= `cfdb-backend-dev-service`) — the ECS cluster and service the "Roll API service" / "Wait for API rollout" steps target via `aws ecs update-service`. These are GitHub **variables** (`vars.*`), not secrets. `backend.yml` now sets an explicit `ServiceName: ${AWS::StackName}-service` so `BACKEND_SERVICE` is the deterministic `<stack>-service` (e.g. `cfdb-backend-dev-service`) rather than a CloudFormation-generated name. **Caveat:** introducing that explicit name forces a ONE-TIME service replacement on the next backend `cloudformation deploy` (the service is recreated under the new name), after which `BACKEND_SERVICE` must be set to `<stack>-service`.
-- **One-time privileged bootstrap** (run once, by an IAM-capable principal — *not* the `cfdb-deploy` CI role, which lacks CloudFormation/PassRole). Flip both task definitions from a `:<sha>` image to the moving `:dev` tag with a single `cloudformation deploy` per stack, after which all steady-state deploys run on the CI role's existing permissions:
+- **One-time privileged bootstrap** (run once, by a principal holding `cloudformation:*`, `iam:PassRole`, and `iam:PutRolePolicy` — see [Which principal can run a privileged deploy](#which-principal-can-run-a-privileged-deploy); the `cfdb-deploy` CI role has none of them). Flip both task definitions from a `:<sha>` image to the moving `:dev` tag with a single `cloudformation deploy` per stack, after which all steady-state deploys run on the CI role's existing permissions:
 
 > **Failure mode if the bootstrap is skipped — the deploy reports green but ships nothing.** The CI workflow only pushes images and force-rolls the service; it never touches the task definition. Until both task defs reference `:dev`, the service keeps re-pulling whatever SHA the task def still pins, so every CI run will pass (`update-service` and `services-stable` both succeed) while the live code never advances. Always run the bootstrap once before relying on CI deploys, and confirm the running tasks reference `:dev` afterward. The "Verify live image is :dev" guard step below performs a best-effort check of this on every deploy and warns (without failing the build) when the running task's image is not `:dev`; it inspects `aws ecs describe-services` → `aws ecs describe-tasks` because the `cfdb-deploy` role intentionally lacks `ecs:DescribeTaskDefinition`.
 
@@ -213,7 +214,7 @@ aws cloudformation deploy \
 
 The `cloudformation/backend.yml` `ImageURI` and `cloudformation/workers.yml` `WorkerImageURI` parameters now **default** to these `:dev` URIs. Note what that default does and does not do: on a stack **UPDATE**, CloudFormation reuses each parameter's **previous** value, not its default — so the `:dev` default only governs a fresh stack **CREATE**. The point is that a later infra `cloudformation deploy` (an update) keeps whatever value the bootstrap set — `:dev` — rather than reverting to a stale SHA, so the moving-tag CI deploy stays the source of truth for what code runs. Because the task defs pin `:dev` rather than a SHA, task-definition-level traceability to a commit is intentionally given up; it is recovered by the immutable `:<sha>` tag pushed alongside `:dev` and by SHA-based rollback via ECR re-tag.
 
-> **One-time privileged bootstrap #2 — the `ecs:TagResource` grant, ordered BEFORE the image.** Worker images that publish their own metadata (the `wool.version`/`wool.secure` task tags `EcsDiscovery` requires) **exit at startup** when their task role lacks `ecs:TagResource` — deliberately, because an unpublishable worker can never be discovered and would otherwise hold a Fargate slot while unable to receive work. That grant lives in `cloudformation/workers.yml`, and the CI pipeline **cannot deploy it**: the `cfdb-deploy` role holds no `cloudformation:*`, so merging ships the tag-or-die image while the deployed task role still lacks the permission. The failure mode is a fleet that empties itself — every `RunTask` launches a worker that logs `ecs:TagResource denied … exiting` and dies, jobs sit `pending` to the 4 h deadline, and the API-side symptom is the same `NoWorkersAvailable` as every other failure in this section — while CI reports green. **Before the first image carrying metadata publishing reaches an environment**, an IAM-capable principal must run, per environment:
+> **One-time privileged bootstrap #2 — the `ecs:TagResource` grant, ordered BEFORE the image.** Worker images that publish their own metadata (the `wool.version`/`wool.secure` task tags `EcsDiscovery` requires) **exit at startup** when their task role lacks `ecs:TagResource` — deliberately, because an unpublishable worker can never be discovered and would otherwise hold a Fargate slot while unable to receive work. That grant lives in `cloudformation/workers.yml`, and the CI pipeline **cannot deploy it**: the `cfdb-deploy` role holds no `cloudformation:*`, so merging ships the tag-or-die image while the deployed task role still lacks the permission. The failure mode is a fleet that empties itself — every `RunTask` launches a worker that logs `ecs:TagResource denied … exiting` and dies, jobs sit `pending` to the 4 h deadline, and the API-side symptom is the same `NoWorkersAvailable` as every other failure in this section — while CI reports green. **Before the first image carrying metadata publishing reaches an environment**, a principal holding `cloudformation:*`, `iam:PassRole`, and `iam:PutRolePolicy` (see [below](#which-principal-can-run-a-privileged-deploy)) must run, per environment:
 >
 > ```bash
 > aws cloudformation deploy --region us-east-2 \
@@ -224,6 +225,21 @@ The `cloudformation/backend.yml` `ImageURI` and `cloudformation/workers.yml` `Wo
 > ```
 >
 > The forward order is harmless — an old image simply ignores the extra permission — so deploy the stack first, then merge. The same ordering applies to prod before the first promotion carrying this change (`promote-to-prod.yml` runs no CloudFormation either). Confirm with a worker log line `Published worker metadata to <arn>`; the denial, if you got the order wrong, is an `AccessDeniedException` in the worker's CloudWatch group and a rate-limited `none advertisable` warning in the API's.
+
+#### Which principal can run a privileged deploy
+
+Every bootstrap above needs `cloudformation:*`, **`iam:PassRole`**, and **`iam:PutRolePolicy`**. `PassRole` is required because any template change touching a container definition registers a new ECS task definition, which passes the task and execution roles; `PutRolePolicy` because these templates own inline policies on those roles.
+
+**`AWSReservedSSO_PowerUserAccess` is not sufficient**, and it is the trap: it is the role a cfdb operator actually holds, and it is *not* the `cfdb-deploy` CI role, so it reads as qualifying. But PowerUserAccess excludes `iam:*`. The deploy gets as far as building a changeset and then fails:
+
+```
+Resource handler returned message: "Access denied for operation 'Create TaskDefinition
+Access denied: User: arn:aws:sts::605134458779:assumed-role/AWSReservedSSO_PowerUserAccess_.../...
+is not authorized to perform: iam:PassRole on resource:
+arn:aws:iam::605134458779:role/cfdb-workers-dev-WorkerTaskRole-...
+```
+
+A refused attempt is safe: the stack rolls back to `UPDATE_ROLLBACK_COMPLETE` with nothing partially applied, so the cost is a round trip rather than a broken stack. Log in with an `AdministratorAccess`-equivalent permission set and re-run the identical command — these deploys are idempotent.
 
 **Tearing down the cache.** CloudFormation cannot delete a non-empty S3 bucket, so empty the `CacheBucket` before deleting the workers stack or the delete will fail and roll back.
 
