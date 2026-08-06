@@ -69,10 +69,19 @@ Parameters:
       torn down (CFDB_WORKER_DRAIN_GRACE_SECONDS).
   BackendClusterName:
     Type: String
-    # NOTE: like every default in these templates, this matches neither
-    # live environment — pass <backend-stack>-cluster explicitly
-    # (cfdb-backend-dev-cluster / cfdb-backend-prod-cluster).
-    Default: cfdb-backend-cluster
+    # Deliberately has NO default, unlike every other parameter here.
+    # The rest carry a placeholder so a bare `cloudformation deploy` is
+    # not rejected for missing values, on the reasoning that a wrong one
+    # fails visibly (a wrong DomainName is the wrong DNS; a wrong
+    # TargetGroupName collides). That reasoning does not hold here: this
+    # value scopes the ecs:TagResource grant below, so a placeholder
+    # deploys cleanly, attaches the policy to a cluster that does not
+    # exist, and leaves every worker failing the same AccessDenied it
+    # was meant to fix — with UPDATE_COMPLETE on screen. Better to be
+    # rejected at deploy time for a missing value than to ship a grant
+    # that grants nothing. CloudFormation reuses stored parameter
+    # values on update, so this must be supplied on the first deploy
+    # only.
     Description: >
       Name of the ECS cluster the backend stack creates
       (${BackendStackName}-cluster). Used only to scope the worker task
