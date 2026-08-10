@@ -741,7 +741,7 @@ Stream file contents from DCCs via HTTPS.
 | 404 | File not found, or HEAD probe of a not-yet-cached processed artifact (GET would dispatch) |
 | 416 | Range not satisfiable (out of bounds, or file size unknown so no range can be satisfied) |
 | 429 | Too many active preprocessing jobs — the active-workflow ceiling (`CFDB_WORKFLOW_MAX_ACTIVE`) is reached; `Retry-After` header set. Retry shortly. |
-| 501 | No supported access method (e.g., Globus-only files) |
+| 501 | No supported access method — the record carries no access URL, or the file is reachable only by an unsupported transfer (e.g. Globus-only files) |
 | 502 | Upstream service error |
 | 503 | Workflow subsystem shutting down (`Retry-After`) |
 | 504 | Service timeout |

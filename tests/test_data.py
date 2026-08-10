@@ -970,11 +970,14 @@ def _make_encode_file_doc(**overrides) -> dict:
     return doc
 
 
-def _data_router_errors(caplog) -> list[logging.LogRecord]:
+def _cfdb_errors(caplog) -> list[logging.LogRecord]:
+    # Matched across the whole cfdb logger tree rather than the data
+    # router's own name, so the pin follows the reduction if it is ever
+    # hoisted into _helpers alongside lookup_file_doc.
     return [
         record
         for record in caplog.records
-        if record.name == "cfdb.api.routers.data" and record.levelno >= logging.ERROR
+        if record.name.startswith("cfdb.") and record.levelno >= logging.ERROR
     ]
 
 
@@ -1009,7 +1012,7 @@ class TestStreamFileMetadataReduction:
 
         # Assert
         assert response.status_code == 200
-        errors = _data_router_errors(caplog)
+        errors = _cfdb_errors(caplog)
         assert errors == [], [record.getMessage() for record in errors]
 
     @pytest.mark.asyncio
@@ -1042,7 +1045,7 @@ class TestStreamFileMetadataReduction:
 
         # Assert
         assert exc_info.value.status_code == 403
-        errors = _data_router_errors(caplog)
+        errors = _cfdb_errors(caplog)
         assert errors == [], [record.getMessage() for record in errors]
 
     @pytest.mark.asyncio
@@ -1080,7 +1083,7 @@ class TestStreamFileMetadataReduction:
 
         # Assert
         assert exc_info.value.status_code == 501
-        errors = _data_router_errors(caplog)
+        errors = _cfdb_errors(caplog)
         assert errors == [], [record.getMessage() for record in errors]
 
     @pytest.mark.asyncio
@@ -1090,6 +1093,7 @@ class TestStreamFileMetadataReduction:
             ("ENCFF268EYE.bed", "text/plain"),
             ("ENCFF268EYE.fastq.gz", "application/gzip"),
             (None, "application/octet-stream"),
+            ("", "application/octet-stream"),
         ],
     )
     async def test_stream_file_should_carry_the_document_filename_downstream(
@@ -1099,13 +1103,14 @@ class TestStreamFileMetadataReduction:
 
         Given:
             An ENCODE file document whose filename is a BED name, a
-            gzipped name, or absent entirely.
+            gzipped name, absent entirely, or present but empty — the
+            last being the shape a bad upstream record produces.
         When:
             stream_file is called for it.
         Then:
             The response should carry the media type that name implies,
-            falling back to a generic name and octet-stream when the
-            document has none.
+            falling back to a generic name and octet-stream whenever the
+            document supplies no usable one.
         """
         # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
@@ -1127,3 +1132,37 @@ class TestStreamFileMetadataReduction:
         assert response.headers["content-disposition"] == (
             f'attachment; filename="{filename or "file"}"'
         )
+
+    @pytest.mark.asyncio
+    async def test_stream_file_should_log_an_error_when_it_genuinely_fails(
+        self, mock_db, mocker, caplog
+    ):
+        """Test that a real failure still produces an error signal.
+
+        Given:
+            A lookup that raises an unexpected exception.
+        When:
+            stream_file is called.
+        Then:
+            It should raise the 500 and log an ERROR record — the
+            positive control that keeps the absence assertions above
+            from passing on a broken capture path.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch(
+            "cfdb.api.routers.data.lookup_file_doc",
+            side_effect=RuntimeError("lookup exploded"),
+        )
+        mock_db.file.docs = [_make_encode_file_doc()]
+
+        # Act
+        with (
+            caplog.at_level(logging.INFO, logger="cfdb.api.routers.data"),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await stream_file("encode", "ENCFF268EYE", _make_request(), range=None)
+
+        # Assert
+        assert exc_info.value.status_code == 500
+        assert _cfdb_errors(caplog) != []
