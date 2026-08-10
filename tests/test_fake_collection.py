@@ -197,3 +197,97 @@ class TestFakeCollectionContract:
 
         # Assert
         assert coll.docs[0]["stages_done"] == ["data"]
+
+    @pytest.mark.asyncio
+    async def test_find_should_return_every_document_when_limit_is_zero(self):
+        """Test a limit of zero means no limit, as it does in MongoDB.
+
+        Given:
+            A FakeCollection holding five documents.
+        When:
+            The cursor is limited to zero and listed.
+        Then:
+            It should return all five documents — the counter-intuitive
+            driver semantics the files query's page size floor exists to
+            defend against (#86), so softening it here would hollow out
+            that regression test.
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs.extend({"n": i} for i in range(5))
+
+        # Act
+        result = await coll.find({}).limit(0).to_list(length=None)
+
+        # Assert
+        assert [d["n"] for d in result] == [0, 1, 2, 3, 4]
+
+    @pytest.mark.asyncio
+    async def test_find_should_return_abs_limit_documents_when_limit_is_negative(self):
+        """Test a negative limit returns at most its magnitude.
+
+        Given:
+            A FakeCollection holding five documents.
+        When:
+            The cursor is limited to -2 and listed.
+        Then:
+            It should return two documents, mirroring the wire protocol's
+            "at most abs(n), then close the cursor".
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs.extend({"n": i} for i in range(5))
+
+        # Act
+        result = await coll.find({}).limit(-2).to_list(length=None)
+
+        # Assert
+        assert [d["n"] for d in result] == [0, 1]
+
+    def test_find_should_raise_when_skip_is_negative(self):
+        """Test a negative skip is refused, as pymongo refuses it.
+
+        Given:
+            A FakeCollection holding five documents.
+        When:
+            The cursor is asked to skip a negative number of documents.
+        Then:
+            It should raise ValueError client-side rather than silently
+            slicing from the tail.
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs.extend({"n": i} for i in range(5))
+
+        # Act & assert
+        with pytest.raises(ValueError, match="skip must be >= 0"):
+            coll.find({}).skip(-1)
+
+    @pytest.mark.asyncio
+    async def test_find_should_yield_the_same_documents_when_iterated_as_when_listed(
+        self,
+    ):
+        """Test cursor iteration and listing agree on the window.
+
+        Given:
+            A FakeCollection holding five documents, and a skip with a
+            negative limit — the case where the two drain paths used to
+            disagree.
+        When:
+            One cursor is drained with async iteration and another with
+            to_list.
+        Then:
+            Both should yield the same two documents — production code
+            consumes cursors both ways.
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs.extend({"n": i} for i in range(5))
+
+        # Act
+        listed = await coll.find({}).skip(1).limit(-2).to_list(length=None)
+        iterated = [doc async for doc in coll.find({}).skip(1).limit(-2)]
+
+        # Assert
+        assert listed == iterated
+        assert [d["n"] for d in listed] == [1, 2]

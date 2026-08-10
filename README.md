@@ -365,6 +365,10 @@ The GraphQL API uses an implicit OR/AND clause system for building MongoDB queri
 
 Pagination is supported via `page` and `pageSize` parameters (defaults: 0 and 25). `totalCount` is unaffected by both — it always reports the full number of matches for the filter.
 
+Both parameters are bounds-checked and an out-of-range value is rejected with a GraphQL error rather than being passed to the cursor: `page` must be `>= 0`, and `pageSize` must be between 1 and 500 (`MAX_PAGE_SIZE`). The floor matters because MongoDB reads `limit(0)` as *no limit*, so an unvalidated `pageSize: 0` would fetch and convert every matching document — on an unauthenticated endpoint over a collection of millions. Use `fileCount` when you want a count without documents. This is a behavior change: `pageSize: 0` previously returned every match, `pageSize: -1` quietly behaved as `pageSize: 1`, and any `pageSize` above 500 was honored.
+
+Note what those bounds do *not* cover. `page` has a floor but no ceiling, so a deep page still costs the database an O(skip) walk — MongoDB satisfies a skip by discarding documents one at a time — and the ceiling on `pageSize` bounds a single `files` selection rather than a whole request, which may alias the field more than once. Both are properties of the endpoint as a whole rather than of a single argument, and neither is addressed here.
+
 #### OR Query - Multiple Values in a List
 
 Find files with either filename:

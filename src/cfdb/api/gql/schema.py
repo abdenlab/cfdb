@@ -1,7 +1,9 @@
 import asyncio
-from typing import List, Optional
+import logging
+from typing import Annotated, List, Optional
 
 import strawberry
+from graphql import GraphQLError
 
 from cfdb import api
 from cfdb.api.gql.inputs import (
@@ -17,6 +19,44 @@ from cfdb.api.gql.types import (
 )
 from cfdb.models import FileMetadataModel
 from cfdb.services import locks
+
+
+logger = logging.getLogger(__name__)
+
+
+class ClientInputError(ValueError):
+    """An argument the caller got wrong.
+
+    Subclassing ``ValueError`` keeps the client-visible behavior and the
+    resolver convention unchanged — Strawberry surfaces either as a
+    GraphQL error carrying this message. The distinct type exists so
+    ``Schema.process_errors`` can log it as the routine client mistake it
+    is: Strawberry's default logs every error at ERROR with the full
+    traceback attached, and ``/metadata`` is unauthenticated, so anything
+    written per rejected request is a log volume an anonymous caller
+    chooses — and it buries genuine faults in the same stream.
+    """
+
+
+class Schema(strawberry.Schema):
+    """Schema that logs a caller's mistake as a caller's mistake.
+
+    ``ClientInputError`` is reported at INFO without ``exc_info``; every
+    other error keeps Strawberry's default ERROR-with-traceback handling,
+    which is what an operator wants to be alerted on.
+    """
+
+    def process_errors(
+        self, errors: List[GraphQLError], execution_context=None
+    ) -> None:
+        unexpected = []
+        for error in errors:
+            if isinstance(error.original_error, ClientInputError):
+                logger.info("Rejected request: %s", error.message)
+            else:
+                unexpected.append(error)
+        if unexpected:
+            super().process_errors(unexpected, execution_context)
 
 
 ALLOWED_DISTINCT_FIELDS: frozenset[str] = frozenset(
@@ -94,9 +134,35 @@ class Query:
         self,
         _: strawberry.Info,
         input: list[FileMetadataInput] | None = None,
-        page: int = 0,
-        page_size: int = api.PAGE_SIZE,
+        page: Annotated[
+            int,
+            strawberry.argument(description="Zero-based page index. Must be >= 0."),
+        ] = 0,
+        page_size: Annotated[
+            int,
+            strawberry.argument(
+                description=(
+                    f"Documents per page, from 1 to {api.MAX_PAGE_SIZE}. "
+                    "Use the fileCount query for a count without documents."
+                )
+            ),
+        ] = api.PAGE_SIZE,
     ) -> FileList:
+        # Reject out-of-range pagination before touching the database.
+        # Neither bound is enforceable by the cursor: Mongo reads
+        # ``limit(0)`` as *no limit* (so ``pageSize: 0`` would fetch the
+        # whole collection) and ``limit(-n)`` as "at most n, then close",
+        # while a negative skip raises deep in pymongo rather than as a
+        # client error.
+        if page < 0:
+            raise ClientInputError(f"page must be >= 0 (got {page})")
+        if not 1 <= page_size <= api.MAX_PAGE_SIZE:
+            raise ClientInputError(
+                f"pageSize must be between 1 and {api.MAX_PAGE_SIZE} "
+                f"(got {page_size}); use the fileCount query for a count "
+                "without documents"
+            )
+
         # Wait for any database cutover to complete
         await locks.wait_for_cutover()
 
@@ -144,7 +210,7 @@ class Query:
     ) -> List[DistinctFieldType]:
         disallowed = set(fields) - ALLOWED_DISTINCT_FIELDS
         if disallowed:
-            raise ValueError(
+            raise ClientInputError(
                 f"Field(s) not queryable: {', '.join(sorted(disallowed))}"
             )
 
@@ -176,4 +242,4 @@ class Query:
         return await api.db.files.count_documents(query)
 
 
-schema = strawberry.Schema(query=Query)
+schema = Schema(query=Query)

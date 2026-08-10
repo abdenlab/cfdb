@@ -508,7 +508,17 @@ type ProjectType {
 }
 
 type Query {
-  files(input: [FileMetadataInput!] = null, page: Int! = 0, pageSize: Int! = 25): FileList!
+  files(
+    input: [FileMetadataInput!] = null
+
+    """Zero-based page index. Must be >= 0."""
+    page: Int! = 0
+
+    """
+    Documents per page, from 1 to 500. Use the fileCount query for a count without documents.
+    """
+    pageSize: Int! = 25
+  ): FileList!
   file(id: ObjectIdScalar!): FileMetadataType
   distinctValues(fields: [String!]!, input: [FileMetadataInput!] = null): [DistinctFieldType!]!
   fileCount(input: [FileMetadataInput!] = null): Int!

@@ -82,7 +82,15 @@ def _match(doc: dict, query: dict) -> bool:
 
 
 class _FakeCursor:
-    """Async-iterable cursor backed by a plain list."""
+    """Async-iterable cursor backed by a plain list.
+
+    ``skip`` and ``limit`` reproduce pymongo's semantics rather than the
+    intuitive ones, because that mismatch is where #86's pagination bugs
+    lived: a limit of 0 means *no limit*, a negative limit means "at most
+    abs(n), then close the cursor", and a negative skip is rejected
+    client-side by the driver. A double that smoothed any of these over
+    would let the resolver's bounds regress unnoticed.
+    """
 
     def __init__(self, docs: list[dict]) -> None:
         self._docs = list(docs)
@@ -90,6 +98,8 @@ class _FakeCursor:
         self._limit = 0
 
     def skip(self, n: int) -> "_FakeCursor":
+        if n < 0:
+            raise ValueError("skip must be >= 0")
         self._skip = n
         return self
 
@@ -97,18 +107,18 @@ class _FakeCursor:
         self._limit = n
         return self
 
-    async def to_list(self, *, length: Any = None) -> list[dict]:
+    @property
+    def _window(self) -> list[dict]:
         sliced = self._docs[self._skip :]
         if self._limit:
-            sliced = sliced[: self._limit]
+            sliced = sliced[: abs(self._limit)]
         return sliced
 
+    async def to_list(self, *, length: Any = None) -> list[dict]:
+        return self._window
+
     def __aiter__(self):
-        self._iter_docs = iter(
-            self._docs[self._skip :]
-            if not self._limit
-            else self._docs[self._skip : self._skip + self._limit]
-        )
+        self._iter_docs = iter(self._window)
         return self
 
     async def __anext__(self):
