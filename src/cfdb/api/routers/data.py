@@ -1,6 +1,7 @@
 """REST API router for streaming files from DCCs."""
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request, status
@@ -12,7 +13,6 @@ from cfdb.api.routers.cache_stream import (
     serve_workflow_artifact_or_dispatch,
     stream_upstream_url,
 )
-from cfdb.models import FileMetadataModel
 from cfdb.services import drs, locks
 from cfdb.services.drs import (
     DRSError,
@@ -33,6 +33,25 @@ _PATH_PARAM_MAX_LEN = 256
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["data"])
+
+
+@dataclass(frozen=True)
+class FileRef:
+    """The two projected fields the /data streaming path actually reads.
+
+    ``FILE_DOC_PROJECTION`` returns a deliberately narrow document — far
+    too narrow to populate a ``FileMetadataModel``, whose ``collections``
+    field is required and never projected. Nothing past the lookup needs
+    the richer type: the handler reads ``access_url`` to fetch from and
+    ``filename`` to label the response with, and nothing else.
+    """
+
+    #: Upstream URL or DRS URI; ``None`` when the record has no access
+    #: method, which the handler turns into a 501.
+    access_url: str | None
+    #: Name used for the Content-Disposition header and media-type
+    #: sniffing; falls back to ``"file"`` when the record has none.
+    filename: str
 
 
 @router.head("/{dcc}/{local_id}")
@@ -120,37 +139,15 @@ async def stream_file(
                 status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
             )
 
-        # 2. Parse file metadata
-        try:
-            # Extract only the fields needed for the API from the database document
-            file_data = {
-                k: v
-                for k, v in file_doc.items()
-                if k in FileMetadataModel.model_fields
-                and k
-                not in ("dcc", "collections")  # Skip required fields not in database
-            }
-            file_metadata = FileMetadataModel(**file_data)
-        except Exception:
-            logger.exception("Failed to parse file metadata")
-            # Try to extract just the access_url if full parsing fails
-            access_url = file_doc.get("access_url")
-            if not access_url:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Invalid file metadata in database",
-                )
-            # Create a minimal metadata object with just access_url
-            from dataclasses import dataclass
-
-            @dataclass
-            class MinimalMetadata:
-                access_url: str
-                filename: str
-
-            file_metadata = MinimalMetadata(
-                access_url=access_url, filename=file_doc.get("filename", "file")
-            )
+        # 2. Reduce the document to the two fields the streaming path reads.
+        #    Built directly rather than by validating a FileMetadataModel:
+        #    FILE_DOC_PROJECTION deliberately omits `collections`, which the
+        #    model requires, so that validation could only ever fail — and
+        #    nothing downstream consumes the richer type anyway.
+        file_metadata = FileRef(
+            access_url=file_doc.get("access_url"),
+            filename=file_doc.get("filename") or "file",
+        )
 
         # 3. Check if file has access_url
         if not file_metadata.access_url:
@@ -378,7 +375,7 @@ async def stream_file_status(
 
 async def _stream_encode_file(
     file_doc: dict,
-    file_metadata,
+    file_metadata: FileRef,
     request: Request,
     range_header: Optional[str] = None,
 ):
@@ -390,7 +387,7 @@ async def _stream_encode_file(
 
     Args:
         file_doc: MongoDB document for the file
-        file_metadata: Parsed file metadata (FileMetadataModel or MinimalMetadata)
+        file_metadata: The file's access URL and filename
         request: FastAPI request object
         range_header: Optional Range header value
 
@@ -398,9 +395,7 @@ async def _stream_encode_file(
         StreamingResponse with file contents
     """
     download_url = file_metadata.access_url
-    filename = getattr(file_metadata, "filename", None) or file_doc.get(
-        "filename", "file"
-    )
+    filename = file_metadata.filename
     file_size = file_doc.get("size_in_bytes")
 
     logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
