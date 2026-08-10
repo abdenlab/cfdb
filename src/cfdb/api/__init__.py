@@ -17,15 +17,25 @@ if TYPE_CHECKING:
 DATABASE_URL: Final = os.getenv("DATABASE_URL", "mongodb://127.0.0.1:27017")
 DATABASE_NAME: Final = os.getenv("DATABASE_NAME", "cfdb")
 PAGE_SIZE: Final = 25
-# Ceiling on the ``files`` query's page size. ``/metadata`` is
+# Ceiling on a single ``files`` selection's page size. ``/metadata`` is
 # unauthenticated and the production ``files`` collection holds millions
 # of documents, so an unbounded page is a denial-of-service vector: every
 # returned document is converted through ``FileMetadataModel(...)
 # .model_dump()`` and ``from_pydantic`` on the event loop, blocking every
-# other request for the duration. 500 is 20x the default and bounds that
-# synchronous pass at roughly 65ms and a few MB for a representative
-# document (measured at ~0.13ms and ~6KB each), while staying generous
-# enough for bulk clients paginating a large filter.
+# other request for the duration. 500 is 20x the default and holds that
+# synchronous pass to tens of milliseconds and a few MB — measured by
+# timing the conversion of a representative enriched file document, so
+# re-measure if ``FileMetadataModel`` grows materially — while staying
+# generous enough for bulk clients paginating a large filter.
+#
+# Two limits of this bound are worth stating rather than discovering. It
+# is per selection, not per request: a query may alias ``files`` many
+# times, so bounding what one request can cost needs request-level cost
+# limiting, which this is not. And it is deliberately a fixed literal
+# rather than one of this module's ``_parse_int_env`` knobs, because the
+# value is published to clients (README, and the rejection message
+# itself) and a contract that varies per deployment is worse than one
+# that does not.
 MAX_PAGE_SIZE: Final = 500
 
 # TLS authentication configuration (production)
