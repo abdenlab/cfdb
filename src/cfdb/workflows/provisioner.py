@@ -467,10 +467,12 @@ class EcsProvisioner:
         The future is recorded in ``_pending`` so ``aclose`` can drain
         threads mid-flight. A done-callback logs any ARNs the boto
         thread produced *after* the awaiting coroutine was cancelled —
-        these are orphan workers that no caller can claim, and their
-        only safety net is the worker's own ``CFDB_WORKER_MAX_LIFETIME``
-        ceiling. Surfacing them at WARNING gives operators a chance
-        to reap manually before the ceiling fires.
+        these are orphan workers that no caller can claim. Left unused,
+        they self-reap once continuously idle beyond
+        ``CFDB_WORKER_IDLE_TIMEOUT_SECONDS`` (minutes), with the
+        ``CFDB_WORKER_MAX_LIFETIME_SECONDS`` ceiling as the outer
+        bound. Surfacing them at WARNING still gives operators a
+        chance to reap manually first.
         """
         slot = _SubmittedRunTask()
         future = self._executor.submit(self._client.run_task, **kwargs)
