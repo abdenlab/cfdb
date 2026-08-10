@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections import Counter
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -842,6 +843,11 @@ async def _sync_encode(task: SyncTask) -> None:
 
         batch = []
         count = 0
+        # Tally the derived compression terms. The derivation depends on the
+        # shape of ENCODE's download URLs, which nobody here controls, so a
+        # corpus-wide flip (an upstream column rename, a redirect stub) would
+        # otherwise be invisible behind an unchanged row count.
+        compression_counts: Counter[str | None] = Counter()
 
         async for encode_file in fetch_encode_metadata():
             # Transform to C2M2 format
@@ -849,6 +855,7 @@ async def _sync_encode(task: SyncTask) -> None:
             if doc is None:
                 continue
 
+            compression_counts[doc.get("compression_format")] += 1
             batch.append(doc)
             count += 1
 
@@ -866,6 +873,13 @@ async def _sync_encode(task: SyncTask) -> None:
 
     task.progress = f"ENCODE sync complete: {count} files"
     logger.info(task.progress)
+    logger.info(
+        "ENCODE compression_format distribution: %s",
+        {
+            ("undetermined" if term is None else term or "uncompressed"): tally
+            for term, tally in compression_counts.most_common()
+        },
+    )
 
 
 async def _materialize_files(submission: str) -> None:
