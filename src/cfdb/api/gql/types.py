@@ -3,6 +3,7 @@ from typing import List, Optional, Union, get_type_hints
 import strawberry
 import strawberry.scalars
 from bson import ObjectId
+from graphql import GraphQLError
 from pydantic import BaseModel
 
 from cfdb.models import FileMetadataModel
@@ -24,10 +25,14 @@ _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 # Above this magnitude a JSON number is no longer exactly representable in an
-# IEEE-754 double, which is the only numeric type a browser client has. No
-# byte size can reach it (2**53 bytes is ~9 PB), so this is a guard against a
-# non-size value being routed through ``BigInt``, not a live concern for
-# ``size_in_bytes``.
+# IEEE-754 double, which is the only numeric type a browser client has. This
+# is surfaced in the scalar's description and is deliberately NOT enforced:
+# the 64-bit bound above is the one every downstream layer shares (it is
+# exactly where BSON raises), so clamping here would invent a second, softer
+# limit inside a type whose name promises 64 bits. Staying JS-safe is
+# therefore an admission criterion for routing a field through ``BigInt`` —
+# ``size_in_bytes`` qualifies because 2**53 bytes is ~9 PB — rather than
+# something the scalar checks.
 _JS_SAFE_INTEGER_MAX = 2**53 - 1
 
 
@@ -37,12 +42,19 @@ def _coerce_big_int(value):
     Serialization and parsing share one implementation because the wire form
     is a JSON number: the value that goes out is the value that comes back.
     ``bool`` is excluded explicitly because it is an ``int`` subclass in
-    Python and ``true`` is not a size.
+    Python and ``true`` is not a size. Integral floats are rejected too, so
+    the wire form stays one unambiguous representation — note this is
+    stricter than the ``Int`` it replaces, which coerced them.
+
+    Raises ``GraphQLError`` rather than ``ValueError`` because graphql-core
+    logs a non-``GraphQLError`` cause with its traceback: on an
+    unauthenticated endpoint every malformed filter value would otherwise
+    write a stack trace at ERROR.
     """
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"BigInt cannot represent non-integer value: {value!r}")
+        raise GraphQLError(f"BigInt cannot represent non-integer value: {value!r}")
     if not _INT64_MIN <= value <= _INT64_MAX:
-        raise ValueError(
+        raise GraphQLError(
             f"BigInt cannot represent non 64-bit signed integer value: {value}"
         )
     return value
@@ -163,13 +175,23 @@ def _resolve_json_type(field_type):
 def _substitute_scalar(field_type, scalar):
     """Replace a field's scalar type, preserving an ``Optional`` wrapper.
 
-    Overridden fields are declared on the model as ``T`` or ``Optional[T]``,
-    so no deeper nesting needs handling.
+    Only ``T`` and ``Optional[T]`` are handled, and anything else raises
+    rather than being approximated. A silently mishandled wrapper would
+    publish a structurally wrong SDL — a list field emitted as a bare
+    scalar — that the drift test would then bless on the next
+    ``make schema``, so an unsupported shape has to fail here, at import.
     """
     args = getattr(field_type, "__args__", None)
-    if args and type(None) in args:
+    if args is None:
+        return scalar
+    inner = [a for a in args if a is not type(None)]
+    # ``Optional[List[T]]`` also has two args, one of them ``None`` — hence
+    # the check that what remains is itself unparameterized.
+    if len(args) == 2 and len(inner) == 1 and not hasattr(inner[0], "__args__"):
         return Optional[scalar]
-    return scalar
+    raise TypeError(
+        f"scalar override supports only T and Optional[T], not {field_type!r}"
+    )
 
 
 def _rebuild_type(field_type, model_cls, strawberry_cls):
