@@ -7,7 +7,11 @@ import asyncio
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from mongomock_motor import AsyncMongoMockClient
+from starlette.testclient import TestClient
 
+from cfdb import api
+from cfdb.api import main
 from cfdb.api.gql.schema import from_pydantic, schema
 from cfdb.api.gql.types import FileMetadataType
 from cfdb.models import FileMetadataModel
@@ -124,6 +128,346 @@ class TestFilesQuery:
         # Assert
         assert result.errors is None
         assert len(result.data["files"]["items"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_files_should_reject_a_page_size_of_zero(self, mock_db):
+        """Test a page size of zero is refused rather than fetching everything.
+
+        Given:
+            Thirty files in the database — more than the default page size,
+            so an unbounded fetch is distinguishable from a default page.
+        When:
+            The GraphQL files query is executed with pageSize: 0, which
+            MongoDB would read as "no limit".
+        Then:
+            It should return a GraphQL error naming the argument, the
+            rejected value and the accepted range, return no data, and
+            point the caller at the fileCount query.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc(f"f{i}") for i in range(30)]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(pageSize: 0) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert result.data is None
+        message = result.errors[0].message
+        # The literal ceiling is asserted here rather than interpolated from
+        # MAX_PAGE_SIZE: it is a documented part of the client contract
+        # (README), so raising it should fail loudly and prompt a doc update.
+        assert "pageSize must be between 1 and 500" in message
+        assert "(got 0)" in message
+        assert "fileCount" in message
+
+    @pytest.mark.asyncio
+    async def test_files_should_reject_a_negative_page_size(self, mock_db):
+        """Test a negative page size is refused rather than quietly clamped.
+
+        Given:
+            Three files in the database.
+        When:
+            The GraphQL files query is executed with pageSize: -1, which the
+            MongoDB wire protocol reads as "at most one, then close".
+        Then:
+            It should return a GraphQL error naming the rejected value and
+            return no data.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(pageSize: -1) {
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert result.data is None
+        assert "pageSize" in result.errors[0].message
+        assert "(got -1)" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_files_should_reject_a_page_size_above_the_maximum(self, mock_db):
+        """Test the page size ceiling is enforced.
+
+        Given:
+            Three files in the database.
+        When:
+            The GraphQL files query is executed with a page size one above
+            MAX_PAGE_SIZE.
+        Then:
+            It should return a GraphQL error naming the rejected value and
+            return no data.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1")]
+        over_ceiling = api.MAX_PAGE_SIZE + 1
+
+        # Act
+        result = await schema.execute(
+            """
+            query Files($pageSize: Int!) {
+                files(pageSize: $pageSize) {
+                    items {
+                        localId
+                    }
+                }
+            }
+            """,
+            variable_values={"pageSize": over_ceiling},
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert result.data is None
+        assert f"(got {over_ceiling})" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_files_should_reject_a_negative_page(self, mock_db, mocker):
+        """Test a negative page is refused before a cursor is ever built.
+
+        Given:
+            Three files in the database and a spy on the collection's find.
+        When:
+            The GraphQL files query is executed with page: -1, which would
+            otherwise reach pymongo as a negative skip.
+        Then:
+            It should return a GraphQL error naming the page argument rather
+            than leaking the driver's own skip complaint, and it should not
+            query the collection at all.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+        find = mocker.spy(mock_db.files, "find")
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(page: -1) {
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert result.data is None
+        message = result.errors[0].message
+        assert "page must be >= 0 (got -1)" in message
+        assert "skip" not in message
+        assert find.call_count == 0
+
+    # GraphQL's Int scalar is 32-bit, so values outside it are rejected during
+    # variable coercion rather than by the resolver. Bounding the generated
+    # domain keeps this test about the resolver's own validation.
+    _INT32_MIN = -(2**31)
+    _INT32_MAX = 2**31 - 1
+
+    @given(
+        pagination=st.one_of(
+            st.tuples(
+                st.integers(_INT32_MIN, -1),
+                st.integers(1, api.MAX_PAGE_SIZE),
+            ),
+            st.tuples(
+                st.integers(0, 20),
+                st.one_of(
+                    st.integers(_INT32_MIN, 0),
+                    st.integers(api.MAX_PAGE_SIZE + 1, _INT32_MAX),
+                ),
+            ),
+        )
+    )
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_files_should_reject_every_out_of_range_pagination_argument(
+        self, mock_db, pagination
+    ):
+        """Test no out-of-range pagination request ever returns documents.
+
+        Given:
+            A fixed collection of 12 files and a pagination pair in which at
+            least one of page and page_size falls outside the accepted range.
+        When:
+            The GraphQL files query runs with those pagination arguments.
+        Then:
+            It should always return a GraphQL error and never any data.
+        """
+        # Arrange
+        # As in the invariant property above: ``mock_db`` is function-scoped
+        # and reused across examples, so the dataset is reseeded each time,
+        # and the async resolver is driven via asyncio.run.
+        page, page_size = pagination
+        mock_db.files.docs = [_make_file_doc(f"f{i}") for i in range(12)]
+
+        # Act
+        result = asyncio.run(
+            schema.execute(
+                """
+                query Files($page: Int!, $pageSize: Int!) {
+                    files(page: $page, pageSize: $pageSize) {
+                        totalCount
+                        items {
+                            localId
+                        }
+                    }
+                }
+                """,
+                variable_values={"page": page, "pageSize": page_size},
+            )
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert result.data is None
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_one_item_when_page_size_is_one(self, mock_db):
+        """Test the smallest accepted page size is served, not rejected.
+
+        Given:
+            Three files in the database.
+        When:
+            The GraphQL files query is executed with page: 1, pageSize: 1.
+        Then:
+            It should return exactly the second file, with no errors.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(page: 1, pageSize: 1) {
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert [f["localId"] for f in result.data["files"]["items"]] == ["f2"]
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_items_when_page_size_is_the_maximum(
+        self, mock_db
+    ):
+        """Test the page size ceiling is inclusive.
+
+        Given:
+            Three files in the database.
+        When:
+            The GraphQL files query is executed with a page size of exactly
+            MAX_PAGE_SIZE.
+        Then:
+            It should return all three files, with no errors.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1"),
+            _make_file_doc("f2"),
+            _make_file_doc("f3"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query Files($pageSize: Int!) {
+                files(pageSize: $pageSize) {
+                    items {
+                        localId
+                    }
+                }
+            }
+            """,
+            variable_values={"pageSize": api.MAX_PAGE_SIZE},
+        )
+
+        # Assert
+        assert result.errors is None
+        assert len(result.data["files"]["items"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_a_default_page_when_pagination_is_omitted(
+        self, mock_db
+    ):
+        """Test the default page size still satisfies the new bounds.
+
+        Given:
+            Five more files than the default page size.
+        When:
+            The GraphQL files query is executed with neither pagination
+            argument supplied.
+        Then:
+            It should return exactly PAGE_SIZE files alongside the full
+            match count.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc(f"f{i}") for i in range(api.PAGE_SIZE + 5)
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert len(result.data["files"]["items"]) == api.PAGE_SIZE
+        assert result.data["files"]["totalCount"] == api.PAGE_SIZE + 5
 
     @pytest.mark.asyncio
     async def test_files_should_return_total_count_independent_of_page_size(
@@ -1299,3 +1643,65 @@ class TestFileCountQuery:
         # Assert
         assert result.errors is None
         assert result.data["fileCount"] == expected
+
+
+class TestMetadataEndpointPagination:
+    """The bounds as a client sees them: over HTTP, through /metadata."""
+
+    @pytest.fixture()
+    def client(self, mocker):
+        """Serve the app over an in-memory client, mirroring test_cors."""
+        # The app binds the real lifespan at import, so entering the client
+        # runs it — back it with mongomock and disable the workflow
+        # subsystem, as the CORS suite does.
+        mocker.patch.object(
+            main, "create_mongodb_client", return_value=AsyncMongoMockClient()
+        )
+        mocker.patch.object(main.WorkflowProfile, "from_env", return_value=None)
+        with TestClient(main.app) as test_client:
+            yield test_client
+
+    @pytest.mark.parametrize(
+        "variables",
+        [
+            {"page": -1, "pageSize": 25},
+            {"page": 0, "pageSize": 0},
+            {"page": 0, "pageSize": -1},
+            {"page": 0, "pageSize": api.MAX_PAGE_SIZE + 1},
+        ],
+    )
+    def test_files_should_answer_with_a_graphql_error_when_pagination_is_out_of_range(
+        self, client, variables
+    ):
+        """Test out-of-range pagination reaches the client as a GraphQL error.
+
+        Given:
+            The application mounted at /metadata and pagination variables
+            outside the accepted range.
+        When:
+            The files query is POSTed to the endpoint.
+        Then:
+            It should answer 200 with a null data field and a populated
+            errors array rather than a server error carrying a traceback.
+        """
+        # Act
+        response = client.post(
+            "/metadata",
+            json={
+                "query": """
+                    query Files($page: Int!, $pageSize: Int!) {
+                        files(page: $page, pageSize: $pageSize) {
+                            totalCount
+                        }
+                    }
+                """,
+                "variables": variables,
+            },
+        )
+
+        # Assert
+        assert response.status_code == 200
+        body = response.json()
+        assert body["data"] is None
+        assert body["errors"]
+        assert "Traceback" not in body["errors"][0]["message"]
