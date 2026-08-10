@@ -244,8 +244,7 @@ class TestFakeCollectionContract:
         # Assert
         assert [d["n"] for d in result] == [0, 1]
 
-    @pytest.mark.asyncio
-    async def test_find_should_raise_when_skip_is_negative(self):
+    def test_find_should_raise_when_skip_is_negative(self):
         """Test a negative skip is refused, as pymongo refuses it.
 
         Given:
@@ -271,22 +270,23 @@ class TestFakeCollectionContract:
         """Test cursor iteration and listing agree on the window.
 
         Given:
-            A FakeCollection holding five documents and a skip and limit
-            applied to the cursor.
+            A FakeCollection holding five documents, and a skip with a
+            negative limit — the case where the two drain paths used to
+            disagree.
         When:
             One cursor is drained with async iteration and another with
             to_list.
         Then:
-            Both should yield the same documents — production code consumes
-            cursors both ways.
+            Both should yield the same two documents — production code
+            consumes cursors both ways.
         """
         # Arrange
         coll = FakeCollection()
         coll.docs.extend({"n": i} for i in range(5))
 
         # Act
-        listed = await coll.find({}).skip(1).limit(2).to_list(length=None)
-        iterated = [doc async for doc in coll.find({}).skip(1).limit(2)]
+        listed = await coll.find({}).skip(1).limit(-2).to_list(length=None)
+        iterated = [doc async for doc in coll.find({}).skip(1).limit(-2)]
 
         # Assert
         assert listed == iterated

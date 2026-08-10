@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -130,7 +131,7 @@ class TestFilesQuery:
         assert len(result.data["files"]["items"]) == 2
 
     @pytest.mark.asyncio
-    async def test_files_should_reject_a_page_size_of_zero(self, mock_db):
+    async def test_files_should_return_an_error_when_page_size_is_zero(self, mock_db):
         """Test a page size of zero is refused rather than fetching everything.
 
         Given:
@@ -173,7 +174,7 @@ class TestFilesQuery:
         assert "fileCount" in message
 
     @pytest.mark.asyncio
-    async def test_files_should_reject_a_negative_page_size(self, mock_db):
+    async def test_files_should_return_an_error_when_page_size_is_negative(self, mock_db):
         """Test a negative page size is refused rather than quietly clamped.
 
         Given:
@@ -212,11 +213,11 @@ class TestFilesQuery:
         assert "(got -1)" in result.errors[0].message
 
     @pytest.mark.asyncio
-    async def test_files_should_reject_a_page_size_above_the_maximum(self, mock_db):
+    async def test_files_should_return_an_error_when_page_size_exceeds_the_maximum(self, mock_db):
         """Test the page size ceiling is enforced.
 
         Given:
-            Three files in the database.
+            A file in the database.
         When:
             The GraphQL files query is executed with a page size one above
             MAX_PAGE_SIZE.
@@ -248,11 +249,12 @@ class TestFilesQuery:
         assert f"(got {over_ceiling})" in result.errors[0].message
 
     @pytest.mark.asyncio
-    async def test_files_should_reject_a_negative_page(self, mock_db, mocker):
+    async def test_files_should_return_an_error_when_page_is_negative(self, mock_db, mocker):
         """Test a negative page is refused before a cursor is ever built.
 
         Given:
-            Three files in the database and a spy on the collection's find.
+            Three files in the database and spies on both collection calls
+            the resolver makes.
         When:
             The GraphQL files query is executed with page: -1, which would
             otherwise reach pymongo as a negative skip.
@@ -268,6 +270,7 @@ class TestFilesQuery:
             _make_file_doc("f3"),
         ]
         find = mocker.spy(mock_db.files, "find")
+        count_documents = mocker.spy(mock_db.files, "count_documents")
 
         # Act
         result = await schema.execute(
@@ -289,6 +292,7 @@ class TestFilesQuery:
         assert "page must be >= 0 (got -1)" in message
         assert "skip" not in message
         assert find.call_count == 0
+        assert count_documents.call_count == 0
 
     # GraphQL's Int scalar is 32-bit, so values outside it are rejected during
     # variable coercion rather than by the resolver. Bounding the generated
@@ -315,7 +319,7 @@ class TestFilesQuery:
         max_examples=50,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    def test_files_should_reject_every_out_of_range_pagination_argument(
+    def test_files_should_return_an_error_when_any_pagination_argument_is_out_of_range(
         self, mock_db, pagination
     ):
         """Test no out-of-range pagination request ever returns documents.
@@ -326,12 +330,14 @@ class TestFilesQuery:
         When:
             The GraphQL files query runs with those pagination arguments.
         Then:
-            It should always return a GraphQL error and never any data.
+            It should always return a validation error naming the offending
+            argument and the rejected value, and never any data.
         """
         # Arrange
-        # As in the invariant property above: ``mock_db`` is function-scoped
-        # and reused across examples, so the dataset is reseeded each time,
-        # and the async resolver is driven via asyncio.run.
+        # As in ``test_files_should_report_total_count_invariant_under_pagination``:
+        # ``mock_db`` is function-scoped and reused across examples, so the
+        # dataset is reseeded each time, and the async resolver is driven
+        # via asyncio.run.
         page, page_size = pagination
         mock_db.files.docs = [_make_file_doc(f"f{i}") for i in range(12)]
 
@@ -355,6 +361,67 @@ class TestFilesQuery:
         # Assert
         assert result.errors is not None
         assert result.data is None
+        message = result.errors[0].message
+        # Asserting the message shape, not just that something failed: the
+        # cursor double rejects a negative skip too, so a bare "an error
+        # occurred" oracle would be satisfied by the driver over half this
+        # domain even with the resolver's own guard removed.
+        assert message.startswith(("page must be", "pageSize must be"))
+        assert f"(got {page if page < 0 else page_size})" in message
+
+    @pytest.mark.asyncio
+    async def test_files_should_not_log_an_error_when_pagination_is_out_of_range(
+        self, mock_db, caplog
+    ):
+        """Test a refused request is logged as a client mistake, not a fault.
+
+        Given:
+            Log capture over the whole application.
+        When:
+            The GraphQL files query is executed with pageSize: 0.
+        Then:
+            It should record the rejection without an ERROR-level entry, so
+            an anonymous caller cannot drive the error stream a deployment
+            alerts on.
+        """
+        # Act
+        with caplog.at_level(logging.INFO):
+            result = await schema.execute("{ files(pageSize: 0) { totalCount } }")
+
+        # Assert
+        assert result.errors is not None
+        assert [r.message for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert any("pageSize must be between" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_files_should_log_an_error_when_the_resolver_fails_unexpectedly(
+        self, mock_db, mocker, caplog
+    ):
+        """Test a genuine fault still reaches the error stream.
+
+        Given:
+            A cutover wait that raises, standing in for an unexpected
+            server-side failure.
+        When:
+            An in-range GraphQL files query is executed.
+        Then:
+            It should record the failure at ERROR with the exception
+            attached, unlike a refused pagination argument.
+        """
+        # Arrange
+        mocker.patch.object(
+            locks, "wait_for_cutover", side_effect=RuntimeError("cutover exploded")
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO):
+            result = await schema.execute("{ files { totalCount } }")
+
+        # Assert
+        assert result.errors is not None
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors
+        assert errors[0].exc_info is not None
 
     @pytest.mark.asyncio
     async def test_files_should_return_one_item_when_page_size_is_one(self, mock_db):
@@ -1661,17 +1728,54 @@ class TestMetadataEndpointPagination:
         with TestClient(main.app) as test_client:
             yield test_client
 
+    _QUERY = """
+        query Files($page: Int!, $pageSize: Int!) {
+            files(page: $page, pageSize: $pageSize) {
+                totalCount
+            }
+        }
+    """
+
+    def test_files_should_answer_with_data_when_pagination_is_in_range(self, client):
+        """Test the endpoint serves a valid paginated request.
+
+        Given:
+            The application mounted at /metadata and in-range pagination
+            variables.
+        When:
+            The files query is POSTed to the endpoint.
+        Then:
+            It should answer 200 with a match count and no errors.
+        """
+        # Act
+        response = client.post(
+            "/metadata",
+            json={
+                "query": self._QUERY,
+                "variables": {"page": 0, "pageSize": api.PAGE_SIZE},
+            },
+        )
+
+        # Assert
+        assert response.status_code == 200
+        body = response.json()
+        assert "errors" not in body
+        assert body["data"]["files"]["totalCount"] == 0
+
     @pytest.mark.parametrize(
-        "variables",
+        ("variables", "expected"),
         [
-            {"page": -1, "pageSize": 25},
-            {"page": 0, "pageSize": 0},
-            {"page": 0, "pageSize": -1},
-            {"page": 0, "pageSize": api.MAX_PAGE_SIZE + 1},
+            ({"page": -1, "pageSize": 25}, "page must be >= 0 (got -1)"),
+            ({"page": 0, "pageSize": 0}, "pageSize must be between 1 and 500 (got 0)"),
+            ({"page": 0, "pageSize": -1}, "pageSize must be between 1 and 500 (got -1)"),
+            (
+                {"page": 0, "pageSize": api.MAX_PAGE_SIZE + 1},
+                f"pageSize must be between 1 and 500 (got {api.MAX_PAGE_SIZE + 1})",
+            ),
         ],
     )
     def test_files_should_answer_with_a_graphql_error_when_pagination_is_out_of_range(
-        self, client, variables
+        self, client, variables, expected
     ):
         """Test out-of-range pagination reaches the client as a GraphQL error.
 
@@ -1681,27 +1785,17 @@ class TestMetadataEndpointPagination:
         When:
             The files query is POSTed to the endpoint.
         Then:
-            It should answer 200 with a null data field and a populated
-            errors array rather than a server error carrying a traceback.
+            It should answer 200 with a null data field and an errors array
+            carrying the message for the argument that was refused.
         """
         # Act
         response = client.post(
             "/metadata",
-            json={
-                "query": """
-                    query Files($page: Int!, $pageSize: Int!) {
-                        files(page: $page, pageSize: $pageSize) {
-                            totalCount
-                        }
-                    }
-                """,
-                "variables": variables,
-            },
+            json={"query": self._QUERY, "variables": variables},
         )
 
         # Assert
         assert response.status_code == 200
         body = response.json()
         assert body["data"] is None
-        assert body["errors"]
-        assert "Traceback" not in body["errors"][0]["message"]
+        assert expected in body["errors"][0]["message"]
