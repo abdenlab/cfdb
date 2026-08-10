@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
@@ -947,3 +949,181 @@ class TestStreamFileStatus:
 
         # Assert
         assert result == {"ready": True}
+
+
+def _make_encode_file_doc(**overrides) -> dict:
+    doc = {
+        "submission": "encode",
+        "id_namespace": "tag:encodeproject.org,2017:",
+        "local_id": "ENCFF268EYE",
+        "filename": "ENCFF268EYE.bed",
+        "md5": FIXTURE_MD5,
+        "access_url": (
+            "https://www.encodeproject.org/files/ENCFF268EYE"
+            "/@@download/ENCFF268EYE.bed"
+        ),
+        "dcc": {"dcc_abbreviation": "ENCODE"},
+        "file_format": {"name": "BED"},
+        "size_in_bytes": 1024,
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _data_router_errors(caplog) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "cfdb.api.routers.data" and record.levelno >= logging.ERROR
+    ]
+
+
+class TestStreamFileMetadataReduction:
+    """The file reference /data streams from is built off the document."""
+
+    @pytest.mark.asyncio
+    async def test_stream_file_should_log_no_error_when_the_request_succeeds(
+        self, mock_db, mocker, caplog
+    ):
+        """Test that a served /data request produces no error signal.
+
+        Given:
+            A public ENCODE file document and an unwired workflow
+            subsystem, so the request streams straight from upstream.
+        When:
+            stream_file is called for it.
+        Then:
+            It should return a 200 response and log no ERROR record from
+            the data router.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", None)
+        mock_db.file.docs = [_make_encode_file_doc()]
+
+        # Act
+        with caplog.at_level(logging.INFO, logger="cfdb.api.routers.data"):
+            response = await stream_file(
+                "encode", "ENCFF268EYE", _make_request(), range=None
+            )
+
+        # Assert
+        assert response.status_code == 200
+        errors = _data_router_errors(caplog)
+        assert errors == [], [record.getMessage() for record in errors]
+
+    @pytest.mark.asyncio
+    async def test_stream_file_should_log_no_error_when_access_is_refused(
+        self, mock_db, mocker, caplog
+    ):
+        """Test that a refused /data request produces only its own signal.
+
+        Given:
+            A HuBMAP file whose data_access_level is "consortium".
+        When:
+            stream_file is called for it.
+        Then:
+            It should raise the 403 and log no ERROR record from the data
+            router, since the file reference is built before the access
+            guard runs.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", None)
+        mock_db.dcc.docs = [_make_dcc_doc()]
+        mock_db.file.docs = [_make_file_doc(access_level="consortium")]
+
+        # Act
+        with (
+            caplog.at_level(logging.INFO, logger="cfdb.api.routers.data"),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await stream_file("hubmap", "file-1", _make_request(), range=None)
+
+        # Assert
+        assert exc_info.value.status_code == 403
+        errors = _data_router_errors(caplog)
+        assert errors == [], [record.getMessage() for record in errors]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("access_url", [None, ""])
+    async def test_stream_file_should_raise_501_when_no_access_url(
+        self, mock_db, mocker, caplog, access_url
+    ):
+        """Test that a file with no access method mirrors /status's 501.
+
+        Given:
+            An ENCODE file document whose access_url is absent or empty.
+        When:
+            stream_file is called for it.
+        Then:
+            It should raise HTTPException(501) — the same code the
+            /status probe reports for the same record — and log no ERROR
+            record from the data router.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", None)
+        doc = _make_encode_file_doc()
+        if access_url is None:
+            del doc["access_url"]
+        else:
+            doc["access_url"] = access_url
+        mock_db.file.docs = [doc]
+
+        # Act
+        with (
+            caplog.at_level(logging.INFO, logger="cfdb.api.routers.data"),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await stream_file("encode", "ENCFF268EYE", _make_request(), range=None)
+
+        # Assert
+        assert exc_info.value.status_code == 501
+        errors = _data_router_errors(caplog)
+        assert errors == [], [record.getMessage() for record in errors]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "expected_media_type"),
+        [
+            ("ENCFF268EYE.bed", "text/plain"),
+            ("ENCFF268EYE.fastq.gz", "application/gzip"),
+            (None, "application/octet-stream"),
+        ],
+    )
+    async def test_stream_file_should_carry_the_document_filename_downstream(
+        self, mock_db, mocker, filename, expected_media_type
+    ):
+        """Test that the streamed response is labelled from the document.
+
+        Given:
+            An ENCODE file document whose filename is a BED name, a
+            gzipped name, or absent entirely.
+        When:
+            stream_file is called for it.
+        Then:
+            The response should carry the media type that name implies,
+            falling back to a generic name and octet-stream when the
+            document has none.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", None)
+        doc = _make_encode_file_doc()
+        if filename is None:
+            del doc["filename"]
+        else:
+            doc["filename"] = filename
+        mock_db.file.docs = [doc]
+
+        # Act
+        response = await stream_file(
+            "encode", "ENCFF268EYE", _make_request(), range=None
+        )
+
+        # Assert
+        assert response.media_type == expected_media_type
+        assert response.headers["content-disposition"] == (
+            f'attachment; filename="{filename or "file"}"'
+        )
