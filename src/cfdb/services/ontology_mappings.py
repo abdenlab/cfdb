@@ -220,14 +220,6 @@ ORGANISM_TO_NCBI_TAXONOMY = {
     "Caenorhabditis elegans": {"id": "NCBI:txid6239", "name": "Caenorhabditis elegans", "clade": "species"},
 }
 
-# Compression format mapping
-COMPRESSION_TO_EDAM = {
-    "gzip": "format:3989",
-    "gz": "format:3989",
-    "bz2": "format:3990",
-    "zip": "format:3987",
-}
-
 
 def get_file_format(encode_format: str) -> dict | None:
     """
