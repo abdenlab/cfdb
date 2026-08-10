@@ -97,6 +97,21 @@ class Query:
         page: int = 0,
         page_size: int = api.PAGE_SIZE,
     ) -> FileList:
+        # Reject out-of-range pagination before touching the database.
+        # Neither bound is enforceable by the cursor: Mongo reads
+        # ``limit(0)`` as *no limit* (so ``pageSize: 0`` would fetch the
+        # whole collection) and ``limit(-n)`` as "at most n, then close",
+        # while a negative skip raises deep in pymongo rather than as a
+        # client error.
+        if page < 0:
+            raise ValueError(f"page must be >= 0 (got {page})")
+        if not 1 <= page_size <= api.MAX_PAGE_SIZE:
+            raise ValueError(
+                f"pageSize must be between 1 and {api.MAX_PAGE_SIZE} "
+                f"(got {page_size}); use the fileCount query for a count "
+                "without documents"
+            )
+
         # Wait for any database cutover to complete
         await locks.wait_for_cutover()
 

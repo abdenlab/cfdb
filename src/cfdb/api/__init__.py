@@ -17,6 +17,16 @@ if TYPE_CHECKING:
 DATABASE_URL: Final = os.getenv("DATABASE_URL", "mongodb://127.0.0.1:27017")
 DATABASE_NAME: Final = os.getenv("DATABASE_NAME", "cfdb")
 PAGE_SIZE: Final = 25
+# Ceiling on the ``files`` query's page size. ``/metadata`` is
+# unauthenticated and the production ``files`` collection holds millions
+# of documents, so an unbounded page is a denial-of-service vector: every
+# returned document is converted through ``FileMetadataModel(...)
+# .model_dump()`` and ``from_pydantic`` on the event loop, blocking every
+# other request for the duration. 500 is 20x the default and bounds that
+# synchronous pass at roughly 65ms and a few MB for a representative
+# document (measured at ~0.13ms and ~6KB each), while staying generous
+# enough for bulk clients paginating a large filter.
+MAX_PAGE_SIZE: Final = 500
 
 # TLS authentication configuration (production)
 MONGODB_TLS_ENABLED: Final = os.getenv("MONGODB_TLS_ENABLED", "false").lower() == "true"
