@@ -93,6 +93,7 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 | `creation_time` | `Experiment date released` | string | ISO date |
 | `data_access_level` | — | string | Constant: `"public"` (all released ENCODE files) |
 | `file_format` | `File format` | FileFormat | Mapped via `FILE_FORMAT_TO_EDAM` |
+| `compression_format` | `File download URL` | string | EDAM term ID derived from the URL's filename suffix via `COMPRESSION_SUFFIX_TO_EDAM`; `""` when no compression suffix is present; **omitted** when compressed in a format no EDAM term names (`UNMAPPABLE_COMPRESSION_SUFFIXES`) or when the URL carries no filename. Derived from the URL only — never from the accession-synthesized `filename`, which cannot carry a suffix. `format:3989` means gzip-family and does not exclude BGZF. The TSV has no compression column. |
 | `data_type` | `Output type` | DataType | Mapped via `OUTPUT_TYPE_TO_EDAM` |
 | `assay_type` | `Assay` | AssayType | Mapped via `ASSAY_TITLE_TO_OBI` |
 
@@ -246,6 +247,7 @@ fetch_encode_metadata()                 # Streaming TSV from ENCODE API
   │
   └─> transform_to_c2m2(row)            # Per-row transformation
         ├─ Map File format -> EDAM      # ontology_mappings.get_file_format()
+        ├─ Derive compression -> EDAM   # from the download URL's suffix
         ├─ Map Output type -> EDAM      # ontology_mappings.get_data_type()
         ├─ Map Assay -> OBI             # ontology_mappings.get_assay_type()
         ├─ Map Organism -> NCBI         # ontology_mappings.get_taxonomy()

@@ -465,7 +465,7 @@ The central entity representing a stable digital asset.
 | `md5` | string? | MD5 checksum (if SHA-256 unavailable) |
 | `filename` | string | Filename without path |
 | `file_format` | FileFormat? | EDAM CV term for digital format |
-| `compression_format` | string? | EDAM CV term for compression (e.g., gzip) |
+| `compression_format` | string? | EDAM CV term ID for compression (e.g., `format:3989` for gzip); `""` when no compression is recorded or recognized; null/absent when undetermined. Read the note below before relying on it. |
 | `data_type` | DataType? | EDAM CV term for data type |
 | `assay_type` | AssayType? | OBI CV term for experiment type |
 | `analysis_type` | string? | OBI CV term for analysis type |
@@ -477,6 +477,10 @@ The central entity representing a stable digital asset.
 | `status` | string? | Dataset status (e.g., "Published", "QA") |
 | `data_access_level` | string? | Access level: public, consortium, or protected |
 | `extra` | EnrichedFile? | DCC-specific file metadata (see EnrichedFile) |
+
+**A note on `compression_format`, because it is easy to over-read.** The field reports compression that is *extrinsic* to `file_format` — a wrapper the source reveals and `file_format` does not. It is not a statement about whether the bytes are compressed. A BAM, bigWig or bigBed carries `""` despite being internally compressed, because its `file_format` already names that container. Conversely 4DN and HuBMAP take the value straight from their upstream C2M2 datapackage, which in practice leaves it blank on every file — including gzipped ones — so `""` from those DCCs means "upstream recorded nothing", not "uncompressed". Never treat `""` as a licence to skip inspecting the bytes.
+
+ENCODE derives the value from the download URL's filename suffix, because the ENCODE metadata TSV has no compression column. Two consequences are worth knowing. The field is **absent** (rendered as null) rather than `""` when nothing could be determined — no filename in the URL, or a compression suffix no EDAM term expresses (`.bz2`, `.xz`, `.zst`, `.zip`, `.starch`) — so treat null as "sniff the bytes", never as "uncompressed". And `format:3989` means "gzip-family stream": ENCODE names both plain gzip and BGZF `.gz` (it publishes no `.bgz` at all, and roughly a quarter of its `.gz` files are BGZF), so the value cannot distinguish them. Anything deciding on `gunzip | bgzip` must read the BGZF header — which is what `cfdb.workflows.processors.tabix` does, deliberately, and that byte-level check remains the decision of record.
 
 #### Dcc
 

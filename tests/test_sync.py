@@ -2,17 +2,39 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
+from cfdb.services import encode as encode_module
 from cfdb.services import sync as sync_module
 from cfdb.services.sync import (
     SyncTask,
     _enrich_hubmap_collections_and_subjects,
     _enrich_hubmap_files,
+    _load_dataset_async,
     _prune_non_public_hubmap_raw_records,
     _sync_dccs,
+    _sync_encode,
 )
 from cfdb.indexes import data_index_specs
+
+
+def _encode_metadata_row(accession: str, filename: str) -> dict:
+    """Return a minimal ENCODE metadata TSV row for the given download name."""
+    return {
+        "File accession": accession,
+        "File format": "bed",
+        "File download URL": (
+            f"https://www.encodeproject.org/files/{accession}/@@download/{filename}"
+        ),
+    }
+
+
+async def _async_iter(rows):
+    """Yield the given rows, standing in for the streaming metadata fetch."""
+    for row in rows:
+        yield row
 
 
 class TestSyncDccsDataIndexing:
@@ -294,3 +316,191 @@ class TestEnrichHubmapFiles:
         # Non-HuBMAP files untouched
         non_hubmap = [d for d in mock_db.files.docs if d["submission"] == "4dn"]
         assert "data_access_level" not in non_hubmap[0]
+
+
+# ---------------------------------------------------------------------------
+# _load_dataset_async
+# ---------------------------------------------------------------------------
+
+
+class TestLoadDatasetAsync:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("submission", ["4dn", "hubmap"])
+    async def test__load_dataset_async_should_store_compression_format_verbatim(
+        self, mock_db, tmp_path, submission
+    ):
+        """Test that the upstream compression_format column is copied unchanged.
+
+        Given:
+            A C2M2 file table whose compression_format values deliberately
+            contradict what the filenames imply — an uncompressed value on a
+            gzipped name, and a gzip term on a plain name.
+        When:
+            _load_dataset_async loads it for a C2M2-sourced DCC.
+        Then:
+            It should store the column's values, not the filename-implied
+            ones.
+        """
+        # Arrange
+        table = tmp_path / "file.tsv"
+        table.write_text(
+            "local_id\tfilename\tcompression_format\n"
+            "a\tx.bed.gz\t\n"
+            "b\ty.bed\tformat:3989\n"
+            "c\tz.bed.gz\tformat:3989\n"
+        )
+
+        # Act
+        await _load_dataset_async(tmp_path, submission)
+
+        # Assert
+        loaded = {doc["local_id"]: doc["compression_format"] for doc in mock_db.file.docs}
+        assert loaded == {"a": "", "b": "format:3989", "c": "format:3989"}
+
+    @pytest.mark.asyncio
+    async def test__load_dataset_async_should_not_add_compression_format_when_absent(
+        self, mock_db, tmp_path
+    ):
+        """Test that the loader never synthesizes the column.
+
+        Given:
+            A C2M2 file table with no compression_format column at all.
+        When:
+            _load_dataset_async loads it for a C2M2-sourced DCC.
+        Then:
+            The stored records should carry no compression_format key.
+        """
+        # Arrange
+        table = tmp_path / "file.tsv"
+        table.write_text("local_id\tfilename\na\tx.bed.gz\n")
+
+        # Act
+        await _load_dataset_async(tmp_path, "4dn")
+
+        # Assert
+        assert all("compression_format" not in doc for doc in mock_db.file.docs)
+
+
+# ---------------------------------------------------------------------------
+# _sync_encode
+# ---------------------------------------------------------------------------
+
+
+class TestSyncEncode:
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_populate_compression_format_on_inserted_docs(
+        self, mock_db, mocker
+    ):
+        """Test that the derived value reaches the documents the sync inserts.
+
+        Given:
+            Three ENCODE metadata rows published as gzip, bigWig and starch,
+            the three outcomes the released corpus actually produces.
+        When:
+            _sync_encode runs the fetch-transform-insert pipeline.
+        Then:
+            Each inserted document should carry the compression term its
+            filename implies, and the starch document should carry no
+            compression_format key at all.
+        """
+        # Arrange
+        rows = [
+            _encode_metadata_row("ENCFF001AAA", "ENCFF001AAA.bed.gz"),
+            _encode_metadata_row("ENCFF002BBB", "ENCFF002BBB.bigWig"),
+            _encode_metadata_row("ENCFF003CCC", "ENCFF003CCC.bed.starch"),
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda: _async_iter(rows)
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        derived = {
+            doc["local_id"]: doc.get("compression_format", "<absent>")
+            for doc in mock_db.files.docs
+        }
+        assert derived == {
+            "ENCFF001AAA": "format:3989",
+            "ENCFF002BBB": "",
+            "ENCFF003CCC": "<absent>",
+        }
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_log_the_compression_format_distribution(
+        self, mock_db, mocker, caplog
+    ):
+        """Test that the sync reports how the derived values came out.
+
+        Given:
+            ENCODE metadata rows covering gzip, no compression and an
+            undetermined compression.
+        When:
+            _sync_encode runs.
+        Then:
+            It should log a tally of the derived terms, so a corpus-wide flip
+            in ENCODE's URL shape is visible rather than hidden behind an
+            unchanged row count.
+        """
+        # Arrange
+        rows = [
+            _encode_metadata_row("ENCFF001AAA", "ENCFF001AAA.bed.gz"),
+            _encode_metadata_row("ENCFF002BBB", "ENCFF002BBB.bigWig"),
+            _encode_metadata_row("ENCFF003CCC", "ENCFF003CCC.bed.starch"),
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda: _async_iter(rows)
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger="cfdb.services.sync"):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        distribution = next(
+            record.getMessage()
+            for record in caplog.records
+            if "compression_format distribution" in record.getMessage()
+        )
+        assert "'format:3989': 1" in distribution
+        assert "'uncompressed': 1" in distribution
+        assert "'undetermined': 1" in distribution
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_leave_other_dcc_documents_unchanged(
+        self, mock_db, mocker
+    ):
+        """Test that the ENCODE derivation does not touch the other DCCs.
+
+        Given:
+            Materialized 4DN and HuBMAP file documents whose
+            compression_format values contradict their filenames, alongside
+            one ENCODE row to sync.
+        When:
+            _sync_encode runs.
+        Then:
+            The 4DN and HuBMAP documents should be byte-identical afterwards.
+        """
+        # Arrange
+        others = [
+            {"submission": "4dn", "filename": "a.pairs.gz", "compression_format": ""},
+            {
+                "submission": "hubmap",
+                "filename": "b.bed",
+                "compression_format": "format:3989",
+            },
+        ]
+        mock_db.files.docs = [dict(doc) for doc in others]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda: _async_iter([_encode_metadata_row("ENCFF001AAA", "x.bed.gz")]),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        survivors = [d for d in mock_db.files.docs if d["submission"] != "encode"]
+        assert survivors == others

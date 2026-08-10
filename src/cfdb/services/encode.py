@@ -14,6 +14,9 @@ File
 ~~~~
 File accession                  → local_id
 File download URL               → access_url, filename (derived)
+File download URL               → compression_format (suffix-derived; the TSV
+                                  carries no compression column, and the field
+                                  is omitted when undetermined)
 File format                     → file_format (EDAM-mapped)
 Output type                     → data_type (EDAM-mapped), output_type
 Assay                           → assay_type (OBI-mapped)
@@ -101,6 +104,7 @@ Static / config-derived:          dcc.id, dcc.dcc_name, dcc.dcc_abbreviation,
 import logging
 import re
 from typing import AsyncGenerator, Optional
+from urllib.parse import unquote, urlsplit
 
 import aiohttp
 
@@ -199,6 +203,99 @@ def _parse_int(value: str | None) -> int | None:
         return None
 
 
+# Compression suffix to EDAM CV term ID, verified against OLS4: format:3989 is
+# "GZIP format" (extensions gz, gzip), format:3615 is "bgzip" (bgz). Beware
+# format:3990, which adjoins them and is "AVI", not the bzip2 term it looks
+# like. The ENCODE metadata TSV carries no compression column (verified against
+# the live 59-column header), so the filename suffix is the only indicator.
+#
+# Only .gz and .starch actually occur in the released ENCODE corpus; the rest
+# are defensive. The suffix cannot distinguish BGZF from plain gzip — ENCODE
+# publishes no .bgz and roughly a quarter of its .gz files are BGZF — so
+# format:3989 here means "gzip-family stream", not "not bgzip".
+COMPRESSION_SUFFIX_TO_EDAM = {
+    ".gz": "format:3989",
+    ".gzip": "format:3989",
+    ".tgz": "format:3989",  # gzip-compressed tar; same bytes as .tar.gz
+    ".bgz": "format:3615",
+}
+
+# Suffixes that mark a file as compressed but that no EDAM term can express.
+# EDAM has no bzip2, xz, zstd or starch term. .zip is here despite having one
+# (format:3987) because a ZIP holds many members with many formats, so there is
+# no single post-decompression file_format to pair it with, and the tabix
+# processor rejects the PK magic outright — calling it a named compression
+# would invite a consumer to decompress and feed it onward. .starch is a
+# BEDOPS-compressed BED archive whose file_format already maps to plain BED.
+#
+# These resolve to None rather than to UNCOMPRESSED: they are compressed, so
+# claiming otherwise would be worse than admitting we cannot say.
+UNMAPPABLE_COMPRESSION_SUFFIXES = (".bz2", ".xz", ".zst", ".zip", ".starch")
+
+# Longest suffix first, so a more specific suffix is never shadowed by a
+# shorter one it ends with.
+_COMPRESSION_SUFFIXES: tuple[tuple[str, str | None], ...] = tuple(
+    sorted(
+        list(COMPRESSION_SUFFIX_TO_EDAM.items())
+        + [(suffix, None) for suffix in UNMAPPABLE_COMPRESSION_SUFFIXES],
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+# Sentinel for "no compression beyond what file_format already implies",
+# mirroring the value 4DN and HuBMAP carry from their upstream C2M2
+# datapackages. It is NOT a claim that the bytes are uncompressed: BAM, bigWig
+# and bigBed are internally compressed and carry this value, because their
+# file_format names the container rather than its decompressed contents.
+# Distinct from None, which means no determination was possible at all.
+UNCOMPRESSED = ""
+
+
+def derive_compression_format(filename_or_url: str | None) -> str | None:
+    """
+    Derive the EDAM compression term ID from a filename or download URL.
+
+    Reports only compression that is *extrinsic* to the declared file format —
+    a wrapper the filename reveals and file_format does not. A .bam is not
+    reported as compressed even though BGZF underlies it, because its
+    file_format already names that container; a .starch is not reported as
+    uncompressed, because its file_format names the BED it decompresses to.
+
+    Args:
+        filename_or_url: A bare filename or a full download URL.
+
+    Returns:
+        The EDAM CV term ID for the compression format (e.g. "format:3989"
+        for gzip); "" when the name carries no compression suffix; or None
+        when no determination is possible — either because no name was
+        available, or because the name ends in a compression suffix no EDAM
+        term can express.
+    """
+    value = _nonempty(filename_or_url)
+    if value is None:
+        return None
+
+    # Reduce to a basename. Query strings and fragments are URL syntax, so they
+    # are stripped only when the value actually is a URL — in a bare filename a
+    # '?' or '#' is an ordinary character and must not truncate the name.
+    if "://" in value:
+        basename = unquote(urlsplit(value).path).rsplit("/", 1)[-1]
+    else:
+        basename = value.rsplit("/", 1)[-1]
+    basename = basename.lower()
+    if not basename:
+        # A directory-style URL carries no evidence either way. Reporting it
+        # as uncompressed would be a positive claim about a file we cannot see.
+        return None
+
+    for suffix, term_id in _COMPRESSION_SUFFIXES:
+        if basename.endswith(suffix):
+            return term_id
+
+    return UNCOMPRESSED
+
+
 def _extract_donor_ids(donors_str: str | None) -> list[str]:
     """
     Extract donor accession IDs from the Donor(s) TSV field.
@@ -281,6 +378,16 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         "creation_time": _nonempty(row.get("Experiment date released")),
         "persistent_id": f"https://www.encodeproject.org/files/{accession}/",
     }
+
+    # Add compression format if it could be determined. Derived from the
+    # download URL alone: when the row has no URL, `filename` is synthesized
+    # from the accession and cannot carry a compression suffix, so deriving
+    # from it would assert "uncompressed" on no evidence. Left absent rather
+    # than set to None so an undetermined file does not surface as a null in
+    # distinctValues, which the compressionFormat filter cannot select.
+    compression_format_edam = derive_compression_format(access_url)
+    if compression_format_edam is not None:
+        doc["compression_format"] = compression_format_edam
 
     # Add file format if mapped
     if file_format_edam:

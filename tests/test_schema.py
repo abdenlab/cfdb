@@ -690,6 +690,85 @@ class TestFilesQuery:
         assert result.data["files"]["items"] == []
 
     @pytest.mark.asyncio
+    async def test_files_should_return_the_uncompressed_sentinel_as_an_empty_string(
+        self, mock_db
+    ):
+        """Test that the uncompressed sentinel survives the resolver as "".
+
+        Given:
+            One file known to be uncompressed and one gzipped file.
+        When:
+            The GraphQL files query selects compressionFormat.
+        Then:
+            It should return "" for the uncompressed file rather than null,
+            preserving the distinction from an undetermined value.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {**_make_file_doc("f1"), "compression_format": ""},
+            {**_make_file_doc("f2"), "compression_format": "format:3989"},
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: []) {
+                    items {
+                        localId
+                        compressionFormat
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        returned = {
+            item["localId"]: item["compressionFormat"]
+            for item in result.data["files"]["items"]
+        }
+        assert returned == {"f1": "", "f2": "format:3989"}
+
+    @pytest.mark.asyncio
+    async def test_files_should_filter_documents_by_compression_format(self, mock_db):
+        """Test that the derived term is queryable through the input filter.
+
+        Given:
+            An uncompressed file, a gzipped file and a bgzipped file.
+        When:
+            The GraphQL files query filters on the gzip term.
+        Then:
+            It should return only the gzipped file.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {**_make_file_doc("f1"), "compression_format": ""},
+            {**_make_file_doc("f2"), "compression_format": "format:3989"},
+            {**_make_file_doc("f3"), "compression_format": "format:3615"},
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: [{ compressionFormat: ["format:3989"] }]) {
+                    totalCount
+                    items {
+                        localId
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 1
+        assert result.data["files"]["items"] == [{"localId": "f2"}]
+
+    @pytest.mark.asyncio
     async def test_files_should_count_only_matching_documents_when_input_filter_supplied(
         self, mock_db
     ):
@@ -1154,6 +1233,52 @@ class TestDistinctValuesQuery:
         assert result.errors is None
         entry = result.data["distinctValues"][0]
         assert entry["values"] == ["hubmap"]
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_should_return_derived_compression_formats(
+        self, mock_db
+    ):
+        """Test distinct values for a field the DCCs populate.
+
+        Given:
+            Three files carrying the uncompressed sentinel, the gzip term and
+            the bgzip term
+        When:
+            The distinctValues query is executed with fields: ["compression_format"]
+        Then:
+            It should return all three as scalar strings, including the empty
+            string
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {**_make_distinct_doc("f1", "4DN"), "compression_format": ""},
+            {
+                **_make_distinct_doc("f2", "ENCODE"),
+                "compression_format": "format:3989",
+            },
+            {
+                **_make_distinct_doc("f3", "ENCODE"),
+                "compression_format": "format:3615",
+            },
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["compression_format"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        entry = result.data["distinctValues"][0]
+        assert sorted(entry["values"]) == ["", "format:3615", "format:3989"]
+        assert all(isinstance(value, str) for value in entry["values"])
 
     @pytest.mark.asyncio
     async def test_distinct_values_returns_empty_list_for_missing_field(
