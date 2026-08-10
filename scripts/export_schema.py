@@ -21,7 +21,10 @@ def render() -> str:
 
 
 def main() -> None:
-    SCHEMA_PATH.write_text(render())
+    # Explicit encoding, not the process locale: the artifact's bytes are
+    # compared for equality by the drift test, so they must not depend on
+    # the shell of whoever ran ``make schema``.
+    SCHEMA_PATH.write_text(render(), encoding="utf-8")
     print(f"Wrote {SCHEMA_PATH}")
 
 
