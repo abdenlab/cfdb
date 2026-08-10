@@ -1,6 +1,7 @@
 """REST API router for streaming files from DCCs."""
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request, status
@@ -12,7 +13,6 @@ from cfdb.api.routers.cache_stream import (
     serve_workflow_artifact_or_dispatch,
     stream_upstream_url,
 )
-from cfdb.models import FileMetadataModel
 from cfdb.services import drs, locks
 from cfdb.services.drs import (
     DRSError,
@@ -33,6 +33,31 @@ _PATH_PARAM_MAX_LEN = 256
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["data"])
+
+
+@dataclass(frozen=True)
+class _FileRef:
+    """What the /data handler needs to fetch a file and label the response.
+
+    Built from the projected document rather than by validating a
+    ``FileMetadataModel``: ``FILE_DOC_PROJECTION`` never selects
+    ``collections``, which that model requires, so the validation could
+    only ever fail — and nothing past the lookup needs the richer type.
+
+    This is not the whole of what the request reads. ``file_doc`` travels
+    on to the access guard and the workflow layer, which read fields this
+    record deliberately does not carry.
+    """
+
+    #: Upstream URL or DRS URI. Non-empty by construction: the handler
+    #: answers 501 before building this when the record has no access
+    #: method.
+    access_url: str
+    #: Name used for the Content-Disposition header and media-type
+    #: sniffing; falls back to ``"file"`` when the record has none.
+    filename: str
+    #: Total size, or ``None`` when the record does not report one.
+    size_in_bytes: int | None
 
 
 @router.head("/{dcc}/{local_id}")
@@ -120,45 +145,23 @@ async def stream_file(
                 status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
             )
 
-        # 2. Parse file metadata
-        try:
-            # Extract only the fields needed for the API from the database document
-            file_data = {
-                k: v
-                for k, v in file_doc.items()
-                if k in FileMetadataModel.model_fields
-                and k
-                not in ("dcc", "collections")  # Skip required fields not in database
-            }
-            file_metadata = FileMetadataModel(**file_data)
-        except Exception:
-            logger.exception("Failed to parse file metadata")
-            # Try to extract just the access_url if full parsing fails
-            access_url = file_doc.get("access_url")
-            if not access_url:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Invalid file metadata in database",
-                )
-            # Create a minimal metadata object with just access_url
-            from dataclasses import dataclass
-
-            @dataclass
-            class MinimalMetadata:
-                access_url: str
-                filename: str
-
-            file_metadata = MinimalMetadata(
-                access_url=access_url, filename=file_doc.get("filename", "file")
-            )
-
-        # 3. Check if file has access_url
-        if not file_metadata.access_url:
+        # 3. Check the file has an access method, then reduce the document
+        #    to what the streaming path reads. Guarding first is what lets
+        #    _FileRef.access_url be a plain str rather than an Optional the
+        #    call ordering happens to have narrowed.
+        access_url = file_doc.get("access_url")
+        if not access_url:
             logger.warning(f"File has no access_url: {normalized_dcc}/{local_id}")
             raise HTTPException(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
                 detail="File has no access URL",
             )
+
+        file_metadata = _FileRef(
+            access_url=access_url,
+            filename=file_doc.get("filename") or "file",
+            size_in_bytes=file_doc.get("size_in_bytes"),
+        )
 
         # 4. Defence-in-depth: reject any non-public HuBMAP file that somehow
         #    survived pruning. Placed before the workflow branch so protected
@@ -186,7 +189,7 @@ async def stream_file(
 
         # ENCODE files: Stream directly via HTTPS (bypass DRS)
         if normalized_dcc == "encode":
-            return await _stream_encode_file(file_doc, file_metadata, request, range)
+            return await _stream_encode_file(file_metadata, request, range)
 
         # 6. Fetch DRS object metadata
         try:
@@ -377,8 +380,7 @@ async def stream_file_status(
 
 
 async def _stream_encode_file(
-    file_doc: dict,
-    file_metadata,
+    file_metadata: _FileRef,
     request: Request,
     range_header: Optional[str] = None,
 ):
@@ -389,8 +391,7 @@ async def _stream_encode_file(
     We stream directly from the ENCODE download URL.
 
     Args:
-        file_doc: MongoDB document for the file
-        file_metadata: Parsed file metadata (FileMetadataModel or MinimalMetadata)
+        file_metadata: The file's access URL, filename, and size
         request: FastAPI request object
         range_header: Optional Range header value
 
@@ -398,21 +399,18 @@ async def _stream_encode_file(
         StreamingResponse with file contents
     """
     download_url = file_metadata.access_url
-    filename = getattr(file_metadata, "filename", None) or file_doc.get(
-        "filename", "file"
-    )
-    file_size = file_doc.get("size_in_bytes")
+    filename = file_metadata.filename
+    file_size = file_metadata.size_in_bytes
 
     logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
 
     # Determine media type from filename; default to binary. (Branches
     # that resolve to the default are folded away.)
     media_type = "application/octet-stream"
-    if filename:
-        if filename.endswith(".gz"):
-            media_type = "application/gzip"
-        elif filename.endswith((".fastq", ".fq", ".bed")):
-            media_type = "text/plain"
+    if filename.endswith(".gz"):
+        media_type = "application/gzip"
+    elif filename.endswith((".fastq", ".fq", ".bed")):
+        media_type = "text/plain"
 
     try:
         return stream_upstream_url(
