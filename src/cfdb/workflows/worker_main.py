@@ -3,8 +3,11 @@
 This module is the ``CMD`` for the worker container image. It boots a
 ``wool.LocalWorker`` on a known port, exposes a tiny HTTP health endpoint
 the ECS health check probes, handles SIGTERM cleanly so ``ecs.stop_task``
-cycles drain in-flight work, and self-terminates after a configurable
-maximum lifetime so workers don't accumulate when the dispatch rate falls.
+cycles drain in-flight work, and self-terminates once it has been
+continuously idle beyond a configurable threshold so workers don't
+accumulate when the dispatch rate falls — with a maximum-lifetime
+ceiling retained as a backstop for workers whose idle reporting is
+wedged or whose job is stuck.
 
 ECS owns the worker *lifecycle* — registration, IP, status, health — and
 ``EcsDiscovery`` polls it for all of that. But two fields of the wool
@@ -27,10 +30,24 @@ Environment variables (single source of truth; CLI flags mirror them):
 * ``CFDB_WORKER_GRPC_PORT`` — gRPC port wool binds (default 50051).
 * ``CFDB_WORKER_HEALTH_PORT`` — HTTP ``/health`` port the ECS
   ``healthCheck`` probes (default 8080).
+* ``CFDB_WORKER_IDLE_TIMEOUT_SECONDS`` — continuous idle beyond
+  which the worker exits; 0 disables. The primary reaper: a busy
+  worker reports zero idle, so the idle exit never fires mid-task,
+  and a dispatch racing the teardown drains under the
+  self-termination grace below.
+* ``CFDB_WORKER_IDLE_POLL_INTERVAL_SECONDS`` — cadence of the idle
+  poll (default 15). Values below the loop's 1 s wakeup are
+  effectively floored at 1 s.
+* ``CFDB_WORKER_IDLE_POLL_FAILURE_LIMIT`` — consecutive idle-poll
+  failures before the worker escalates once to ERROR and disables
+  idle shutdown (default 20).
 * ``CFDB_WORKER_MAX_LIFETIME_SECONDS`` — hard ceiling on worker
-  uptime; 0 disables. One hour above
-  :data:`cfdb.workflows.WORKFLOW_DURATION_CAP_S` so a worker started
-  shortly before a long sort can still outlive the job.
+  uptime; 0 disables. The backstop behind the idle timeout for a
+  worker whose idle reporting is wedged or whose job is stuck.
+* ``CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS`` — how long a
+  self-terminating exit (idle or max-lifetime) waits for in-flight
+  tasks to drain before cancelling them; worst-case worker uptime is
+  therefore lifetime + grace.
 * ``CFDB_WORKER_DRAIN_GRACE_SECONDS`` — how long ``/health`` returns
   503 after SIGTERM before tearing down the gRPC port. A second
   SIGTERM short-circuits.
@@ -75,16 +92,69 @@ __all__ = ["main", "serve"]
 #: ``healthCheck`` can ``curl`` it without speaking gRPC.
 DEFAULT_HEALTH_PORT = 8080
 
-#: Default maximum wall-clock lifetime of a worker process. Wool exposes
-#: no per-job activity hook today, so the worker can't tell idle from
-#: busy; this is a hard ceiling — ECS replaces the task after this long.
-#: Sized one hour above :data:`cfdb.workflows.WORKFLOW_DURATION_CAP_S`
-#: (default 4 h) so a worker started shortly before a long sort can
-#: still outlive the job. Note: max-lifetime expiry exits without the
-#: drain-grace window the SIGTERM path provides — operators that want
-#: a cleaner handoff should rely on ECS rolling tasks via service
-#: updates rather than waiting for max-lifetime to fire.
-DEFAULT_MAX_LIFETIME_SECONDS = 5 * 60 * 60
+#: Default continuous-idle threshold beyond which the worker exits.
+#: This is the primary reaper: wool's ``idle`` RPC reports seconds since
+#: the worker's in-flight task set last became empty (zero while any
+#: task runs), so the idle exit never fires while a task is running,
+#: and a dispatch accepted in the teardown window drains under
+#: :data:`DEFAULT_MAX_LIFETIME_GRACE_SECONDS` rather than being
+#: cancelled. Ten minutes rides out ordinary dispatch gaps between
+#: queued jobs while reclaiming a drained-to-idle Fargate task ~70×
+#: sooner than the max-lifetime ceiling would. ``0`` disables idle
+#: shutdown and restores the pure max-lifetime behavior.
+DEFAULT_IDLE_TIMEOUT_SECONDS = 600.0
+
+#: Default cadence at which the serve loop polls its own worker's
+#: ``idle`` RPC. The RPC returns the accumulated continuous idle
+#: duration, so the cadence only bounds threshold overshoot — the
+#: worker exits within one poll interval of crossing the timeout —
+#: and polls deliberately do not disturb the measurement. The loop
+#: wakes once per :data:`_STOP_POLL_INTERVAL_SECONDS`, so values
+#: below 1 s are effectively floored at 1 s.
+DEFAULT_IDLE_POLL_INTERVAL_SECONDS = 15.0
+
+#: Per-poll gRPC deadline for the ``idle`` RPC. The dial is loopback,
+#: so a slow answer means the worker subprocess is broken rather than
+#: busy; a poll that times out is logged and retried on the next
+#: cadence, and a worker that never answers is bounded by the
+#: max-lifetime backstop.
+_IDLE_POLL_RPC_TIMEOUT_SECONDS = 5.0
+
+#: Consecutive idle-poll failures tolerated before the loop escalates
+#: once to ERROR and disables further polling. Twenty at the 15 s
+#: cadence is ~5 minutes of sustained failure — far beyond any
+#: transient blip — after which continuing to warn every cadence adds
+#: noise without information. The max-lifetime backstop still bounds
+#: the worker once polling is disabled.
+DEFAULT_IDLE_POLL_FAILURE_LIMIT = 20
+
+#: Default maximum wall-clock lifetime of a worker process — the
+#: backstop behind idle-based shutdown, not the primary reaper. It
+#: bounds the two cases the idle timeout cannot: a worker whose
+#: ``idle`` RPC is wedged or unimplemented (so idle polling yields
+#: nothing), and a stuck job that holds the in-flight set non-empty
+#: past any reasonable runtime. Because expiry now drains in-flight
+#: work for up to :data:`DEFAULT_MAX_LIFETIME_GRACE_SECONDS` rather
+#: than cancelling it, the ceiling can sit well above any healthy
+#: job's runtime: a worker that stays busy back-to-back is reaped at
+#: the first expiry whose drain completes, not mid-task.
+DEFAULT_MAX_LIFETIME_SECONDS = 12 * 60 * 60
+
+#: How long a self-terminating exit — idle timeout or max-lifetime —
+#: waits for in-flight tasks to drain before cancelling them
+#: (``wool.Worker.stop(grace=...)``). On a genuinely idle exit the
+#: docket is empty and the drain returns instantly, so the grace
+#: costs nothing in the common case; it exists for the two cases
+#: where work is in flight at stop time: a dispatch accepted between
+#: the final idle poll and the teardown, and a max-lifetime expiry on
+#: a busy worker. Sized above the API's 4 h
+#: :data:`cfdb.workflows.WORKFLOW_DURATION_CAP_S` so a healthy job
+#: always finishes inside it — the only work ever cancelled is work
+#: already past the API's own viability bound. Worst-case worker
+#: uptime is therefore lifetime + grace (18 h at the defaults). The
+#: signal path does not use this grace: ECS bounds SIGTERM with
+#: SIGKILL, so a long drain there is unreachable anyway.
+DEFAULT_MAX_LIFETIME_GRACE_SECONDS = 6 * 60 * 60
 
 #: How long to keep returning ``503`` on ``/health`` after SIGTERM,
 #: giving ECS a chance to observe ``unhealthy`` and drain at the load
@@ -328,11 +398,33 @@ async def _publish_worker_metadata(
             return
 
 
+def _lifetime_bound_description(max_lifetime_seconds: float) -> str:
+    """Describe what still bounds the worker once idle polling stops.
+
+    The disable-polling log lines close with this so they stay honest
+    when the max-lifetime backstop is itself disabled (``0``): claiming
+    a "backstop (0s)" would assert a bound that does not exist.
+    """
+    if max_lifetime_seconds > 0:
+        return (
+            f"the max-lifetime backstop ({max_lifetime_seconds:.0f}s) "
+            "still bounds this worker"
+        )
+    return (
+        "no max-lifetime backstop is configured — this worker's uptime "
+        "is now unbounded"
+    )
+
+
 async def serve(
     *,
     worker_port: int = DEFAULT_WORKER_PORT,
     health_port: int = DEFAULT_HEALTH_PORT,
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    idle_poll_interval_seconds: float = DEFAULT_IDLE_POLL_INTERVAL_SECONDS,
+    idle_poll_failure_limit: int = DEFAULT_IDLE_POLL_FAILURE_LIMIT,
     max_lifetime_seconds: float = DEFAULT_MAX_LIFETIME_SECONDS,
+    max_lifetime_grace_seconds: float = DEFAULT_MAX_LIFETIME_GRACE_SECONDS,
     drain_grace_seconds: float = DEFAULT_DRAIN_GRACE_SECONDS,
     tls_ca: Optional[str] = None,
     tls_cert: Optional[str] = None,
@@ -340,9 +432,24 @@ async def serve(
     publish_attempts: int = DEFAULT_PUBLISH_ATTEMPTS,
     publish_backoff_seconds: float = DEFAULT_PUBLISH_BACKOFF_SECONDS,
 ) -> int:
-    """Run the worker until SIGTERM or maximum lifetime elapses.
+    """Run the worker until SIGTERM, idle timeout, or maximum lifetime.
 
-    Returns ``0`` on clean shutdown (SIGTERM, SIGINT, or max-lifetime).
+    The primary self-termination path is idle-based: on a
+    ``idle_poll_interval_seconds`` cadence the loop asks its own worker
+    (via wool's ``idle`` RPC, over loopback) how long it has been
+    continuously idle, and exits once that crosses
+    ``idle_timeout_seconds``. A busy worker reports zero idle, so the
+    idle exit never fires while a task is running;
+    ``idle_timeout_seconds=0`` disables it. ``max_lifetime_seconds``
+    remains as the backstop for a worker whose idle reporting is wedged
+    or whose job is stuck. Both self-termination exits stop the worker
+    with ``grace=max_lifetime_grace_seconds``, draining any in-flight
+    task — a dispatch that raced the idle teardown, or the job a
+    max-lifetime expiry interrupted — before cancelling; the signal
+    paths keep wool's immediate cancel.
+
+    Returns ``0`` on clean shutdown (SIGTERM, SIGINT, idle timeout, or
+    max-lifetime).
     Bind failures and other early-startup errors raise out — ``main``
     propagates them and the process exits with a Python traceback,
     which surfaces the cause in container logs more clearly than a
@@ -415,8 +522,22 @@ async def serve(
         # too_many_pings; see cfdb.workflows.grpc_options.
         options=worker_grpc_options(),
     )
+    idle_conn: Optional["wool.WorkerConnection"] = None
+    # Grace passed to ``worker.stop()`` in the teardown. ``None`` is
+    # wool's immediate-cancel; the self-termination exits below replace
+    # it with ``max_lifetime_grace_seconds`` so their teardown drains
+    # in-flight work, while the signal paths keep the immediate cancel.
+    stop_grace: Optional[float] = None
     await worker.start()
     try:
+        if idle_timeout_seconds > 0:
+            # Dial our own worker over loopback to poll its idle RPC —
+            # the same channel-back-to-own-subprocess pattern wool uses
+            # for graceful stop, so the shared credentials (and their
+            # identity SAN) verify the same way they do on that channel.
+            idle_conn = wool.WorkerConnection(
+                f"127.0.0.1:{worker_port}", credentials=credentials
+            )
         # Publish before entering the serve loop. The worker is already
         # accepting gRPC by now, but until its tags land EcsDiscovery
         # deliberately will not advertise it, so there is no window in
@@ -437,25 +558,39 @@ async def serve(
             "enabled" if credentials is not None else "disabled",
             WORKER_MAX_CONCURRENT_TASKS if backpressure is not None else "unbounded",
         )
+        next_idle_poll = loop.time()
+        idle_poll_failures = 0
         while True:
-            # Check the self-termination path first. Max-lifetime is a
-            # local hard ceiling: the gap between ``stop_event.set()``
-            # and ``worker.stop()`` is microseconds — no health probe
-            # will actually fire during it, so this is a defense-in-
-            # depth flip rather than a real drain window. Operators
-            # that need a true drain handoff on max-lifetime should
-            # roll tasks via ECS service updates instead of relying
-            # on the self-timeout. Flipping /health to 503 still costs
-            # nothing and keeps the in-process ordering consistent
-            # with the signal path's drain semantics.
+            # Check the self-termination paths first. Both skip the
+            # signal path's /health drain window (the gap between
+            # ``stop_event.set()`` and ``worker.stop()`` is microseconds
+            # — no health probe will actually fire during it) but set
+            # ``stop_grace`` so the teardown *drains* in-flight work
+            # instead of cancelling it. That grace is what makes these
+            # exits safe: an idle snapshot cannot rule out a dispatch
+            # accepted between the final poll and the stop, and a
+            # max-lifetime expiry can land mid-job on a busy worker —
+            # in either case the accepted task has already been marked
+            # running on the API side, where a graceless cancel would
+            # finalize the job as terminally failed rather than
+            # re-queue it. With the grace, in-flight work runs to
+            # completion (instantly when the docket is truly empty)
+            # and only the drain's own timeout — sized above the API's
+            # per-job duration cap — ever cancels anything. The signal
+            # paths leave ``stop_grace`` at wool's immediate cancel:
+            # ECS bounds SIGTERM with SIGKILL, so a long drain there
+            # could never complete anyway.
             if (
                 max_lifetime_seconds > 0
                 and (loop.time() - started_at) >= max_lifetime_seconds
             ):
                 logger.info(
-                    "Max lifetime (%.0fs) reached — exiting",
+                    "Max lifetime (%.0fs) reached — draining in-flight "
+                    "work for up to %.0fs, then exiting",
                     max_lifetime_seconds,
+                    max_lifetime_grace_seconds,
                 )
+                stop_grace = max_lifetime_grace_seconds
                 stop_event.set()
                 break
             if stop_event.is_set():
@@ -476,6 +611,62 @@ async def serve(
                     except asyncio.TimeoutError:
                         pass
                 break
+            if idle_conn is not None and loop.time() >= next_idle_poll:
+                next_idle_poll = loop.time() + idle_poll_interval_seconds
+                try:
+                    idle = await idle_conn.idle(
+                        timeout=_IDLE_POLL_RPC_TIMEOUT_SECONDS
+                    )
+                except wool.IdleUnavailable:
+                    # Structurally unreachable when the worker is this
+                    # same wool install, but a skew scenario must not
+                    # crash-loop the poll: fall back to the
+                    # max-lifetime backstop. The connection stays
+                    # referenced so the teardown below still closes it.
+                    logger.warning(
+                        "Worker does not implement idle reporting — "
+                        "disabling idle shutdown; %s",
+                        _lifetime_bound_description(max_lifetime_seconds),
+                    )
+                    next_idle_poll = float("inf")
+                except Exception as exc:
+                    # Transient or unexpected poll failure. A busy
+                    # worker must never die to a flaky poll, so retry
+                    # on the next cadence — but sustained failure is
+                    # not a blip (a permanent TLS misconfiguration or
+                    # a dead subprocess looks exactly like this), so
+                    # after enough consecutive misses escalate once to
+                    # ERROR and stop polling: one actionable CloudWatch
+                    # signal instead of hours of identical warnings.
+                    idle_poll_failures += 1
+                    if idle_poll_failures >= idle_poll_failure_limit:
+                        logger.error(
+                            "Idle poll failed %d consecutive times "
+                            "(last: %s: %s) — disabling idle shutdown; %s",
+                            idle_poll_failures,
+                            type(exc).__name__,
+                            exc,
+                            _lifetime_bound_description(max_lifetime_seconds),
+                        )
+                        next_idle_poll = float("inf")
+                    else:
+                        logger.warning(
+                            "Idle poll failed (%s: %s), retrying in %.0fs",
+                            type(exc).__name__,
+                            exc,
+                            idle_poll_interval_seconds,
+                        )
+                else:
+                    idle_poll_failures = 0
+                    if idle >= idle_timeout_seconds:
+                        logger.info(
+                            "Idle for %.0fs (threshold %.0fs) — exiting",
+                            idle,
+                            idle_timeout_seconds,
+                        )
+                        stop_grace = max_lifetime_grace_seconds
+                        stop_event.set()
+                        break
             try:
                 await asyncio.wait_for(
                     stop_event.wait(), timeout=_STOP_POLL_INTERVAL_SECONDS
@@ -484,8 +675,13 @@ async def serve(
                 continue
         return 0
     finally:
+        if idle_conn is not None:
+            try:
+                await idle_conn.close()
+            except Exception:
+                logger.exception("idle connection close failed during shutdown")
         try:
-            await worker.stop()
+            await worker.stop(grace=stop_grace)
         except Exception:
             logger.exception("worker.stop() failed during shutdown")
         await _shutdown_health_server(health_runner)
@@ -561,12 +757,60 @@ async def _shutdown_health_server(runner: Optional["web.AppRunner"]) -> None:
     help="HTTP port the ECS health-check endpoint binds.",
 )
 @click.option(
+    "--idle-timeout-seconds",
+    type=click.FloatRange(min=0),
+    envvar="CFDB_WORKER_IDLE_TIMEOUT_SECONDS",
+    default=DEFAULT_IDLE_TIMEOUT_SECONDS,
+    show_default=True,
+    help=(
+        "Continuous idle seconds beyond which the worker exits; "
+        "0 disables idle shutdown."
+    ),
+)
+@click.option(
+    "--idle-poll-interval-seconds",
+    type=click.FloatRange(min=0),
+    envvar="CFDB_WORKER_IDLE_POLL_INTERVAL_SECONDS",
+    default=DEFAULT_IDLE_POLL_INTERVAL_SECONDS,
+    show_default=True,
+    help=(
+        "Cadence of the idle poll in seconds. Values below the loop's "
+        "1 s wakeup are effectively floored at 1 s."
+    ),
+)
+@click.option(
+    "--idle-poll-failure-limit",
+    type=click.IntRange(min=1),
+    envvar="CFDB_WORKER_IDLE_POLL_FAILURE_LIMIT",
+    default=DEFAULT_IDLE_POLL_FAILURE_LIMIT,
+    show_default=True,
+    help=(
+        "Consecutive idle-poll failures before escalating once to "
+        "ERROR and disabling idle shutdown for this worker."
+    ),
+)
+@click.option(
     "--max-lifetime-seconds",
     type=click.FloatRange(min=0),
     envvar="CFDB_WORKER_MAX_LIFETIME_SECONDS",
     default=DEFAULT_MAX_LIFETIME_SECONDS,
     show_default=True,
-    help="Hard ceiling on worker uptime in seconds; 0 disables.",
+    help=(
+        "Hard ceiling on worker uptime in seconds; 0 disables. The "
+        "backstop behind the idle timeout, not the primary reaper."
+    ),
+)
+@click.option(
+    "--max-lifetime-grace-seconds",
+    type=click.FloatRange(min=0),
+    envvar="CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS",
+    default=DEFAULT_MAX_LIFETIME_GRACE_SECONDS,
+    show_default=True,
+    help=(
+        "Seconds a self-terminating exit (idle or max-lifetime) drains "
+        "in-flight work before cancelling it. Worst-case uptime is "
+        "max lifetime plus this grace."
+    ),
 )
 @click.option(
     "--drain-grace-seconds",
@@ -619,7 +863,11 @@ async def _shutdown_health_server(runner: Optional["web.AppRunner"]) -> None:
 def main(
     worker_port: int,
     health_port: int,
+    idle_timeout_seconds: float,
+    idle_poll_interval_seconds: float,
+    idle_poll_failure_limit: int,
     max_lifetime_seconds: float,
+    max_lifetime_grace_seconds: float,
     drain_grace_seconds: float,
     tls_ca: Optional[str],
     tls_cert: Optional[str],
@@ -630,7 +878,8 @@ def main(
     """ECS Fargate worker entrypoint — invoked by the container CMD.
 
     Boots a wool gRPC worker, exposes /health for ECS to probe, and
-    self-terminates after the max-lifetime ceiling. SIGTERM begins a
+    self-terminates once continuously idle beyond the idle timeout
+    (with the max-lifetime ceiling as a backstop). SIGTERM begins a
     drain grace window during which /health returns 503 so the load
     balancer can drop the worker before the gRPC port closes.
     """
@@ -640,7 +889,11 @@ def main(
             serve(
                 worker_port=worker_port,
                 health_port=health_port,
+                idle_timeout_seconds=idle_timeout_seconds,
+                idle_poll_interval_seconds=idle_poll_interval_seconds,
+                idle_poll_failure_limit=idle_poll_failure_limit,
                 max_lifetime_seconds=max_lifetime_seconds,
+                max_lifetime_grace_seconds=max_lifetime_grace_seconds,
                 drain_grace_seconds=drain_grace_seconds,
                 tls_ca=tls_ca,
                 tls_cert=tls_cert,
