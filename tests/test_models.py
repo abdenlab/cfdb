@@ -723,6 +723,52 @@ class TestEnrichedBiosample:
 
 
 class TestFileMetadataModel:
+    def test___init___should_preserve_the_uncompressed_sentinel(self):
+        """Test that the uncompressed sentinel is not collapsed into None.
+
+        Given:
+            One document whose compression_format is the empty string, and
+            one that omits the field entirely.
+        When:
+            Both are instantiated.
+        Then:
+            The first should keep "" and the second should be None, since ""
+            means known-uncompressed while None means undetermined.
+        """
+        # Arrange
+        uncompressed = {**_minimal_file_metadata(), "compression_format": ""}
+        undetermined = _minimal_file_metadata()
+
+        # Act
+        uncompressed_result = FileMetadataModel(**uncompressed)
+        undetermined_result = FileMetadataModel(**undetermined)
+
+        # Assert
+        assert uncompressed_result.compression_format == ""
+        assert undetermined_result.compression_format is None
+
+    def test___init___should_reject_a_subdocument_compression_format(self):
+        """Test that the field stays a scalar rather than an EDAM subdocument.
+
+        Given:
+            A document whose compression_format is an id/name dict, the shape
+            file_format takes after materialization.
+        When:
+            The model is instantiated.
+        Then:
+            It should raise a ValidationError, since the GraphQL type, the
+            input filter and the upstream C2M2 column are all scalar strings.
+        """
+        # Arrange
+        data = {
+            **_minimal_file_metadata(),
+            "compression_format": {"id": "format:3989", "name": "gzip"},
+        }
+
+        # Act & assert
+        with pytest.raises(ValidationError):
+            FileMetadataModel(**data)
+
     def test_deserializes_with_dict_shaped_extra_file_format(self):
         """Test that a 4DN doc with a CV-object extra_files file_format loads.
 
