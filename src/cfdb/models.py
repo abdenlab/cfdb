@@ -387,8 +387,13 @@ class FileMetadataModel(BaseModel):
             (e.g., TSV or FASTQ). If compressed, this is the uncompressed format.
 
         compression_format:
-            An EDAM CV term ID identifying the compression format (e.g., gzip or
-            bzip2). None if file is not compressed.
+            An EDAM CV term ID identifying compression that is extrinsic to
+            file_format (e.g., "format:3989" for gzip). The empty string means
+            no compression was recorded or recognized -- NOT that the bytes are
+            uncompressed, since a BAM or bigWig is internally compressed and
+            carries it, and the C2M2-sourced DCCs leave the upstream column
+            blank on gzipped files. None means no determination was possible;
+            neither value licenses skipping a byte-level check.
 
         data_type:
             An EDAM CV term ID identifying the type of information stored in this
