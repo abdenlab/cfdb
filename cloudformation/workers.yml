@@ -52,14 +52,42 @@ Parameters:
       Days after which cached artifacts expire. Cache keys are
       content-addressed by upstream md5, so expiry is safe — a missing
       artifact is simply re-materialized on the next request.
+  WorkerIdleTimeoutSeconds:
+    Type: String
+    Default: "600"
+    AllowedPattern: "^[0-9]+$"
+    Description: >
+      Continuous idle seconds beyond which a worker exits
+      (CFDB_WORKER_IDLE_TIMEOUT_SECONDS); 0 disables idle shutdown.
+      The primary reaper — a busy worker reports zero idle, so the
+      idle exit never fires mid-task, and a dispatch racing the
+      teardown drains under WorkerMaxLifetimeGraceSeconds. Keep this
+      comfortably above CFDB_WORKFLOW_RETRY_INTERVAL_S (default 120 s)
+      plus worker cold-start time (at least 2-3x), or overflow-spawned
+      workers idle-reap before the scheduler's next retry tick reaches
+      them and jobs ride the queue to the capacity deadline.
   WorkerMaxLifetimeSeconds:
     Type: String
-    Default: "18000"
+    Default: "43200"
     AllowedPattern: "^[0-9]+$"
     Description: >
       Hard ceiling on worker uptime (CFDB_WORKER_MAX_LIFETIME_SECONDS);
-      one hour above the 4 h workflow duration cap so a worker started
-      shortly before a long sort can still outlive the job.
+      the backstop behind the idle timeout for a worker whose idle
+      reporting is wedged or whose job is stuck. Expiry drains
+      in-flight work for up to WorkerMaxLifetimeGraceSeconds rather
+      than cancelling it, so worst-case worker uptime is this ceiling
+      plus that grace (18 h at the defaults).
+  WorkerMaxLifetimeGraceSeconds:
+    Type: String
+    Default: "21600"
+    AllowedPattern: "^[0-9]+$"
+    Description: >
+      Seconds a self-terminating exit — idle timeout or max lifetime —
+      drains in-flight work before cancelling it
+      (CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS). Instant when the worker
+      is genuinely idle; sized above the 4 h workflow duration cap so
+      the only work ever cancelled is work already past the API's own
+      viability bound.
   WorkerDrainGraceSeconds:
     Type: String
     Default: "120"
@@ -360,8 +388,12 @@ Resources:
               Value: "50051"
             - Name: CFDB_WORKER_HEALTH_PORT
               Value: "8080"
+            - Name: CFDB_WORKER_IDLE_TIMEOUT_SECONDS
+              Value: !Ref WorkerIdleTimeoutSeconds
             - Name: CFDB_WORKER_MAX_LIFETIME_SECONDS
               Value: !Ref WorkerMaxLifetimeSeconds
+            - Name: CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS
+              Value: !Ref WorkerMaxLifetimeGraceSeconds
             - Name: CFDB_WORKER_DRAIN_GRACE_SECONDS
               Value: !Ref WorkerDrainGraceSeconds
             # The worker tags its own task at startup (worker-metadata
