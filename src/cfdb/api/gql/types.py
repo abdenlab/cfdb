@@ -18,6 +18,62 @@ class ObjectIdScalar:
     ...
 
 
+# Bounds of a signed 64-bit integer — the range ``BigInt`` accepts, matching
+# what MongoDB stores in a BSON int64 and what a C2M2 file size can be.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+# Above this magnitude a JSON number is no longer exactly representable in an
+# IEEE-754 double, which is the only numeric type a browser client has. No
+# byte size can reach it (2**53 bytes is ~9 PB), so this is a guard against a
+# non-size value being routed through ``BigInt``, not a live concern for
+# ``size_in_bytes``.
+_JS_SAFE_INTEGER_MAX = 2**53 - 1
+
+
+def _coerce_big_int(value):
+    """Coerce a ``BigInt`` value in either direction, rejecting non-integers.
+
+    Serialization and parsing share one implementation because the wire form
+    is a JSON number: the value that goes out is the value that comes back.
+    ``bool`` is excluded explicitly because it is an ``int`` subclass in
+    Python and ``true`` is not a size.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"BigInt cannot represent non-integer value: {value!r}")
+    if not _INT64_MIN <= value <= _INT64_MAX:
+        raise ValueError(
+            f"BigInt cannot represent non 64-bit signed integer value: {value}"
+        )
+    return value
+
+
+@strawberry.scalar(
+    description=(
+        "A signed 64-bit integer, serialized as a JSON number. Widens the "
+        "GraphQL `Int` scalar, which the specification fixes at 32 bits and "
+        "which therefore cannot represent a file larger than ~2 GB. Values "
+        f"beyond {_JS_SAFE_INTEGER_MAX} (2^53-1) exceed what an IEEE-754 "
+        "double represents exactly and would lose precision in a JavaScript "
+        "client; byte sizes cannot reach that magnitude."
+    ),
+    serialize=_coerce_big_int,
+    parse_value=_coerce_big_int,
+)
+class BigInt:
+    """A signed 64-bit integer represented as a JSON number in GraphQL."""
+
+    ...
+
+
+# Model fields whose Python ``int`` annotation must NOT become a GraphQL
+# ``Int``. Keyed by ``(model, field name)`` so widening one model's field
+# does not silently widen an unrelated field that happens to share its name.
+_SCALAR_OVERRIDES: dict[tuple[type, str], object] = {
+    (FileMetadataModel, "size_in_bytes"): BigInt,
+}
+
+
 @strawberry.type
 class DistinctFieldType:
     field: str
@@ -104,6 +160,18 @@ def _resolve_json_type(field_type):
     return field_type
 
 
+def _substitute_scalar(field_type, scalar):
+    """Replace a field's scalar type, preserving an ``Optional`` wrapper.
+
+    Overridden fields are declared on the model as ``T`` or ``Optional[T]``,
+    so no deeper nesting needs handling.
+    """
+    args = getattr(field_type, "__args__", None)
+    if args and type(None) in args:
+        return Optional[scalar]
+    return scalar
+
+
 def _rebuild_type(field_type, model_cls, strawberry_cls):
     """Replace a BaseModel class inside a (possibly nested) type annotation
     with its Strawberry equivalent, preserving Optional/List wrappers."""
@@ -146,6 +214,12 @@ def annotate(model, name=None):
         if name:
             cls.__name__ = f"{name}Type"
         for field_name, field_type in get_type_hints(model).items():
+            override = _SCALAR_OVERRIDES.get((model, field_name))
+            if override is not None:
+                cls.__annotations__[field_name] = _substitute_scalar(
+                    field_type, override
+                )
+                continue
             model_cls, _ = _find_basemodel(field_type)
             if model_cls is None:
                 if field_type is ObjectId:

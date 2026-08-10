@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import strawberry
 
+from cfdb.api.gql.types import BigInt
+
 
 @strawberry.input
 class AnatomyInput:
@@ -243,7 +245,10 @@ class FileMetadataInput:
     project_local_id: list[str] | None = None
     persistent_id: list[str] | None = None
     creation_time: list[str] | None = None
-    size_in_bytes: list[int] | None = None
+    # ``BigInt``, not ``int``: a 32-bit ``Int`` filter cannot name the size of
+    # a file over ~2 GB, which would leave exactly the files the widened
+    # output field exposes unfilterable.
+    size_in_bytes: list[BigInt] | None = None
     sha256: list[str] | None = None
     md5: list[str] | None = None
     filename: list[str] | None = None
