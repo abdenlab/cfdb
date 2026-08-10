@@ -106,7 +106,8 @@ async def stream_file(
             logger.error("Database not initialized")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database not available",
+            )
+      detail="Database not available",
             )
 
         logger.info(
