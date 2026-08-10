@@ -9,6 +9,12 @@ import pytest
 from cfdb import api
 
 
+# The exact size, in bytes, of the ENCODE .hic file named in issue #83 —
+# above the 2**31-1 ceiling GraphQL's ``Int`` scalar imposes. Shared so the
+# number that names the regression exists in exactly one place.
+ISSUE_83_SIZE = 6262125716
+
+
 def _resolve(doc: dict, key: str):
     """Resolve a possibly dot-notated key against a nested dict."""
     value = doc
