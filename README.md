@@ -84,6 +84,7 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 | `make api` | Build and start the API container |
 | `make materialize-files` | Manually materialize all file metadata (usually done via sync) |
 | `make materialize-dcc DCC=hubmap` | Materialize a single DCC |
+| `make schema` | Regenerate the checked-in `schema.graphql` from the Strawberry schema |
 | `make certs` | Generate TLS certificates for production |
 | `make mongodb-prod` | Start MongoDB with TLS/X.509 authentication |
 | `make api-prod` | Start API with X.509 client certificate |
@@ -356,6 +357,19 @@ Single file lookup: `{ file(id: "507f1f77bcf86cd799439011") { filename accessUrl
 
 File count for a filter: `{ fileCount(input: [{ dcc: [{ dccAbbreviation: ["4DN"] }] }]) }` — returns the number of matching files without fetching any documents. It accepts the same `FileMetadataInput` filter shape as `files`; with no `input` it counts every file.
 
+### Custom Scalars
+
+| Scalar | Wire form | Used by |
+|--------|-----------|---------|
+| `ObjectIdScalar` | JSON string | `file(id:)` |
+| `BigInt` | JSON number | `sizeInBytes`, on both `FileMetadataType` and `FileMetadataInput` |
+
+`BigInt` is a signed 64-bit integer. The GraphQL specification fixes `Int` at 32 bits, so a file larger than 2,147,483,647 bytes (~2.1 GB) could not be represented at all: the field resolved to `null` and contributed a `Int cannot represent non 32-bit signed integer value` entry to the response's `errors` array, degrading a whole page of results to a partial one. That affects every ENCODE `.hic` file (6–51 GB) and the larger 4DN mcools, so it is the common case for contact maps rather than an edge case. The input filter carries the same scalar — a 32-bit filter would leave exactly the files the widened output field exposes unfilterable.
+
+`BigInt` stays a JSON **number** on the wire rather than a string, so `sizeInBytes` remains directly usable in client-side arithmetic and comparisons with no parsing step. The usual objection to that choice — values above `Number.MAX_SAFE_INTEGER` (2^53-1) lose precision in JavaScript — does not bind here: 2^53 bytes is ~9 PB, far above any file this API serves. The scalar rejects non-integers (including `true`/`false`) and anything outside the signed 64-bit range on both input and output.
+
+**This is a breaking schema change.** A client that hard-codes `Int` breaks in three ways: a query declaring `query Q($s: [Int!])` and passing it to `sizeInBytes` now fails variable-type validation and must declare `[BigInt!]`; generated clients must re-run codegen against the new SDL; and any client validating responses against a stored copy of the schema must refresh it. A client that merely *reads* `sizeInBytes` out of the JSON response needs no change — it was already receiving a JSON number, and now receives a correct one instead of `null`.
+
 ### Query Mechanics
 
 The GraphQL API uses an implicit OR/AND clause system for building MongoDB queries:
@@ -460,7 +474,7 @@ The central entity representing a stable digital asset.
 | `dcc` | Dcc | The Data Coordinating Center that produced this file |
 | `collections` | Collection[] | Collections containing this file |
 | `project` | Project? | The primary project within which this file was created |
-| `size_in_bytes` | int? | File size |
+| `size_in_bytes` | int? | File size, exposed as the 64-bit `BigInt` scalar (see [Custom Scalars](#custom-scalars)) |
 | `sha256` | string? | SHA-256 checksum (preferred) |
 | `md5` | string? | MD5 checksum (if SHA-256 unavailable) |
 | `filename` | string | Filename without path |
