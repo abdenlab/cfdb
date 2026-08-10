@@ -36,22 +36,28 @@ router = APIRouter(prefix="/data", tags=["data"])
 
 
 @dataclass(frozen=True)
-class FileRef:
-    """The two projected fields the /data streaming path actually reads.
+class _FileRef:
+    """What the /data handler needs to fetch a file and label the response.
 
-    ``FILE_DOC_PROJECTION`` returns a deliberately narrow document — far
-    too narrow to populate a ``FileMetadataModel``, whose ``collections``
-    field is required and never projected. Nothing past the lookup needs
-    the richer type: the handler reads ``access_url`` to fetch from and
-    ``filename`` to label the response with, and nothing else.
+    Built from the projected document rather than by validating a
+    ``FileMetadataModel``: ``FILE_DOC_PROJECTION`` never selects
+    ``collections``, which that model requires, so the validation could
+    only ever fail — and nothing past the lookup needs the richer type.
+
+    This is not the whole of what the request reads. ``file_doc`` travels
+    on to the access guard and the workflow layer, which read fields this
+    record deliberately does not carry.
     """
 
-    #: Upstream URL or DRS URI; ``None`` when the record has no access
-    #: method, which the handler turns into a 501.
-    access_url: str | None
+    #: Upstream URL or DRS URI. Non-empty by construction: the handler
+    #: answers 501 before building this when the record has no access
+    #: method.
+    access_url: str
     #: Name used for the Content-Disposition header and media-type
     #: sniffing; falls back to ``"file"`` when the record has none.
     filename: str
+    #: Total size, or ``None`` when the record does not report one.
+    size_in_bytes: int | None
 
 
 @router.head("/{dcc}/{local_id}")
@@ -139,23 +145,23 @@ async def stream_file(
                 status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
             )
 
-        # 2. Reduce the document to the two fields the streaming path reads.
-        #    Built directly rather than by validating a FileMetadataModel:
-        #    FILE_DOC_PROJECTION deliberately omits `collections`, which the
-        #    model requires, so that validation could only ever fail — and
-        #    nothing downstream consumes the richer type anyway.
-        file_metadata = FileRef(
-            access_url=file_doc.get("access_url"),
-            filename=file_doc.get("filename") or "file",
-        )
-
-        # 3. Check if file has access_url
-        if not file_metadata.access_url:
+        # 3. Check the file has an access method, then reduce the document
+        #    to what the streaming path reads. Guarding first is what lets
+        #    _FileRef.access_url be a plain str rather than an Optional the
+        #    call ordering happens to have narrowed.
+        access_url = file_doc.get("access_url")
+        if not access_url:
             logger.warning(f"File has no access_url: {normalized_dcc}/{local_id}")
             raise HTTPException(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
                 detail="File has no access URL",
             )
+
+        file_metadata = _FileRef(
+            access_url=access_url,
+            filename=file_doc.get("filename") or "file",
+            size_in_bytes=file_doc.get("size_in_bytes"),
+        )
 
         # 4. Defence-in-depth: reject any non-public HuBMAP file that somehow
         #    survived pruning. Placed before the workflow branch so protected
@@ -183,7 +189,7 @@ async def stream_file(
 
         # ENCODE files: Stream directly via HTTPS (bypass DRS)
         if normalized_dcc == "encode":
-            return await _stream_encode_file(file_doc, file_metadata, request, range)
+            return await _stream_encode_file(file_metadata, request, range)
 
         # 6. Fetch DRS object metadata
         try:
@@ -374,8 +380,7 @@ async def stream_file_status(
 
 
 async def _stream_encode_file(
-    file_doc: dict,
-    file_metadata: FileRef,
+    file_metadata: _FileRef,
     request: Request,
     range_header: Optional[str] = None,
 ):
@@ -386,8 +391,7 @@ async def _stream_encode_file(
     We stream directly from the ENCODE download URL.
 
     Args:
-        file_doc: MongoDB document for the file
-        file_metadata: The file's access URL and filename
+        file_metadata: The file's access URL, filename, and size
         request: FastAPI request object
         range_header: Optional Range header value
 
@@ -396,18 +400,17 @@ async def _stream_encode_file(
     """
     download_url = file_metadata.access_url
     filename = file_metadata.filename
-    file_size = file_doc.get("size_in_bytes")
+    file_size = file_metadata.size_in_bytes
 
     logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
 
     # Determine media type from filename; default to binary. (Branches
     # that resolve to the default are folded away.)
     media_type = "application/octet-stream"
-    if filename:
-        if filename.endswith(".gz"):
-            media_type = "application/gzip"
-        elif filename.endswith((".fastq", ".fq", ".bed")):
-            media_type = "text/plain"
+    if filename.endswith(".gz"):
+        media_type = "application/gzip"
+    elif filename.endswith((".fastq", ".fq", ".bed")):
+        media_type = "text/plain"
 
     try:
         return stream_upstream_url(
