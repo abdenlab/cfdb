@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
 
 from cfdb.services import encode as encode_module
-from cfdb.services import sync as sync_module
 from cfdb.services import fourdn as fourdn_module
+from cfdb.services import sync as sync_module
 from cfdb.services.sync import (
     SyncTask,
     _enrich_4dn_api_metadata,
@@ -17,6 +18,8 @@ from cfdb.services.sync import (
     _enrich_hubmap_files,
     _load_dataset_async,
     _prune_non_public_hubmap_raw_records,
+    _set_accession_ids,
+    _stamp_4dn_file_accessions,
     _sync_dccs,
     _sync_encode,
 )
@@ -391,6 +394,41 @@ class TestLoadDatasetAsync:
 
 class TestSyncEncode:
     @pytest.mark.asyncio
+    async def test__sync_encode_should_populate_accession_id_on_inserted_docs(
+        self, mock_db, mocker
+    ):
+        """Test that the accession survives the path that reaches the database.
+
+        ENCODE writes the files collection directly rather than through the
+        materializer, so this pipeline is the only writer of both accession
+        levels for that DCC.
+
+        Given:
+            An ENCODE row carrying a file accession, an experiment accession
+            and a biosample term.
+        When:
+            _sync_encode runs the fetch-transform-insert pipeline.
+        Then:
+            The inserted document should carry the folded accession at both
+            the file and the collection level.
+        """
+        # Arrange
+        row = _encode_metadata_row("encff001aaa", "encff001aaa.bed.gz")
+        row["Experiment accession"] = "encsr918zsj"
+        row["Biosample term name"] = "K562"
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda: _async_iter([row])
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        doc = next(d for d in mock_db.files.docs if d["submission"] == "encode")
+        assert doc["accession_id"] == "ENCFF001AAA"
+        assert doc["collections"][0]["accession_id"] == "ENCSR918ZSJ"
+
+    @pytest.mark.asyncio
     async def test__sync_encode_should_populate_compression_format_on_inserted_docs(
         self, mock_db, mocker
     ):
@@ -509,21 +547,164 @@ class TestSyncEncode:
         assert survivors == others
 
 
-class TestEnrich4dnApiMetadata:
+class TestStamp4dnFileAccessions:
     @pytest.mark.asyncio
-    async def test__enrich_4dn_api_metadata_should_stamp_accession_id_when_api_returns_nothing(
-        self, mocker, mock_db
+    async def test__stamp_4dn_file_accessions_should_write_the_raw_file_collection(
+        self, mock_db
     ):
-        """Test that accession_id does not depend on the Search API matching.
+        """Test that the accession survives a re-materialization.
+
+        The materializer rebuilds ``files`` from ``file`` on every run, so a
+        value written to ``files`` lasts only until the next
+        ``make materialize-dcc``. Writing the raw document instead lets
+        ``enrich_file``'s in-place mutation carry it forward, which is what
+        already makes the collection accession durable.
 
         Given:
-            A materialized 4DN file whose persistent_id carries an accession,
-            and a Search API that returns no metadata for it.
+            A raw 4DN file document whose persistent_id carries an accession.
+        When:
+            _stamp_4dn_file_accessions runs.
+        Then:
+            It should stamp the raw file collection, leaving the derived
+            files collection untouched.
+        """
+        # Arrange
+        mock_db.file.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH",
+            }
+        ]
+        mock_db.files.docs = [{"_id": "f1", "submission": "4dn"}]
+
+        # Act
+        await _stamp_4dn_file_accessions()
+
+        # Assert
+        assert mock_db.file.docs[0]["accession_id"] == "4DNFIMCJXZKH"
+        assert "accession_id" not in mock_db.files.docs[0]
+
+    @pytest.mark.asyncio
+    async def test__stamp_4dn_file_accessions_should_stamp_without_the_search_api(
+        self, mock_db
+    ):
+        """Test that accession_id does not depend on the Search API at all.
+
+        Given:
+            Two raw 4DN files with parseable accessions and no Search API
+            stub of any kind, since this pass predates the fetch.
+        When:
+            _stamp_4dn_file_accessions runs.
+        Then:
+            It should stamp both, so every 4DN file is queryable by accession
+            rather than only the API-matched subset.
+        """
+        # Arrange
+        mock_db.file.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH",
+            },
+            {
+                "_id": "f2",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMEMLGM5",
+            },
+        ]
+
+        # Act
+        await _stamp_4dn_file_accessions()
+
+        # Assert
+        assert [d["accession_id"] for d in mock_db.file.docs] == [
+            "4DNFIMCJXZKH",
+            "4DNFIMEMLGM5",
+        ]
+
+    @pytest.mark.asyncio
+    async def test__stamp_4dn_file_accessions_should_warn_when_an_accession_is_unparseable(
+        self, mock_db, caplog
+    ):
+        """Test the operator's only signal that the field is partial.
+
+        Given:
+            Two raw 4DN files, one of whose persistent_ids carries no
+            accession.
+        When:
+            _stamp_4dn_file_accessions runs.
+        Then:
+            It should log a warning naming the unparseable count, since a
+            null accession_id is otherwise indistinguishable from a DCC
+            that issues no accession.
+        """
+        # Arrange
+        mock_db.file.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH",
+            },
+            {"_id": "f2", "submission": "4dn", "persistent_id": "https://x/nope"},
+        ]
+
+        # Act
+        with caplog.at_level(logging.WARNING):
+            await _stamp_4dn_file_accessions()
+
+        # Assert
+        assert "1 files have no parseable accession" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test__stamp_4dn_file_accessions_should_leave_accession_id_unset_when_unparseable(
+        self, mock_db
+    ):
+        """Test that a file with no parseable accession is skipped, not failed.
+
+        Given:
+            A raw 4DN file whose persistent_id carries no 4DNF accession.
+        When:
+            _stamp_4dn_file_accessions runs.
+        Then:
+            It should leave accession_id absent and complete without raising,
+            so one malformed row cannot abort the sync.
+        """
+        # Arrange
+        mock_db.file.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/no-accession-here",
+            }
+        ]
+
+        # Act
+        await _stamp_4dn_file_accessions()
+
+        # Assert
+        assert "accession_id" not in mock_db.file.docs[0]
+
+
+class TestEnrich4dnApiMetadata:
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_api_metadata_should_enrich_both_files_sharing_an_accession(
+        self, mocker, mock_db
+    ):
+        """Test that a duplicate accession does not cost a file its metadata.
+
+        The lookup was an accession-keyed dict, which is last-write-wins:
+        of two files resolving to one accession, whichever the cursor
+        yielded second overwrote the first and only it was enriched. Which
+        one lost depended on cursor order, and nothing reported it.
+
+        Given:
+            Two 4DN files whose persistent_ids carry the same accession,
+            and a Search API returning metadata for it.
         When:
             _enrich_4dn_api_metadata runs.
         Then:
-            It should still set accession_id, so every 4DN file is queryable
-            by accession rather than only the API-matched subset.
+            It should enrich both.
         """
         # Arrange
         mock_db.files.docs = [
@@ -531,10 +712,19 @@ class TestEnrich4dnApiMetadata:
                 "_id": "f1",
                 "submission": "4dn",
                 "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH",
-            }
+            },
+            {
+                "_id": "f2",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH/@@download",
+            },
         ]
         mocker.patch.object(
-            fourdn_module, "fetch_file_metadata_bulk", mocker.AsyncMock(return_value={})
+            fourdn_module,
+            "fetch_file_metadata_bulk",
+            mocker.AsyncMock(
+                return_value={"4DNFIMCJXZKH": {"genome_assembly": "GRCh38"}}
+            ),
         )
         mocker.patch.object(
             fourdn_module, "fetch_biosource_tiers", mocker.AsyncMock(return_value={})
@@ -544,32 +734,46 @@ class TestEnrich4dnApiMetadata:
         await _enrich_4dn_api_metadata()
 
         # Assert
-        assert mock_db.files.docs[0]["accession_id"] == "4DNFIMCJXZKH"
+        assert [d.get("genome_assembly") for d in mock_db.files.docs] == [
+            "GRCh38",
+            "GRCh38",
+        ]
 
     @pytest.mark.asyncio
-    async def test__enrich_4dn_api_metadata_should_leave_accession_id_unset_when_unparseable(
+    async def test__enrich_4dn_api_metadata_should_enrich_a_mixed_case_persistent_id(
         self, mocker, mock_db
     ):
-        """Test that a file with no parseable accession is skipped, not failed.
+        """Test that the extracted accession joins the Search API response.
+
+        The extracted value is the key for the API round trip, and the
+        portal answers with its own upper-case form. While the extractor
+        returned the raw match, a mixed-case persistent_id produced a key
+        that joined against nothing: the file kept a correct accession_id
+        and silently lost every enriched field, without being counted in
+        the unparseable warning that is the operator's only signal.
 
         Given:
-            A 4DN file whose persistent_id carries no 4DNF accession.
+            A 4DN file whose persistent_id carries a mixed-case accession,
+            and a Search API keyed on the canonical upper-case form.
         When:
             _enrich_4dn_api_metadata runs.
         Then:
-            It should leave accession_id absent and complete without raising,
-            so one malformed row cannot abort the sync.
+            It should apply the enrichment, not merely fail quietly.
         """
         # Arrange
         mock_db.files.docs = [
             {
                 "_id": "f1",
                 "submission": "4dn",
-                "persistent_id": "https://data.4dnucleome.org/no-accession-here",
+                "persistent_id": "https://data.4dnucleome.org/4DNFImcjxzkh",
             }
         ]
         mocker.patch.object(
-            fourdn_module, "fetch_file_metadata_bulk", mocker.AsyncMock(return_value={})
+            fourdn_module,
+            "fetch_file_metadata_bulk",
+            mocker.AsyncMock(
+                return_value={"4DNFIMCJXZKH": {"genome_assembly": "GRCh38"}}
+            ),
         )
         mocker.patch.object(
             fourdn_module, "fetch_biosource_tiers", mocker.AsyncMock(return_value={})
@@ -579,7 +783,54 @@ class TestEnrich4dnApiMetadata:
         await _enrich_4dn_api_metadata()
 
         # Assert
-        assert "accession_id" not in mock_db.files.docs[0]
+        assert mock_db.files.docs[0]["genome_assembly"] == "GRCh38"
+
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_api_metadata_should_enrich_only_the_matched_file(
+        self, mocker, mock_db
+    ):
+        """Test that enrichment applies to exactly the API-matched subset.
+
+        Given:
+            Two materialized 4DN files with parseable accessions, where the
+            Search API returns metadata for only one of them.
+        When:
+            _enrich_4dn_api_metadata runs.
+        Then:
+            It should apply the enrichment fields to the matched file only,
+            leaving the unmatched one untouched.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH",
+            },
+            {
+                "_id": "f2",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMEMLGM5",
+            },
+        ]
+        mocker.patch.object(
+            fourdn_module,
+            "fetch_file_metadata_bulk",
+            mocker.AsyncMock(
+                return_value={"4DNFIMCJXZKH": {"genome_assembly": "GRCh38"}}
+            ),
+        )
+        mocker.patch.object(
+            fourdn_module, "fetch_biosource_tiers", mocker.AsyncMock(return_value={})
+        )
+
+        # Act
+        await _enrich_4dn_api_metadata()
+
+        # Assert
+        matched, unmatched = mock_db.files.docs
+        assert matched["genome_assembly"] == "GRCh38"
+        assert "genome_assembly" not in unmatched
 
 
 class TestEnrich4dnCollections:
@@ -614,6 +865,48 @@ class TestEnrich4dnCollections:
 
         # Act
         await _enrich_4dn_collections()
+
+        # Assert
+        assert mock_db.collection.docs[0]["accession_id"] == "4DNEXNHE6X77"
+
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_collections_should_stamp_accession_id_when_the_api_raises(
+        self, mocker, mock_db
+    ):
+        """Test that the stamp survives an API failure, not just an empty result.
+
+        fetch_experiment_metadata_bulk catches only aiohttp.ClientError, so
+        a TimeoutError from its 60-second budget propagates. While the
+        fetch ran before the scan, that aborted the pass with nothing
+        stamped -- the same guarantee the file pass makes, but only against
+        the gentler failure.
+
+        Given:
+            A raw 4DN collection with a parseable accession, and a Search
+            API that raises rather than returning an empty result.
+        When:
+            _enrich_4dn_collections runs.
+        Then:
+            It should have stamped accession_id before the failure
+            propagates.
+        """
+        # Arrange
+        mock_db.collection.docs = [
+            {
+                "_id": "c1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNEXNHE6X77",
+            }
+        ]
+        mocker.patch.object(
+            fourdn_module,
+            "fetch_experiment_metadata_bulk",
+            mocker.AsyncMock(side_effect=asyncio.TimeoutError()),
+        )
+
+        # Act
+        with pytest.raises(asyncio.TimeoutError):
+            await _enrich_4dn_collections()
 
         # Assert
         assert mock_db.collection.docs[0]["accession_id"] == "4DNEXNHE6X77"
@@ -681,6 +974,9 @@ class TestEnrich4dnCollections:
                     "4DNEXNHE6X77": {
                         "lab": "Some Lab",
                         "experiment_type": "in situ Hi-C",
+                        # Lands under extra.fourdn via a dotted $set, so this
+                        # also pins that the nested write still nests.
+                        "status": "released",
                     }
                 }
             ),
@@ -694,3 +990,179 @@ class TestEnrich4dnCollections:
         assert doc["accession_id"] == "4DNEXNHE6X77"
         assert doc["lab"] == "Some Lab"
         assert doc["experiment_type"] == "in situ Hi-C"
+        assert doc["extra"]["fourdn"] == {"status": "released"}
+
+
+class TestSetAccessionIds:
+    @pytest.mark.asyncio
+    async def test__set_accession_ids_should_continue_when_a_batch_fails(
+        self, mocker, mock_db, caplog
+    ):
+        """Test that a failed stamp degrades the field, not the whole sync.
+
+        Stamping is the first write of each enrichment pass, so an escaping
+        BulkWriteError would abort the pass before any Search API
+        enrichment ran and fail the sync -- costing more than the
+        accessions it failed to write. The two are independent by design.
+
+        Given:
+            A bulk_write that raises BulkWriteError.
+        When:
+            _set_accession_ids runs.
+        Then:
+            It should report zero modifications, log the shortfall at
+            ERROR, and return rather than propagate, so the caller's
+            enrichment pass still runs.
+        """
+        # Arrange
+        from pymongo.errors import BulkWriteError
+
+        mocker.patch.object(
+            mock_db.files,
+            "bulk_write",
+            mocker.AsyncMock(side_effect=BulkWriteError({"writeErrors": []})),
+        )
+
+        # Act
+        with caplog.at_level(logging.ERROR):
+            modified = await _set_accession_ids(
+                mock_db.files, [("f0", "4DNFAAA")], "test"
+            )
+
+        # Assert
+        assert modified == 0
+        assert "not stamped" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test__set_accession_ids_should_stamp_every_document(self, mock_db):
+        """Test that each pair produces its own stamp.
+
+        Given:
+            Three documents, each with its own accession.
+        When:
+            _set_accession_ids runs.
+        Then:
+            It should stamp all three and report three modifications.
+        """
+        # Arrange
+        mock_db.files.docs = [{"_id": f"f{i}"} for i in range(3)]
+        stamps = [("f0", "4DNFAAA"), ("f1", "4DNFBBB"), ("f2", "4DNFCCC")]
+
+        # Act
+        modified = await _set_accession_ids(mock_db.files, stamps, "test")
+
+        # Assert
+        assert modified == 3
+        assert [d["accession_id"] for d in mock_db.files.docs] == [
+            "4DNFAAA",
+            "4DNFBBB",
+            "4DNFCCC",
+        ]
+
+    @pytest.mark.asyncio
+    async def test__set_accession_ids_should_stamp_both_documents_sharing_an_accession(
+        self, mock_db
+    ):
+        """Test that a duplicate accession does not cost a document its stamp.
+
+        This is why the helper takes a list of pairs rather than the
+        accession-keyed dict the callers also build: that dict is
+        last-write-wins, so one of these two documents would be dropped
+        before any update was issued, left with a null accession despite
+        having parsed cleanly, and which one lost would depend on cursor
+        order.
+
+        Given:
+            Two distinct documents whose persistent_ids resolve to the same
+            accession.
+        When:
+            _set_accession_ids runs.
+        Then:
+            It should stamp both.
+        """
+        # Arrange
+        mock_db.files.docs = [{"_id": "f1"}, {"_id": "f2"}]
+        stamps = [("f1", "4DNFIMCJXZKH"), ("f2", "4DNFIMCJXZKH")]
+
+        # Act
+        modified = await _set_accession_ids(mock_db.files, stamps, "test")
+
+        # Assert
+        assert modified == 2
+        assert all(d["accession_id"] == "4DNFIMCJXZKH" for d in mock_db.files.docs)
+
+    @pytest.mark.asyncio
+    async def test__set_accession_ids_should_fold_the_accession(self, mock_db):
+        """Test that the stored form matches what a filter folds to.
+
+        Given:
+            A pair whose accession is lower-cased and padded.
+        When:
+            _set_accession_ids runs.
+        Then:
+            It should store the stripped, upper-cased form.
+        """
+        # Arrange
+        mock_db.files.docs = [{"_id": "f1"}]
+
+        # Act
+        await _set_accession_ids(mock_db.files, [("f1", "  4dnfimcjxzkh ")], "test")
+
+        # Assert
+        assert mock_db.files.docs[0]["accession_id"] == "4DNFIMCJXZKH"
+
+    @pytest.mark.asyncio
+    async def test__set_accession_ids_should_stamp_across_batch_boundaries(
+        self, mocker, mock_db
+    ):
+        """Test that batching does not drop documents at the seams.
+
+        Given:
+            Five documents and a batch size of two, so the final batch is
+            partial.
+        When:
+            _set_accession_ids runs.
+        Then:
+            It should issue three unordered bulk writes and stamp all five,
+            so no document is lost to a boundary.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "BATCH_SIZE", 2)
+        mock_db.files.docs = [{"_id": f"f{i}"} for i in range(5)]
+        stamps = [(f"f{i}", f"4DNF{i}") for i in range(5)]
+        spy = mocker.spy(mock_db.files, "bulk_write")
+
+        # Act
+        modified = await _set_accession_ids(mock_db.files, stamps, "test")
+
+        # Assert
+        assert modified == 5
+        assert spy.call_count == 3
+        assert all(call.kwargs["ordered"] is False for call in spy.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test__set_accession_ids_should_do_nothing_when_given_no_pairs(
+        self, mock_db, caplog
+    ):
+        """Test the empty guard.
+
+        Given:
+            No pairs at all, as happens when a DCC yields no parseable
+            accession.
+        When:
+            _set_accession_ids runs.
+        Then:
+            It should report zero, issue no write, and warn under a label
+            naming which pass was empty.
+        """
+        # Arrange
+        mock_db.files.docs = [{"_id": "f1"}]
+
+        # Act
+        with caplog.at_level(logging.WARNING):
+            modified = await _set_accession_ids(mock_db.files, [], "4DN file")
+
+        # Assert
+        assert modified == 0
+        assert "accession_id" not in mock_db.files.docs[0]
+        assert "4DN file" in caplog.text
