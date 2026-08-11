@@ -174,7 +174,6 @@ def data_index_specs() -> list[IndexSpec]:
     for f in (
         "id_namespace",
         "local_id",
-        "accession_id",
         "project_id_namespace",
         "project_local_id",
         "persistent_id",
@@ -224,7 +223,6 @@ def data_index_specs() -> list[IndexSpec]:
     for f in (
         "id_namespace",
         "local_id",
-        "accession_id",
         "persistent_id",
         "abbreviation",
         "name",
