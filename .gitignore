@@ -77,7 +77,10 @@ uv.lock
 
 # Rust
 materialize/target/
-Cargo.lock
+# materialize/Cargo.lock is deliberately tracked: the materializer is a
+# binary crate and CI's `cargo test --locked` is the only guard on its
+# index list, so an untracked lockfile let an unrelated upstream release
+# turn that guard red.
 
 # Database
 database/
