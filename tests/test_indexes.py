@@ -602,3 +602,46 @@ async def test_ensure_indexes_should_reraise_unexpected_failure(mocker):
     with pytest.raises(OperationFailure):
         await ensure_indexes(db, [spec])
     collection.drop_index.assert_not_awaited()
+
+
+def test_data_index_specs_should_not_target_the_materialized_files_collection():
+    """Test the ownership split between the two index sources.
+
+    This module owns the raw C2M2 collections; the Rust materializer owns
+    the denormalized ``files`` collection it builds, and indexes it in
+    ``index_keys``. The module docstring states that split in prose only,
+    so this pins it: adding a ``files`` spec here would create a second
+    writer for those indexes, silently competing with the materializer.
+
+    Given:
+        The data index specs.
+    When:
+        The set of collections they target is collected.
+    Then:
+        It should include the raw ``file`` collection and not ``files``.
+    """
+    # Act
+    targets = {spec.collection for spec in data_index_specs()}
+
+    # Assert
+    assert "file" in targets
+    assert "files" not in targets
+
+
+def test_all_index_specs_should_not_repeat_a_collection_and_name():
+    """Test that no index is declared twice.
+
+    Given:
+        The full operational-plus-data spec list.
+    When:
+        Its (collection, name) pairs are collected.
+    Then:
+        None should repeat, so appending a field to two loops -- or to the
+        same loop twice -- fails here rather than issuing a redundant
+        createIndex against a live database.
+    """
+    # Act
+    pairs = [(spec.collection, spec.name) for spec in all_index_specs()]
+
+    # Assert
+    assert len(pairs) == len(set(pairs))
