@@ -8,8 +8,11 @@ import pytest
 
 from cfdb.services import encode as encode_module
 from cfdb.services import sync as sync_module
+from cfdb.services import fourdn as fourdn_module
 from cfdb.services.sync import (
     SyncTask,
+    _enrich_4dn_api_metadata,
+    _enrich_4dn_collections,
     _enrich_hubmap_collections_and_subjects,
     _enrich_hubmap_files,
     _load_dataset_async,
@@ -504,3 +507,190 @@ class TestSyncEncode:
         # Assert
         survivors = [d for d in mock_db.files.docs if d["submission"] != "encode"]
         assert survivors == others
+
+
+class TestEnrich4dnApiMetadata:
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_api_metadata_should_stamp_accession_id_when_api_returns_nothing(
+        self, mocker, mock_db
+    ):
+        """Test that accession_id does not depend on the Search API matching.
+
+        Given:
+            A materialized 4DN file whose persistent_id carries an accession,
+            and a Search API that returns no metadata for it.
+        When:
+            _enrich_4dn_api_metadata runs.
+        Then:
+            It should still set accession_id, so every 4DN file is queryable
+            by accession rather than only the API-matched subset.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNFIMCJXZKH",
+            }
+        ]
+        mocker.patch.object(
+            fourdn_module, "fetch_file_metadata_bulk", mocker.AsyncMock(return_value={})
+        )
+        mocker.patch.object(
+            fourdn_module, "fetch_biosource_tiers", mocker.AsyncMock(return_value={})
+        )
+
+        # Act
+        await _enrich_4dn_api_metadata()
+
+        # Assert
+        assert mock_db.files.docs[0]["accession_id"] == "4DNFIMCJXZKH"
+
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_api_metadata_should_leave_accession_id_unset_when_unparseable(
+        self, mocker, mock_db
+    ):
+        """Test that a file with no parseable accession is skipped, not failed.
+
+        Given:
+            A 4DN file whose persistent_id carries no 4DNF accession.
+        When:
+            _enrich_4dn_api_metadata runs.
+        Then:
+            It should leave accession_id absent and complete without raising,
+            so one malformed row cannot abort the sync.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {
+                "_id": "f1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/no-accession-here",
+            }
+        ]
+        mocker.patch.object(
+            fourdn_module, "fetch_file_metadata_bulk", mocker.AsyncMock(return_value={})
+        )
+        mocker.patch.object(
+            fourdn_module, "fetch_biosource_tiers", mocker.AsyncMock(return_value={})
+        )
+
+        # Act
+        await _enrich_4dn_api_metadata()
+
+        # Assert
+        assert "accession_id" not in mock_db.files.docs[0]
+
+
+class TestEnrich4dnCollections:
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_collections_should_stamp_accession_id_when_api_returns_nothing(
+        self, mocker, mock_db
+    ):
+        """Test that the collection accession does not depend on an API match.
+
+        Given:
+            A raw 4DN collection whose persistent_id carries an experiment
+            accession, and a Search API that returns no experiments.
+        When:
+            _enrich_4dn_collections runs.
+        Then:
+            It should still set accession_id, so the value is present for the
+            materializer to embed into files.collections[].
+        """
+        # Arrange
+        mock_db.collection.docs = [
+            {
+                "_id": "c1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNEXNHE6X77",
+            }
+        ]
+        mocker.patch.object(
+            fourdn_module,
+            "fetch_experiment_metadata_bulk",
+            mocker.AsyncMock(return_value={}),
+        )
+
+        # Act
+        await _enrich_4dn_collections()
+
+        # Assert
+        assert mock_db.collection.docs[0]["accession_id"] == "4DNEXNHE6X77"
+
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_collections_should_leave_accession_id_unset_when_unparseable(
+        self, mocker, mock_db
+    ):
+        """Test that a collection with no parseable accession is skipped.
+
+        Given:
+            A 4DN collection whose persistent_id carries no 4DNE accession.
+        When:
+            _enrich_4dn_collections runs.
+        Then:
+            It should leave accession_id absent and complete without raising.
+        """
+        # Arrange
+        mock_db.collection.docs = [
+            {
+                "_id": "c1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/nothing-here",
+            }
+        ]
+        mocker.patch.object(
+            fourdn_module,
+            "fetch_experiment_metadata_bulk",
+            mocker.AsyncMock(return_value={}),
+        )
+
+        # Act
+        await _enrich_4dn_collections()
+
+        # Assert
+        assert "accession_id" not in mock_db.collection.docs[0]
+
+    @pytest.mark.asyncio
+    async def test__enrich_4dn_collections_should_stamp_accession_id_alongside_api_metadata(
+        self, mocker, mock_db
+    ):
+        """Test that stamping does not displace the existing enrichment.
+
+        Given:
+            A 4DN collection the Search API does return experiment metadata for.
+        When:
+            _enrich_4dn_collections runs.
+        Then:
+            It should set accession_id and the promoted experiment fields
+            together, so the new write does not regress the existing pass.
+        """
+        # Arrange
+        mock_db.collection.docs = [
+            {
+                "_id": "c1",
+                "submission": "4dn",
+                "persistent_id": "https://data.4dnucleome.org/4DNEXNHE6X77",
+            }
+        ]
+        mocker.patch.object(
+            fourdn_module,
+            "fetch_experiment_metadata_bulk",
+            mocker.AsyncMock(
+                return_value={
+                    "4DNEXNHE6X77": {
+                        "lab": "Some Lab",
+                        "experiment_type": "in situ Hi-C",
+                    }
+                }
+            ),
+        )
+
+        # Act
+        await _enrich_4dn_collections()
+
+        # Assert
+        doc = mock_db.collection.docs[0]
+        assert doc["accession_id"] == "4DNEXNHE6X77"
+        assert doc["lab"] == "Some Lab"
+        assert doc["experiment_type"] == "in situ Hi-C"
