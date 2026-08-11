@@ -6,6 +6,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from cfdb.accessions import normalize_accession
 from cfdb.services.encode import (
     COMPRESSION_SUFFIX_TO_EDAM,
     UNCOMPRESSED,
@@ -610,23 +611,147 @@ def test_transform_to_c2m2_should_not_set_accession_id_on_a_biosample_collection
     assert "accession_id" not in doc["collections"][0]
 
 
-@given(accession=st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1))
-def test_transform_to_c2m2_should_store_the_accession_case_folded(accession):
-    """Test that the stored accession matches what a filter folds to.
+def test_transform_to_c2m2_should_not_reintroduce_padding_on_the_accession_id():
+    """Test that the builder does not re-pad an already-stripped accession.
+
+    The stripping itself happens upstream in ``_nonempty``, which every
+    accession cell is read through, so this does not pin normalize_accession's
+    whitespace handling -- deleting .strip() from it leaves this test green.
+    That contract is pinned in tests/test_accessions.py. What this covers is
+    the builder: that nothing between the cell and the stored field puts the
+    padding back.
 
     Given:
-        Any lower-case File accession.
+        A row whose File accession carries surrounding whitespace, as a
+        hand-edited TSV cell can.
     When:
         transform_to_c2m2 is called.
     Then:
-        It should store accession_id upper-cased, so a filter value folded by
-        the GraphQL layer matches it under bare equality.
+        It should store the stripped accession.
     """
     # Arrange
-    row = _encode_row(**{"File accession": accession})
+    row = _encode_row(**{"File accession": "  ENCFF123ABC  "})
 
     # Act
     doc = transform_to_c2m2(row)
 
     # Assert
-    assert doc["accession_id"] == accession.upper()
+    assert doc["accession_id"] == "ENCFF123ABC"
+
+
+def test_transform_to_c2m2_should_fold_accession_id_without_rewriting_local_id():
+    """Test that the two fields legitimately disagree in case.
+
+    Given:
+        A row whose File accession is published in lower case.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should fold accession_id for matching while leaving local_id as
+        published, since local_id is the DCC's own identifier and rewriting
+        it would change the document's key.
+    """
+    # Arrange
+    row = _encode_row(**{"File accession": "encff123abc"})
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["accession_id"] == "ENCFF123ABC"
+    assert doc["local_id"] == "encff123abc"
+
+
+def test_transform_to_c2m2_should_fold_the_experiment_collection_accession():
+    """Test that the collection accession is folded like the file's.
+
+    The upper-casing is the load-bearing half: the padding was already
+    removed upstream by ``_nonempty``, so only the case change is evidence
+    that the collection branch routes through the shared fold rather than
+    storing the cell as published.
+
+    Given:
+        A row whose Experiment accession is lower-cased and padded, with a
+        biosample term present so the collection is built at all.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should store the stripped, upper-cased experiment accession.
+    """
+    # Arrange
+    row = _encode_row(
+        **{
+            "Experiment accession": " encsr918zsj ",
+            "Biosample term name": "K562",
+        }
+    )
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["collections"][0]["accession_id"] == "ENCSR918ZSJ"
+
+
+def test_transform_to_c2m2_should_build_no_collection_without_a_biosample_term():
+    """Test that an experiment accession alone yields no collection.
+
+    The whole collection block is gated on the biosample term name, so a
+    row shaped like an ENCODE annotation or reference contributes no
+    collection and its experiment accession is not queryable anywhere.
+    Pre-existing behavior, pinned here because the accession field turns it
+    from a cosmetic gap into a data-completeness question.
+
+    Given:
+        A row carrying an Experiment accession but no Biosample term name.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should produce an empty collections list.
+    """
+    # Arrange
+    row = _encode_row(**{"Experiment accession": "ENCSR918ZSJ"})
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["collections"] == []
+
+
+@given(
+    accession=st.text(
+        alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        min_size=1,
+        max_size=16,
+    ),
+    pad=st.text(alphabet=" \t", max_size=3),
+)
+@settings(max_examples=100)
+def test_transform_to_c2m2_should_store_the_accession_case_folded(accession, pad):
+    """Test that the builder routes the accession through the shared fold.
+
+    Both sides of the assertion call normalize_accession on the same input,
+    so this pins that transform_to_c2m2 does not *bypass* the shared fold
+    -- not which direction that fold goes. It cannot detect a change of
+    fold direction, because the expectation moves with it: inverting
+    normalize_accession to .lower() fails 37 tests elsewhere and leaves
+    this one green. The direction is pinned against literals by
+    ...should_fold_accession_id_without_rewriting_local_id below and by the
+    query-side round trip in tests/test_inputs.py.
+
+    Given:
+        Any File accession in arbitrary casing with arbitrary padding.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        accession_id should equal the folded local_id.
+    """
+    # Arrange
+    row = _encode_row(**{"File accession": f"{pad}{accession}{pad}"})
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["accession_id"] == normalize_accession(doc["local_id"])
