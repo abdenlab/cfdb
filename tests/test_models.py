@@ -723,6 +723,44 @@ class TestEnrichedBiosample:
 
 
 class TestFileMetadataModel:
+    def test___init___should_default_accession_id_to_none(self):
+        """Test that a file without an accession carries None.
+
+        Given:
+            A document omitting accession_id, as every document does before
+            a sync populates it and as HuBMAP files do permanently.
+        When:
+            The model is instantiated.
+        Then:
+            It should leave accession_id as None rather than failing or
+            defaulting to an empty string.
+        """
+        # Act
+        result = FileMetadataModel(**_minimal_file_metadata())
+
+        # Assert
+        assert result.accession_id is None
+
+    def test___init___should_round_trip_an_accession_id(self):
+        """Test that a populated accession survives model construction.
+
+        Given:
+            A materialized document carrying accession_id.
+        When:
+            The model is instantiated.
+        Then:
+            It should expose the accession unchanged, since the model is what
+            the GraphQL output type is generated from.
+        """
+        # Arrange
+        doc = {**_minimal_file_metadata(), "accession_id": "4DNFIMCJXZKH"}
+
+        # Act
+        result = FileMetadataModel(**doc)
+
+        # Assert
+        assert result.accession_id == "4DNFIMCJXZKH"
+
     def test___init___should_preserve_the_uncompressed_sentinel(self):
         """Test that the uncompressed sentinel is not collapsed into None.
 
@@ -1073,6 +1111,40 @@ class TestFileMetadataModel:
 
 
 class TestCollection:
+    def test___init___should_default_accession_id_to_none(self):
+        """Test that a collection without an accession carries None.
+
+        Given:
+            A Collection constructed without accession_id, as ENCODE's
+            biosample-keyed fallback collection is.
+        When:
+            The model is instantiated.
+        Then:
+            It should leave accession_id as None.
+        """
+        # Act
+        result = Collection(biosamples=[])
+
+        # Assert
+        assert result.accession_id is None
+
+    def test___init___should_round_trip_an_accession_id(self):
+        """Test that a populated experiment accession survives construction.
+
+        Given:
+            A Collection carrying a 4DN experiment accession.
+        When:
+            The model is instantiated.
+        Then:
+            It should expose the accession unchanged, since the nested GraphQL
+            collection type is generated from this model.
+        """
+        # Act
+        result = Collection(biosamples=[], accession_id="4DNEXNHE6X77")
+
+        # Assert
+        assert result.accession_id == "4DNEXNHE6X77"
+
     def test_empty_string_to_none_with_empty_extra(self):
         """Test empty string coercion on the extra field.
 
