@@ -1,5 +1,5 @@
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
 
@@ -761,6 +761,56 @@ class TestFileMetadataModel:
         # Assert
         assert result.accession_id == "4DNFIMCJXZKH"
 
+    def test___init___should_coerce_a_blank_accession_id_to_none(self):
+        """Test that a blank accession reads as absent, not as empty.
+
+        Matches normalize_accession, which already folds a blank to None on
+        the write side, so a document written by some other path cannot
+        surface an empty string the accession filter can never select.
+
+        Given:
+            A document whose accession_id is the empty string.
+        When:
+            The model is instantiated.
+        Then:
+            It should coerce the value to None.
+        """
+        # Arrange
+        doc = {**_minimal_file_metadata(), "accession_id": ""}
+
+        # Act
+        result = FileMetadataModel(**doc)
+
+        # Assert
+        assert result.accession_id is None
+
+    @given(accession=st.text(min_size=1).filter(lambda s: s.strip()))
+    @settings(max_examples=100)
+    def test___init___should_not_refold_a_stored_accession(self, accession):
+        """Test that the read path leaves the stored value byte-identical.
+
+        Deliberately no folding validator here: the model is read-path
+        only, so folding on read would make a mis-stored lower-case value
+        display correctly while remaining permanently unfindable, turning a
+        loud bug into a silent one. The fold belongs at the write and query
+        boundaries, where it is.
+
+        Given:
+            Any non-blank accession, in any casing.
+        When:
+            The model is instantiated.
+        Then:
+            It should expose exactly what was stored.
+        """
+        # Arrange
+        doc = {**_minimal_file_metadata(), "accession_id": accession}
+
+        # Act
+        result = FileMetadataModel(**doc)
+
+        # Assert
+        assert result.accession_id == accession
+
     def test___init___should_preserve_the_uncompressed_sentinel(self):
         """Test that the uncompressed sentinel is not collapsed into None.
 
@@ -1144,6 +1194,22 @@ class TestCollection:
 
         # Assert
         assert result.accession_id == "4DNEXNHE6X77"
+
+    def test___init___should_coerce_a_blank_accession_id_to_none(self):
+        """Test that a blank collection accession reads as absent.
+
+        Given:
+            A Collection whose accession_id is the empty string.
+        When:
+            The model is instantiated.
+        Then:
+            It should coerce the value to None.
+        """
+        # Act
+        result = Collection(biosamples=[], accession_id="")
+
+        # Assert
+        assert result.accession_id is None
 
     def test_empty_string_to_none_with_empty_extra(self):
         """Test empty string coercion on the extra field.
