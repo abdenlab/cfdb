@@ -490,6 +490,7 @@ class FileMetadataModel(BaseModel):
 
     @field_validator(
         "file_format", "data_type", "assay_type", "project", "extra",
+        "accession_id",
         mode="before",
     )
     @classmethod
@@ -684,7 +685,7 @@ class Collection(BaseModel):
     subjects: List[Subject] = []
     extra: Optional[EnrichedCollection] = None
 
-    @field_validator("extra", mode="before")
+    @field_validator("extra", "accession_id", mode="before")
     @classmethod
     def empty_string_to_none(cls, v):
         if v == "":
