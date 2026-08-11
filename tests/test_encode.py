@@ -539,3 +539,94 @@ def test_transform_to_c2m2_should_not_raise_for_any_download_url(url):
 
     # Assert
     assert doc.get("compression_format", UNCOMPRESSED) in DERIVED_VALUES
+
+
+def test_transform_to_c2m2_should_set_accession_id_on_the_file():
+    """Test that the ENCODE file accession lands on accession_id.
+
+    Given:
+        An ENCODE row carrying a File accession.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should set accession_id to that accession, giving ENCODE the same
+        cross-DCC query field 4DN gets from its persistent_id.
+    """
+    # Arrange
+    row = _encode_row()
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["accession_id"] == "ENCFF123ABC"
+
+
+def test_transform_to_c2m2_should_set_accession_id_on_the_experiment_collection():
+    """Test that the experiment accession lands on the collection.
+
+    Given:
+        An ENCODE row naming an Experiment accession, and a Biosample term
+        name -- which the collection block is gated on, so the accession
+        alone would build no collection at all.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should set accession_id on the built collection, so a collection
+        accession filter resolves for ENCODE as it does for 4DN.
+    """
+    # Arrange
+    row = _encode_row(
+        **{"Experiment accession": "ENCSR918ZSJ", "Biosample term name": "K562"}
+    )
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["collections"][0]["accession_id"] == "ENCSR918ZSJ"
+
+
+def test_transform_to_c2m2_should_not_set_accession_id_on_a_biosample_collection():
+    """Test that the synthesized fallback collection gets no accession.
+
+    Given:
+        An ENCODE row with no Experiment accession, so the collection is keyed
+        on the biosample term instead.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should leave accession_id unset on that collection, since it names
+        no ENCODE experiment and a fabricated accession would be wrong.
+    """
+    # Arrange
+    row = _encode_row(**{"Biosample term name": "K562"})
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["collections"]
+    assert "accession_id" not in doc["collections"][0]
+
+
+@given(accession=st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1))
+def test_transform_to_c2m2_should_store_the_accession_case_folded(accession):
+    """Test that the stored accession matches what a filter folds to.
+
+    Given:
+        Any lower-case File accession.
+    When:
+        transform_to_c2m2 is called.
+    Then:
+        It should store accession_id upper-cased, so a filter value folded by
+        the GraphQL layer matches it under bare equality.
+    """
+    # Arrange
+    row = _encode_row(**{"File accession": accession})
+
+    # Act
+    doc = transform_to_c2m2(row)
+
+    # Assert
+    assert doc["accession_id"] == accession.upper()
