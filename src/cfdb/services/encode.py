@@ -12,7 +12,7 @@ Field Mapping (ENCODE TSV → CFDB)
 
 File
 ~~~~
-File accession                  → local_id
+File accession                  → local_id, accession_id (case-folded)
 File download URL               → access_url, filename (derived)
 File download URL               → compression_format (suffix-derived; the TSV
                                   carries no compression column, and the field
@@ -51,7 +51,8 @@ Audit ERROR                     → extra.encode.audit_error
 
 Collection
 ~~~~~~~~~~
-Experiment accession            → collections[].local_id, name, persistent_id
+Experiment accession            → collections[].local_id, name, persistent_id,
+                                  accession_id (case-folded)
 Lab                             → collections[].lab
 Assay                           → collections[].experiment_type
 Experiment target               → collections[].experiment_target
@@ -108,6 +109,7 @@ from urllib.parse import unquote, urlsplit
 
 import aiohttp
 
+from cfdb.accessions import normalize_accession
 from cfdb.dcc_registry import get_dcc_config
 from cfdb.services.ontology_mappings import (
     get_assay_type,
@@ -368,6 +370,11 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         "submission": "encode",
         "id_namespace": id_namespace,
         "local_id": accession,
+        # Duplicates local_id for ENCODE, which stores the accession there.
+        # The point of the separate field is cross-DCC uniformity: 4DN's
+        # local_id is an opaque UUID, so one accession_id input works for
+        # both. Folded so it matches what the GraphQL layer folds filters to.
+        "accession_id": normalize_accession(accession),
         "filename": filename,
         "size_in_bytes": size_in_bytes,
         "md5": _nonempty(row.get("md5sum")),
@@ -532,6 +539,12 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
             "biosamples": [biosample],
             "subjects": subjects,
         }
+        # Only the experiment-keyed branch has an accession. The
+        # ``biosample:``-keyed fallback collection is synthesized locally and
+        # names no ENCODE experiment, so it is left unset rather than given a
+        # fabricated accession.
+        if experiment_accession:
+            collection["accession_id"] = normalize_accession(experiment_accession)
         if collection_persistent_id:
             collection["persistent_id"] = collection_persistent_id
         if anatomy:
