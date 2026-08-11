@@ -326,6 +326,13 @@ class FakeCollection:
         return None
 
     async def bulk_write(self, operations: list, ordered: bool = True) -> _BulkWriteResult:
+        # Routed through ``_apply_update`` rather than assigning ``$set``
+        # keys directly: a dotted key (``extra.fourdn``) must nest, not land
+        # as a literal flat key, or a test asserting an enrichment payload
+        # shape passes against a document real Mongo would have written
+        # differently. ``_apply_update`` also reports whether the row
+        # actually changed, so ``modified_count`` counts changed rows like
+        # Mongo does rather than merely matched ones.
         count = 0
         for op in operations:
             # Support UpdateOne
@@ -334,9 +341,8 @@ class FakeCollection:
                 update = op._doc
                 for d in self.docs:
                     if _match(d, filt):
-                        for k, v in update.get("$set", {}).items():
-                            d[k] = v
-                        count += 1
+                        if _apply_update(d, update, is_insert=False):
+                            count += 1
                         break
         return _BulkWriteResult(count)
 
