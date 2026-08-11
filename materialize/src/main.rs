@@ -840,6 +840,10 @@ fn index_keys() -> Vec<Document> {
     vec![
         doc! { "id_namespace": 1 },
         doc! { "local_id": 1 },
+        // Cross-DCC accession lookup. Stored already case-folded (see
+        // cfdb.accessions), so this plain index serves the case-insensitive
+        // match DocumentDB 5.0 cannot serve via collation.
+        doc! { "accession_id": 1 },
         doc! { "id_namespace": 1, "local_id": 1 },
         doc! { "persistent_id": 1 },
         doc! { "filename": 1 },
@@ -854,6 +858,7 @@ fn index_keys() -> Vec<Document> {
         doc! { "assay_type.name": 1 },
         doc! { "collections.id_namespace": 1 },
         doc! { "collections.local_id": 1 },
+        doc! { "collections.accession_id": 1 },
         doc! { "collections.name": 1 },
         // Collection anatomy indexes
         doc! { "collections.anatomy.id": 1 },
@@ -1219,14 +1224,15 @@ mod tests {
     fn index_keys_returns_expected_set() {
         // GIVEN the index_keys function
         // WHEN called
-        // THEN it returns exactly 47 index key documents matching the expected fields
+        // THEN it returns exactly 49 index key documents matching the expected fields
         let keys = index_keys();
-        assert_eq!(keys.len(), 47);
+        assert_eq!(keys.len(), 49);
         assert_eq!(
             keys,
             vec![
                 doc! { "id_namespace": 1 },
                 doc! { "local_id": 1 },
+                doc! { "accession_id": 1 },
                 doc! { "id_namespace": 1, "local_id": 1 },
                 doc! { "persistent_id": 1 },
                 doc! { "filename": 1 },
@@ -1241,6 +1247,7 @@ mod tests {
                 doc! { "assay_type.name": 1 },
                 doc! { "collections.id_namespace": 1 },
                 doc! { "collections.local_id": 1 },
+                doc! { "collections.accession_id": 1 },
                 doc! { "collections.name": 1 },
                 doc! { "collections.anatomy.id": 1 },
                 doc! { "collections.anatomy.name": 1 },

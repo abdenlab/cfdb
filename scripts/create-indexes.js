@@ -44,6 +44,7 @@ function ensureIndex(coll, keys, opts) {
 print("Creating indexes on 'file' collection...");
 db.file.createIndex({ id_namespace: 1 });
 db.file.createIndex({ local_id: 1 });
+db.file.createIndex({ accession_id: 1 });  // cross-DCC accession (case-folded)
 db.file.createIndex({ id_namespace: 1, local_id: 1 });  // composite key
 db.file.createIndex({ project_id_namespace: 1 });
 db.file.createIndex({ project_local_id: 1 });
@@ -98,6 +99,7 @@ db.assay_type.createIndex({ submission: 1, id: 1 }, { unique: true });  // uniqu
 print("Creating indexes on 'collection' collection...");
 db.collection.createIndex({ id_namespace: 1 });
 db.collection.createIndex({ local_id: 1 });
+db.collection.createIndex({ accession_id: 1 });  // cross-DCC accession (case-folded)
 db.collection.createIndex({ id_namespace: 1, local_id: 1 });  // composite key
 db.collection.createIndex({ persistent_id: 1 });
 db.collection.createIndex({ abbreviation: 1 });
