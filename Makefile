@@ -47,6 +47,10 @@ api:
 	docker run -d --name api --network cvh-backend-network --network-alias cvh-backend -p 8000:8000 -e SYNC_DATA_DIR=/tmp/sync-data api
 	@echo "API container is up and running on port 8000 (http://0.0.0.0:8000/metadata)."
 
+schema:
+	@echo "Regenerating schema.graphql from the Strawberry schema..."
+	uv run python scripts/export_schema.py
+
 wool:
 	@echo "Building the wool worker Docker image (cfdb-wool, linux/amd64)..."
 	docker build --platform linux/amd64 -t cfdb-wool -f Dockerfile.wool .

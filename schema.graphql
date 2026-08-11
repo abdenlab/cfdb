@@ -22,6 +22,11 @@ type AssayTypeType {
   description: String
 }
 
+"""
+A signed 64-bit integer, serialized as a JSON number. Widens the GraphQL `Int` scalar, which the specification fixes at 32 bits and which therefore cannot represent a file larger than ~2 GB. Values beyond 9007199254740991 (2^53-1) exceed what an IEEE-754 double represents exactly and would lose precision in a JavaScript client; byte sizes cannot reach that magnitude.
+"""
+scalar BigInt
+
 input BiosampleInput {
   idNamespace: [String!] = null
   localId: [String!] = null
@@ -407,7 +412,7 @@ input FileMetadataInput {
   projectLocalId: [String!] = null
   persistentId: [String!] = null
   creationTime: [String!] = null
-  sizeInBytes: [Int!] = null
+  sizeInBytes: [BigInt!] = null
   sha256: [String!] = null
   md5: [String!] = null
   filename: [String!] = null
@@ -443,7 +448,7 @@ type FileMetadataType {
   projectLocalId: String!
   persistentId: String
   creationTime: String
-  sizeInBytes: Int
+  sizeInBytes: BigInt
   sha256: String
   md5: String
   filename: String!

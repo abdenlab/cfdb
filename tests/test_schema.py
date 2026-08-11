@@ -17,6 +17,8 @@ from cfdb.api.gql.schema import from_pydantic, schema
 from cfdb.api.gql.types import FileMetadataType
 from cfdb.models import FileMetadataModel
 from cfdb.services import locks
+from scripts.export_schema import SCHEMA_PATH, render
+from tests.conftest import ISSUE_83_SIZE
 
 
 def test_from_pydantic_should_convert_nested_model_lists_and_leave_json_untouched():
@@ -51,7 +53,9 @@ def test_from_pydantic_should_convert_nested_model_lists_and_leave_json_untouche
     assert result.collections[0].extra.hubmap.metadata == {"k": "v", "n": 1}
 
 
-def _make_file_doc(local_id: str, submission: str = "hubmap") -> dict:
+def _make_file_doc(
+    local_id: str, submission: str = "hubmap", size_in_bytes: int | None = None
+) -> dict:
     """Return a minimal file document that satisfies FileMetadataModel."""
     return {
         "id_namespace": "ns",
@@ -61,12 +65,20 @@ def _make_file_doc(local_id: str, submission: str = "hubmap") -> dict:
         "filename": f"{local_id}.bam",
         "submission": submission,
         "data_access_level": "public",
+        "size_in_bytes": size_in_bytes,
         "dcc": {
             "dcc_name": submission.upper(),
             "dcc_abbreviation": submission,
         },
         "collections": [],
     }
+
+
+def _named_type(type_ref: dict) -> str | None:
+    """Unwrap an introspection type reference down to its named type."""
+    while type_ref is not None and type_ref.get("name") is None:
+        type_ref = type_ref.get("ofType")
+    return type_ref.get("name") if type_ref else None
 
 
 def _make_distinct_doc(local_id: str, dcc_name: str, submission: str = "hubmap") -> dict:
@@ -1924,3 +1936,497 @@ class TestMetadataEndpointPagination:
         body = response.json()
         assert body["data"] is None
         assert expected in body["errors"][0]["message"]
+
+
+# Introspects every integer field and argument that must NOT have been
+# widened, shared by the two tests that assert different halves of it.
+_INT_FIELD_INTROSPECTION = """
+    {
+        extraFile: __type(name: "ExtraFileType") {
+            fields { name type { ...Ref } }
+        }
+        fileList: __type(name: "FileList") {
+            fields { name type { ...Ref } }
+        }
+        query: __type(name: "Query") {
+            fields { name type { ...Ref } args { name type { ...Ref } } }
+        }
+    }
+    fragment Ref on __Type {
+        name ofType { name ofType { name ofType { name } } }
+    }
+    """
+
+
+class TestSizeInBytesScalar:
+    """Coverage of the 64-bit ``BigInt`` scalar carrying ``sizeInBytes``."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_cutover(self, mocker):
+        """No-op ``locks.wait_for_cutover`` for every test in this class."""
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_size_in_bytes_should_resolve_a_file_above_the_int32_ceiling(
+        self, mock_db
+    ):
+        """Test a file larger than 2 GB reports its true size.
+
+        Given:
+            The 6,262,125,716-byte ENCODE file from issue #83, whose size
+            exceeds what a 32-bit GraphQL Int can represent.
+        When:
+            The GraphQL files query selects sizeInBytes.
+        Then:
+            It should return the exact size with no errors, rather than the
+            null-plus-per-field-error the Int scalar produced.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1", size_in_bytes=ISSUE_83_SIZE)]
+
+        # Act
+        result = await schema.execute(
+            "{ files { items { sizeInBytes } } }",
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"][0]["sizeInBytes"] == ISSUE_83_SIZE
+
+    @pytest.mark.parametrize(
+        "size",
+        [
+            -(2**63),
+            -1,
+            0,
+            4096,
+            2**31 - 1,
+            2**31,
+            2**53 - 1,
+            2**63 - 1,
+        ],
+        ids=[
+            "int64-min",
+            "negative",
+            "zero",
+            "small",
+            "int32-max",
+            "int32-max-plus-one",
+            "js-safe-max",
+            "int64-max",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_size_in_bytes_should_round_trip_across_the_64_bit_range(
+        self, mock_db, size
+    ):
+        """Test sizes spanning the declared range survive serialization intact.
+
+        Given:
+            A file whose size sits at a notable point of the 64-bit range —
+            both inclusive bounds, zero, an ordinary size, either side of the
+            old Int ceiling, and the JavaScript safe-integer maximum.
+        When:
+            The GraphQL files query selects sizeInBytes.
+        Then:
+            It should return that exact value with no errors.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1", size_in_bytes=size)]
+
+        # Act
+        result = await schema.execute("{ files { items { sizeInBytes } } }")
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"][0]["sizeInBytes"] == size
+
+    @given(size=st.integers(min_value=-(2**63), max_value=2**63 - 1))
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_size_in_bytes_should_round_trip_any_value_in_the_declared_range(
+        self, mock_db, size
+    ):
+        """Test the round trip holds across the whole declared range.
+
+        Given:
+            An arbitrary size drawn from the signed 64-bit range the scalar
+            advertises.
+        When:
+            The GraphQL files query selects sizeInBytes.
+        Then:
+            It should return that exact value with no errors, so the
+            contract is the declared range rather than the handful of
+            boundary values the parametrized case happens to name.
+        """
+        # Arrange
+        # ``mock_db`` is function-scoped, so Hypothesis reuses one instance
+        # across examples (hence the suppressed health check); reseeding it
+        # each example keeps them independent. The resolver is async and
+        # Hypothesis does not compose with pytest-asyncio, so it is driven
+        # through asyncio.run.
+        mock_db.files.docs = [_make_file_doc("f1", size_in_bytes=size)]
+
+        # Act
+        result = asyncio.run(schema.execute("{ files { items { sizeInBytes } } }"))
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"][0]["sizeInBytes"] == size
+
+    # Drawn as a union of two bounded strategies rather than by filtering
+    # ``st.integers()``, which discards the in-range majority and trips
+    # Hypothesis's filter_too_much health check.
+    @given(
+        size=st.integers(min_value=2**63) | st.integers(max_value=-(2**63) - 1),
+    )
+    @settings(
+        max_examples=25,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_size_in_bytes_should_reject_any_value_outside_the_declared_range(
+        self, mock_db, size
+    ):
+        """Test the range bound holds for every value beyond it.
+
+        Given:
+            An arbitrary integer outside the signed 64-bit range — the range
+            beyond which BSON itself cannot encode a value.
+        When:
+            The GraphQL files query selects sizeInBytes.
+        Then:
+            It should null that field and report a BigInt error, rather than
+            emitting a number no downstream layer can carry.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1", size_in_bytes=size)]
+
+        # Act
+        result = asyncio.run(schema.execute("{ files { items { sizeInBytes } } }"))
+
+        # Assert
+        assert result.data["files"]["items"][0]["sizeInBytes"] is None
+        assert "BigInt cannot represent" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_size_in_bytes_should_be_null_when_the_file_records_no_size(
+        self, mock_db
+    ):
+        """Test an absent size still resolves to null rather than an error.
+
+        Given:
+            A file whose size_in_bytes is unset.
+        When:
+            The GraphQL files query selects sizeInBytes.
+        Then:
+            It should return null with no errors, as the field is optional.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1")]
+
+        # Act
+        result = await schema.execute("{ files { items { sizeInBytes } } }")
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"][0]["sizeInBytes"] is None
+
+    @pytest.mark.asyncio
+    async def test_size_in_bytes_should_null_only_its_own_field_when_unrepresentable(
+        self, mock_db
+    ):
+        """Test an out-of-range stored size does not take down the page.
+
+        Given:
+            Two files, the first holding a size beyond the 64-bit range and
+            the second an ordinary size.
+        When:
+            The GraphQL files query selects sizeInBytes alongside other
+            fields.
+        Then:
+            It should null only the offending file's sizeInBytes, report the
+            failure at that field's path, and return every other field and
+            the sibling file untouched.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1", size_in_bytes=2**70),
+            _make_file_doc("f2", size_in_bytes=1234),
+        ]
+
+        # Act
+        result = await schema.execute(
+            "{ files { items { localId sizeInBytes } } }",
+        )
+
+        # Assert
+        assert [e.path for e in result.errors] == [
+            ["files", "items", 0, "sizeInBytes"]
+        ]
+        items = result.data["files"]["items"]
+        assert items[0] == {"localId": "f1", "sizeInBytes": None}
+        assert items[1] == {"localId": "f2", "sizeInBytes": 1234}
+
+    @pytest.mark.asyncio
+    async def test_files_should_filter_on_a_size_above_the_int32_ceiling(self, mock_db):
+        """Test a literal size filter selects a file larger than 2 GB.
+
+        Given:
+            One file at the issue #83 size and one ordinary file.
+        When:
+            The GraphQL files query filters on that size as a query literal.
+        Then:
+            It should return only the large file, so sizes above the old Int
+            ceiling are filterable and not merely readable.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("big", size_in_bytes=ISSUE_83_SIZE),
+            _make_file_doc("small", size_in_bytes=1234),
+        ]
+
+        # Act
+        result = await schema.execute(
+            "{ files(input: [{ sizeInBytes: [%d] }])"
+            " { totalCount items { localId } } }" % ISSUE_83_SIZE,
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 1
+        assert result.data["files"]["items"][0]["localId"] == "big"
+
+    @pytest.mark.asyncio
+    async def test_files_should_filter_on_a_large_size_passed_as_a_variable(
+        self, mock_db
+    ):
+        """Test a BigInt variable filters as a query literal does.
+
+        Given:
+            One file at the issue #83 size and one ordinary file.
+        When:
+            The GraphQL files query filters on that size through a
+            [BigInt!] variable, which GraphQL coerces by a different path
+            than a query literal.
+        Then:
+            It should return only the large file.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("big", size_in_bytes=ISSUE_83_SIZE),
+            _make_file_doc("small", size_in_bytes=1234),
+        ]
+
+        # Act
+        result = await schema.execute(
+            "query Files($sizes: [BigInt!]) {"
+            " files(input: [{ sizeInBytes: $sizes }])"
+            " { totalCount items { localId } } }",
+            variable_values={"sizes": [ISSUE_83_SIZE]},
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 1
+        assert result.data["files"]["items"][0]["localId"] == "big"
+
+    @pytest.mark.asyncio
+    async def test_files_should_reject_an_int_typed_variable_for_the_size_filter(
+        self,
+    ):
+        """Test the documented break for clients still declaring Int.
+
+        Given:
+            A files query declaring its size-filter variable as [Int!], as a
+            client written against the pre-BigInt schema would.
+        When:
+            The query is executed.
+        Then:
+            It should fail validation naming the expected [BigInt!] type,
+            rather than silently truncating at the 32-bit ceiling.
+        """
+        # Act
+        # No arrangement: the query is rejected at validation, before any
+        # resolver runs, so no database state participates.
+        result = await schema.execute(
+            "query Files($sizes: [Int!]) {"
+            " files(input: [{ sizeInBytes: $sizes }]) { totalCount } }",
+            variable_values={"sizes": [1234]},
+        )
+
+        # Assert
+        assert result.data is None
+        assert "BigInt" in result.errors[0].message
+
+    @pytest.mark.parametrize(
+        "literal",
+        ["true", str(2**63), str(-(2**63) - 1)],
+        ids=["boolean", "above-int64-max", "below-int64-min"],
+    )
+    @pytest.mark.asyncio
+    async def test_files_should_reject_a_size_filter_literal_outside_the_scalar(
+        self, literal
+    ):
+        """Test the scalar refuses literals it cannot represent.
+
+        Given:
+            A size filter literal that is a boolean, or an integer one step
+            beyond either end of the 64-bit range.
+        When:
+            The GraphQL files query is executed with that literal.
+        Then:
+            It should reject the query outright with a BigInt error rather
+            than coercing the value.
+        """
+        # Act
+        result = await schema.execute(
+            f"{{ files(input: [{{ sizeInBytes: [{literal}] }}]) {{ totalCount }} }}",
+        )
+
+        # Assert
+        assert result.data is None
+        assert "BigInt cannot represent" in result.errors[0].message
+
+    @pytest.mark.parametrize(
+        "value",
+        ["6262125716", 1.5, 1234.0],
+        ids=["string", "non-integral-float", "integral-float"],
+    )
+    @pytest.mark.asyncio
+    async def test_files_should_reject_a_non_integer_size_filter_variable(
+        self, value
+    ):
+        """Test the scalar refuses non-integer variable values.
+
+        Given:
+            A [BigInt!] variable carrying a numeric string, a fractional
+            number, or an integral float — the last being the one Int used
+            to coerce, so this is a fourth way a pre-BigInt client breaks.
+        When:
+            The GraphQL files query is executed with that variable.
+        Then:
+            It should reject the query with a BigInt error, so the wire form
+            stays unambiguously a JSON integer.
+        """
+        # Act
+        result = await schema.execute(
+            "query Files($sizes: [BigInt!]) {"
+            " files(input: [{ sizeInBytes: $sizes }]) { totalCount } }",
+            variable_values={"sizes": [value]},
+        )
+
+        # Assert
+        assert result.data is None
+        assert "BigInt cannot represent" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_schema_should_type_size_in_bytes_as_big_int_on_both_sides(self):
+        """Test the widening reached the input filter as well as the output.
+
+        Given:
+            The published GraphQL schema.
+        When:
+            FileMetadataType and FileMetadataInput are introspected.
+        Then:
+            Both should name sizeInBytes as BigInt, since widening only the
+            output would leave the files it exposes unfilterable by size.
+        """
+        # Act
+        result = await schema.execute(
+            """
+            {
+                output: __type(name: "FileMetadataType") {
+                    fields { name type { ...Ref } }
+                }
+                input: __type(name: "FileMetadataInput") {
+                    inputFields { name type { ...Ref } }
+                }
+            }
+            fragment Ref on __Type {
+                name ofType { name ofType { name ofType { name } } }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        output = {f["name"]: f["type"] for f in result.data["output"]["fields"]}
+        inputs = {f["name"]: f["type"] for f in result.data["input"]["inputFields"]}
+        assert _named_type(output["sizeInBytes"]) == "BigInt"
+        assert _named_type(inputs["sizeInBytes"]) == "BigInt"
+
+    @pytest.mark.asyncio
+    async def test_schema_should_leave_the_count_fields_as_int(self):
+        """Test the widening did not spread to unrelated integer fields.
+
+        Given:
+            The published GraphQL schema, in which totalCount, fileCount and
+            the pagination arguments count documents rather than bytes.
+        When:
+            Those fields and arguments are introspected.
+        Then:
+            Each should still be Int, which no collection this API serves
+            can overflow, since the override is scoped to one model field
+            rather than to every int in the schema.
+        """
+        # Act
+        result = await schema.execute(_INT_FIELD_INTROSPECTION)
+
+        # Assert
+        assert result.errors is None
+        file_list = {f["name"]: f["type"] for f in result.data["fileList"]["fields"]}
+        query = {f["name"]: f for f in result.data["query"]["fields"]}
+        files_args = {a["name"]: a["type"] for a in query["files"]["args"]}
+        assert _named_type(file_list["totalCount"]) == "Int"
+        assert _named_type(query["fileCount"]["type"]) == "Int"
+        assert _named_type(files_args["page"]) == "Int"
+        assert _named_type(files_args["pageSize"]) == "Int"
+
+    @pytest.mark.asyncio
+    async def test_schema_should_still_type_extra_file_size_as_int(self):
+        """Test the deliberate deferral of the other byte-size field.
+
+        Given:
+            ExtraFileType.fileSize, which is a byte size like sizeInBytes and
+            so carries the same 32-bit ceiling.
+        When:
+            The type is introspected.
+        Then:
+            It should still be Int — a deliberate deferral, not a rule.
+            Issue #83 scopes this change to sizeInBytes, and 4DN extra_files
+            are index sidecars (bai, tbi, px2, beddb) that do not approach
+            2 GB. Widen it and change this test when that stops holding.
+        """
+        # Act
+        result = await schema.execute(_INT_FIELD_INTROSPECTION)
+
+        # Assert
+        assert result.errors is None
+        extra_file = {f["name"]: f["type"] for f in result.data["extraFile"]["fields"]}
+        assert _named_type(extra_file["fileSize"]) == "Int"
+
+
+def test_render_should_match_the_checked_in_sdl():
+    """Test schema.graphql has not drifted from the Strawberry schema.
+
+    Given:
+        The checked-in schema.graphql, which is a generated artifact and the
+        contract clients codegen against.
+    When:
+        The SDL is rendered by the same function `make schema` writes with.
+    Then:
+        The two should be byte-identical, so a type change that skipped
+        regeneration cannot ship a stale public contract.
+    """
+    # Act
+    # Call the generator rather than re-deriving it, so the failure message
+    # below stays true: re-rendering the SDL a second way would let the
+    # guard and `make schema` disagree about what "up to date" means.
+    generated = render()
+
+    # Assert
+    assert SCHEMA_PATH.read_text(encoding="utf-8") == generated, (
+        "schema.graphql is stale — run `make schema` to regenerate it."
+    )
