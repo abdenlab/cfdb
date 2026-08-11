@@ -202,6 +202,7 @@ async def _sync_c2m2_zip(
         task.current_step = "enriching_collections"
         task.progress = "Enriching 4DN collections from experiment API..."
         logger.info(task.progress)
+        await _stamp_4dn_file_accessions()
         await _enrich_4dn_collections()
     elif dcc == "hubmap":
         task.current_step = "enriching_collections"
@@ -234,7 +235,7 @@ async def _sync_c2m2_zip(
         await _enrich_hubmap_files(dataset_metadata)
 
 
-async def _set_accession_ids(collection, accession_to_id: dict, label: str) -> int:
+async def _set_accession_ids(collection, stamps: list, label: str) -> int:
     """Stamp ``accession_id`` on every document with a parsed accession.
 
     Kept separate from the Search API enrichment passes because it must
@@ -243,31 +244,105 @@ async def _set_accession_ids(collection, accession_to_id: dict, label: str) -> i
     document whose accession parsed, or the field is queryable for only
     part of the DCC.
 
-    ``accession_to_id`` maps accession to document ``_id``. Values are
-    folded through :func:`~cfdb.accessions.normalize_accession` so what
-    is stored matches what the GraphQL layer folds a filter value to.
+    ``stamps`` is a list of ``(document _id, accession)`` pairs, one entry
+    per document -- deliberately not the accession-keyed dict the callers
+    also build for their Search API fetch. That dict is last-write-wins,
+    so two documents resolving to one accession would collapse to a single
+    entry and leave the loser unstamped despite having parsed cleanly,
+    silently contradicting the guarantee above. Which one lost would
+    depend on cursor order, and the end state -- a null ``accession_id``
+    -- is indistinguishable from a DCC that issues no accession at all.
+
+    Values are folded through
+    :func:`~cfdb.accessions.normalize_accession` so what is stored matches
+    what the GraphQL layer folds a filter value to.
+
+    A failed batch is logged and skipped rather than raised. Stamping is
+    now the first write of each enrichment pass, so an escaping
+    ``BulkWriteError`` would abort the pass before any Search API
+    enrichment ran and fail the whole sync -- costing more than the
+    accessions it failed to write. The two are independent by design, so a
+    partial stamp degrades the field rather than the sync.
 
     Returns the number of documents modified.
     """
     from pymongo import UpdateOne
+    from pymongo.errors import BulkWriteError
 
     operations = [
         UpdateOne({"_id": doc_id}, {"$set": {"accession_id": normalize_accession(acc)}})
-        for acc, doc_id in accession_to_id.items()
+        for doc_id, acc in stamps
     ]
     if not operations:
         logger.warning(f"{label} accession_id: no documents to stamp")
         return 0
 
     total_modified = 0
+    failed = 0
     for i in range(0, len(operations), BATCH_SIZE):
-        result = await collection.bulk_write(
-            operations[i : i + BATCH_SIZE], ordered=False
-        )
+        batch = operations[i : i + BATCH_SIZE]
+        try:
+            result = await collection.bulk_write(batch, ordered=False)
+        except BulkWriteError as exc:
+            failed += len(batch)
+            logger.error(
+                f"{label} accession_id: batch of {len(batch)} failed to stamp; "
+                f"continuing so enrichment still runs: {exc}"
+            )
+            continue
         total_modified += result.modified_count
 
+    if failed:
+        logger.error(
+            f"{label} accession_id: {failed} of {len(operations)} documents were "
+            "not stamped; those files are not queryable by accession"
+        )
     logger.info(f"{label} accession_id: stamped {total_modified} documents")
     return total_modified
+
+
+async def _stamp_4dn_file_accessions() -> None:
+    """Stamp accession_id onto the raw 4DN file documents.
+
+    Deliberately targets the raw ``file`` collection rather than the
+    materialized ``files``, and therefore runs pre-materialization. The
+    materializer rebuilds ``files`` from ``file`` on every run -- dropping
+    the collection outright when invoked without a submission filter -- so
+    a value written post-materialization survives only until the next
+    ``make materialize-dcc`` or ``make materialize-files``, both of which
+    are supported standalone operator commands. Stamping the raw document
+    instead lets ``enrich_file``'s in-place mutation carry the value
+    forward on every rebuild, which is what already makes the collection
+    accession durable.
+
+    The accession is parsed from ``persistent_id``, which the raw file rows
+    already carry, so this needs nothing the Search API pass provides.
+    """
+    from cfdb.services.fourdn import extract_accession
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    stamps: list[tuple[object, str]] = []
+    unparseable = 0
+    cursor = api.db.file.find(
+        {"submission": "4dn"},
+        {"_id": 1, "persistent_id": 1},
+    )
+    async for doc in cursor:
+        acc = extract_accession(doc.get("persistent_id", ""))
+        if acc:
+            stamps.append((doc["_id"], acc))
+        else:
+            unparseable += 1
+
+    if unparseable:
+        logger.warning(
+            f"4DN file accession_id: {unparseable} files have no parseable "
+            "accession in persistent_id; accession_id left null"
+        )
+
+    await _set_accession_ids(api.db.file, stamps, "4DN file")
 
 
 async def _enrich_4dn_api_metadata() -> None:
@@ -283,11 +358,17 @@ async def _enrich_4dn_api_metadata() -> None:
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Build accession -> _id lookup from existing files (avoids $regex per
+    # Build accession -> _ids lookup from existing files (avoids $regex per
     # update) first, so enrichment metadata is fetched for exactly those
-    # accessions.
-    accession_to_id: dict[str, object] = {}
-    unparseable = 0
+    # accessions. accession_id itself is stamped pre-materialization by
+    # _stamp_4dn_file_accessions, so this pass no longer writes it.
+    #
+    # Every accession maps to a *list* of document ids. 4DN issues one
+    # accession per file, but nothing here enforces that, and a plain
+    # accession-keyed dict is last-write-wins: two files resolving to one
+    # accession would silently leave the loser un-enriched, chosen by
+    # cursor order, with no signal that it happened.
+    accession_to_ids: dict[str, list] = {}
     cursor = api.db.files.find(
         {"submission": "4dn"},
         {"_id": 1, "persistent_id": 1},
@@ -295,28 +376,20 @@ async def _enrich_4dn_api_metadata() -> None:
     async for doc in cursor:
         acc = extract_accession(doc.get("persistent_id", ""))
         if acc:
-            accession_to_id[acc] = doc["_id"]
-        else:
-            unparseable += 1
+            accession_to_ids.setdefault(acc, []).append(doc["_id"])
 
-    logger.info(f"4DN enrichment: {len(accession_to_id)} files in DB mapped by accession")
-    if unparseable:
+    mapped = sum(len(ids) for ids in accession_to_ids.values())
+    logger.info(f"4DN enrichment: {mapped} files in DB mapped by accession")
+    if mapped > len(accession_to_ids):
         logger.warning(
-            f"4DN enrichment: {unparseable} files have no parseable accession in "
-            "persistent_id; accession_id left null"
+            f"4DN enrichment: {mapped - len(accession_to_ids)} files share an "
+            "accession with another file; all of them will be enriched alike"
         )
-
-    # Stamp accession_id from the parsed accession before fetching anything.
-    # This is deliberately independent of the Search API results below: a file
-    # whose accession parses but which the API returns no metadata for still
-    # gets its accession_id, so *every* 4DN file is queryable by accession
-    # rather than only the API-matched subset.
-    await _set_accession_ids(api.db.files, accession_to_id, "4DN file")
 
     # Fetch API data for exactly the accessions we hold. Batching the Search
     # API query by accession bypasses its 10k result-window cap, which a
     # blind deep-pagination scan would silently hit and truncate.
-    file_metadata = await fetch_file_metadata_bulk(accession_to_id.keys())
+    file_metadata = await fetch_file_metadata_bulk(accession_to_ids.keys())
     biosource_tiers = await fetch_biosource_tiers()
 
     logger.info(
@@ -327,8 +400,8 @@ async def _enrich_4dn_api_metadata() -> None:
     # Build bulk update operations matched by _id
     operations = []
     for accession, meta in file_metadata.items():
-        doc_id = accession_to_id.get(accession)
-        if not doc_id:
+        doc_ids = accession_to_ids.get(accession)
+        if not doc_ids:
             continue
 
         update: dict = {}
@@ -371,7 +444,9 @@ async def _enrich_4dn_api_metadata() -> None:
         if not update:
             continue
 
-        operations.append(UpdateOne({"_id": doc_id}, {"$set": update}))
+        operations.extend(
+            UpdateOne({"_id": doc_id}, {"$set": update}) for doc_id in doc_ids
+        )
 
     if not operations:
         logger.warning("4DN enrichment: no updates to apply")
@@ -399,31 +474,49 @@ async def _enrich_4dn_collections() -> None:
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
-    # Fetch experiment metadata from 4DN API
-    experiment_metadata = await fetch_experiment_metadata_bulk()
-
-    logger.info(f"4DN collection enrichment: {len(experiment_metadata)} experiment entries")
-
-    # Build bulk updates: match collection docs by experiment accession in persistent_id
-    operations = []
+    # Scan and stamp before any network call. An empty API result already
+    # left every collection queryable by accession, but a *raised* one did
+    # not: fetch_experiment_metadata_bulk catches only aiohttp.ClientError,
+    # so a TimeoutError from its 60s budget propagated and nothing was
+    # stamped at all. Collecting first makes that guarantee structural
+    # rather than a property of where the await happens to sit, and matches
+    # the ordering the file pass already uses.
     cursor = api.db.collection.find(
         {"submission": "4dn"},
         {"_id": 1, "persistent_id": 1},
     )
-    matched = 0
     unparseable = 0
-    accession_to_id: dict[str, object] = {}
+    stamps: list[tuple[object, str]] = []
     async for doc in cursor:
         accession = extract_experiment_accession(doc.get("persistent_id", ""))
         if not accession:
             unparseable += 1
             continue
 
-        # Recorded before the API-match check below so accession_id lands on
-        # every collection whose accession parsed, not just the subset the
-        # Search API returned metadata for.
-        accession_to_id[accession] = doc["_id"]
+        # One entry per document rather than an accession-keyed dict, so two
+        # collections sharing an accession both get stamped instead of one
+        # silently winning.
+        stamps.append((doc["_id"], accession))
 
+    if unparseable:
+        logger.warning(
+            f"4DN collection enrichment: {unparseable} collections have no "
+            "parseable accession in persistent_id; accession_id left null"
+        )
+
+    # This runs pre-materialization, so the materializer embeds the value
+    # into files.collections[].
+    await _set_accession_ids(api.db.collection, stamps, "4DN collection")
+
+    # Fetch experiment metadata from 4DN API
+    experiment_metadata = await fetch_experiment_metadata_bulk()
+
+    logger.info(f"4DN collection enrichment: {len(experiment_metadata)} experiment entries")
+
+    # Build bulk updates from the accessions already collected above
+    operations = []
+    matched = 0
+    for doc_id, accession in stamps:
         meta = experiment_metadata.get(accession)
         if not meta:
             continue
@@ -443,19 +536,7 @@ async def _enrich_4dn_collections() -> None:
             update["extra.fourdn"] = remaining
 
         if update:
-            operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
-
-    if unparseable:
-        logger.warning(
-            f"4DN collection enrichment: {unparseable} collections have no "
-            "parseable accession in persistent_id; accession_id left null"
-        )
-
-    # Stamped before the early return below: an API fetch that yields nothing
-    # must still leave every collection queryable by accession. This runs
-    # pre-materialization, so the materializer embeds the value into
-    # files.collections[].
-    await _set_accession_ids(api.db.collection, accession_to_id, "4DN collection")
+            operations.append(UpdateOne({"_id": doc_id}, {"$set": update}))
 
     if not operations:
         logger.warning("4DN collection enrichment: no updates to apply")
