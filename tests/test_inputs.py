@@ -1,10 +1,111 @@
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from cfdb.accessions import normalize_accession
 from cfdb.api.gql.inputs import CollectionInput, FileMetadataInput, to_dict, to_query
 
 #: Alphabet the DCCs actually issue accessions from.
 _ACCESSION_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def test_to_dict_should_emit_every_declared_field():
+    """Test that conversion yields the full field set, not just the set ones.
+
+    Given:
+        A FileMetadataInput with every field left at its None default.
+    When:
+        to_dict converts it.
+    Then:
+        It should emit a key for every declared field, since to_query is
+        written to receive the whole set and drop the None values itself.
+    """
+    # Arrange
+    declared = {
+        field.name
+        for field in FileMetadataInput.__strawberry_definition__.fields
+    }
+
+    # Act
+    result = to_dict(FileMetadataInput())
+
+    # Assert
+    assert set(result) == declared
+    assert all(value is None for value in result.values())
+
+
+def test_to_dict_should_recurse_into_nested_input_lists():
+    """Test that nested Strawberry inputs are converted, not passed through.
+
+    Given:
+        A FileMetadataInput whose collections field holds a CollectionInput.
+    When:
+        to_dict converts it.
+    Then:
+        It should leave no Strawberry object in the tree, since to_query
+        can only walk dicts and lists.
+    """
+    # Act
+    result = to_dict(
+        FileMetadataInput(collections=[CollectionInput(accession_id=["X"])])
+    )
+
+    # Assert
+    assert isinstance(result["collections"], list)
+    assert result["collections"][0]["accession_id"] == ["X"]
+
+
+def test_to_dict_should_pass_non_input_values_through_unchanged():
+    """Test the passthrough branch, including that plain dicts are not walked.
+
+    Given:
+        A scalar, None, and a plain dict carrying no Strawberry definition.
+    When:
+        to_dict converts each.
+    Then:
+        It should return each unchanged -- notably not recursing into the
+        plain dict, so to_dict is only safe on Strawberry inputs and lists
+        of them.
+    """
+    # Arrange
+    plain = {"accession_id": ["x"]}
+
+    # Act & assert
+    assert to_dict("ENCFF525XQX") == "ENCFF525XQX"
+    assert to_dict(None) is None
+    assert to_dict(plain) is plain
+
+
+def _clauses(query: dict) -> set:
+    """Return a query's $and clauses as an order-insensitive set."""
+    return frozenset(tuple(sorted(clause.items())) for clause in query["$and"])
+
+
+def test_to_dict_and_to_query_should_agree_with_a_hand_written_filter():
+    """Test that the Strawberry path and a dict literal produce one query.
+
+    Compared as a set of clauses rather than a list, because to_dict emits
+    fields in declaration order while a dict literal preserves the order
+    written -- so the two agree on the conjunction but not on its
+    sequence, and $and is order-insensitive in MongoDB.
+
+    Given:
+        The same filter expressed as a FileMetadataInput and as a dict of
+        only its set fields.
+    When:
+        Each is converted to a MongoDB query.
+    Then:
+        They should produce the same set of clauses, pinning the
+        assumption every dict-literal test in this module rests on.
+    """
+    # Arrange
+    payload = FileMetadataInput(filename=["a.bed"], accession_id=["encff1"])
+
+    # Act
+    from_input = to_query(to_dict(payload))
+    from_dict = to_query({"filename": ["a.bed"], "accession_id": ["encff1"]})
+
+    # Assert
+    assert _clauses(from_input) == _clauses(from_dict)
 
 
 def test_to_query_should_fold_accession_id_to_upper_case():
@@ -127,16 +228,36 @@ def test_to_query_should_fold_every_value_of_an_or_clause():
     }
 
 
-def test_to_query_should_leave_non_string_leaves_unchanged():
-    """Test that folding never reaches a non-string filter value.
+def test_to_query_should_leave_a_non_string_accession_value_unchanged():
+    """Test that folding is guarded on the value actually being a string.
 
     Given:
-        A filter naming an integer-valued field.
+        A filter whose accession_id value is an integer, which the GraphQL
+        layer will not produce but a direct to_query caller can.
     When:
         to_query builds the MongoDB predicate.
     Then:
-        It should emit the integer unchanged, since folding is guarded on
-        the value being a string.
+        It should emit the integer unchanged rather than raising, pinning
+        the isinstance guard. Targeting accession_id specifically is what
+        makes this test meaningful -- asserted against a field that is not
+        folded at all, it would pass with the guard deleted.
+    """
+    # Act
+    query = to_query({"accession_id": [123]})
+
+    # Assert
+    assert query == {"accession_id": 123}
+
+
+def test_to_query_should_leave_a_non_normalized_field_unchanged():
+    """Test that an ordinary non-string field passes through.
+
+    Given:
+        A filter naming an integer-valued field that is not folded.
+    When:
+        to_query builds the MongoDB predicate.
+    Then:
+        It should emit the integer unchanged.
     """
     # Act
     query = to_query({"size_in_bytes": [3221225472]})
@@ -145,22 +266,91 @@ def test_to_query_should_leave_non_string_leaves_unchanged():
     assert query == {"size_in_bytes": 3221225472}
 
 
-def test_to_query_should_emit_none_for_a_blank_accession():
-    """Test that an explicitly-blank accession selects absent values.
+def test_to_query_should_drop_a_blank_accession():
+    """Test that a blank accession constrains nothing rather than everything.
+
+    Emitting ``{accession_id: None}`` would match documents whose accession
+    is null *or absent* -- all of HuBMAP, every unparsed 4DN file, and the
+    whole corpus before the first post-deploy sync. That made a blank value
+    the only filter in the schema that widened the result set.
 
     Given:
-        A filter whose accession value is whitespace only.
+        A filter whose only accession value is whitespace.
     When:
-        to_query builds the MongoDB predicate.
+        to_query builds the MongoDB query.
     Then:
-        It should emit None, matching documents with no accession rather
-        than an empty string no document stores.
+        It should emit an empty query, so a search box wired straight to
+        the variable returns everything unfiltered rather than a page of
+        unrelated accession-less files.
     """
     # Act
     query = to_query({"accession_id": ["   "]})
 
     # Assert
-    assert query == {"accession_id": None}
+    assert query == {}
+
+
+def test_to_query_should_keep_the_real_accession_when_one_value_is_blank():
+    """Test that a blank value cannot widen a filter that also names one.
+
+    Given:
+        A filter carrying a real accession alongside a blank one, as a
+        partly-filled multi-value input produces.
+    When:
+        to_query builds the MongoDB query.
+    Then:
+        It should emit only the real accession, rather than unioning in
+        every document that has none.
+    """
+    # Act
+    query = to_query({"accession_id": ["4DNFIMCJXZKH", "   "]})
+
+    # Assert
+    assert query == {"accession_id": "4DNFIMCJXZKH"}
+
+
+def test_to_query_should_return_an_empty_query_for_a_filter_with_no_constraints():
+    """Test that an empty clause list collapses instead of being emitted.
+
+    MongoDB rejects ``{"$and": []}`` and ``{"$or": []}`` with BadValue, so
+    a filter whose every field is unset has to collapse to a query that
+    matches everything rather than one the server refuses.
+
+    Given:
+        A filter object with no fields set.
+    When:
+        to_query builds the MongoDB query.
+    Then:
+        It should emit an empty query.
+    """
+    # Act
+    query = to_query([{"filename": None, "accession_id": None}])
+
+    # Assert
+    assert query == {}
+
+
+def test_to_query_should_not_fold_an_accession_nested_under_extra():
+    """Test that folding is decided by the whole path, not the leaf name.
+
+    ``extra.<dcc>`` holds values exactly as the DCC published them, so a
+    DCC-native accession stored there is not folded on write. Folding it on
+    query would make those documents permanently unmatchable with nothing
+    raising -- so an unlisted path must fail closed, matching byte-exactly
+    like every other field.
+
+    Given:
+        A filter naming accession_id under the extra.fourdn namespace.
+    When:
+        to_query builds the MongoDB predicate.
+    Then:
+        It should leave the value unfolded.
+    """
+    # Act
+    query = to_query({"extra": {"fourdn": {"accession_id": ["4dnfimcjxzkh"]}}})
+
+    # Assert
+    assert query == {"extra.fourdn.accession_id": "4dnfimcjxzkh"}
 
 
 def test_to_query_should_accept_accession_id_from_the_graphql_inputs():
@@ -193,30 +383,182 @@ def test_to_query_should_accept_accession_id_from_the_graphql_inputs():
     }
 
 
+def test_to_query_should_collapse_a_single_clause():
+    """Test that one set field yields a bare predicate, not a wrapper.
+
+    Given:
+        A filter dict with exactly one field set.
+    When:
+        to_query flattens it.
+    Then:
+        It should return the predicate without an $and wrapper.
+    """
+    # Act
+    query = to_query({"filename": ["a.bed"]})
+
+    # Assert
+    assert query == {"filename": "a.bed"}
+
+
+def test_to_query_should_drop_fields_left_unset():
+    """Test that the None fields to_dict always emits are discarded.
+
+    Given:
+        A filter dict mixing set fields with explicitly-None ones, which is
+        exactly what to_dict produces.
+    When:
+        to_query flattens it.
+    Then:
+        It should emit only the set fields, which is what makes to_dict's
+        all-fields output usable as a filter.
+    """
+    # Act
+    query = to_query({"filename": ["a.bed"], "md5": None, "sha256": None})
+
+    # Assert
+    assert query == {"filename": "a.bed"}
+
+
+def test_to_query_should_flatten_nested_and_clauses():
+    """Test that a nested conjunction is merged upward, not left nested.
+
+    Given:
+        A sub-input contributing two fields alongside a top-level field.
+    When:
+        to_query flattens it.
+    Then:
+        It should emit one flat three-element $and rather than an $and
+        containing another $and.
+    """
+    # Act
+    query = to_query(
+        {"filename": ["a.bed"], "collections": {"name": ["c"], "lab": ["l"]}}
+    )
+
+    # Assert
+    assert query == {
+        "$and": [
+            {"filename": "a.bed"},
+            {"collections.name": "c"},
+            {"collections.lab": "l"},
+        ]
+    }
+
+
+def test_to_query_should_flatten_nested_or_clauses():
+    """Test that a nested disjunction is merged upward.
+
+    Given:
+        A list of two sub-inputs, the first of which itself expands to an
+        $or over two values.
+    When:
+        to_query flattens it.
+    Then:
+        It should emit one flat three-branch $or.
+    """
+    # Act
+    query = to_query({"collections": [{"name": ["a", "b"]}, {"name": ["c"]}]})
+
+    # Assert
+    assert query == {
+        "$or": [
+            {"collections.name": "a"},
+            {"collections.name": "b"},
+            {"collections.name": "c"},
+        ]
+    }
+
+
+def test_to_query_should_build_a_dotted_path_at_depth():
+    """Test path construction several levels down.
+
+    Given:
+        A filter reaching collections.biosamples.subjects.local_id.
+    When:
+        to_query flattens it.
+    Then:
+        It should emit the four-segment dotted path as one predicate, and
+        leave the value unfolded -- confirming with the substring test that
+        folding is decided by the last segment alone, not by depth.
+    """
+    # Act
+    query = to_query(
+        {"collections": {"biosamples": {"subjects": {"local_id": ["Mixed-Case"]}}}}
+    )
+
+    # Assert
+    assert query == {"collections.biosamples.subjects.local_id": "Mixed-Case"}
+
+
+def test_to_query_should_return_a_bare_scalar_unchanged():
+    """Test the no-prefix branch, which bypasses predicate construction.
+
+    Given:
+        A bare scalar passed with no prefix.
+    When:
+        to_query is called.
+    Then:
+        It should return the scalar unchanged and unfolded, since there is
+        no field name to decide folding by.
+    """
+    # Act & assert
+    assert to_query("4dnfimcjxzkh") == "4dnfimcjxzkh"
+
+
 @given(
     accession=st.text(alphabet=_ACCESSION_CHARS, min_size=1, max_size=16),
     swap=st.lists(st.booleans(), min_size=16, max_size=16),
+    pad=st.text(alphabet=" \t", max_size=3),
 )
-def test_to_query_should_build_one_predicate_for_any_casing(accession, swap):
+@settings(max_examples=200)
+def test_to_query_should_build_one_predicate_for_any_casing(accession, swap, pad):
     """Test that casing a caller chooses cannot change the predicate.
 
     Given:
-        Any accession over the DCC alphabet, and an arbitrary per-character
-        re-casing of it.
+        Any accession over the DCC alphabet, an arbitrary per-character
+        re-casing of it, and arbitrary surrounding padding.
     When:
         to_query builds a predicate from each.
     Then:
-        Both should produce the identical predicate, which is the property
-        the case-insensitive accession lookup rests on.
+        Both should equal the canonical stored form -- a stronger claim
+        than the two merely agreeing, which would also hold if both were
+        folded wrongly in the same way.
     """
     # Arrange
     recased = "".join(
         char.lower() if flip else char for char, flip in zip(accession, swap)
     )
+    expected = {"accession_id": normalize_accession(accession)}
 
     # Act
     from_canonical = to_query({"accession_id": [accession]})
-    from_recased = to_query({"accession_id": [recased]})
+    from_recased = to_query({"accession_id": [f"{pad}{recased}{pad}"]})
 
     # Assert
-    assert from_canonical == from_recased
+    assert from_canonical == expected
+    assert from_recased == expected
+
+
+@given(
+    field=st.sampled_from(
+        ["filename", "local_id", "md5", "sha256", "persistent_id", "access_url"]
+    ),
+    value=st.text(min_size=1),
+)
+@settings(max_examples=100)
+def test_to_query_should_leave_every_other_field_byte_identical(field, value):
+    """Test that no field other than the accession is ever folded.
+
+    Given:
+        Any real model field name other than accession_id, with any value.
+    When:
+        to_query builds the predicate.
+    Then:
+        It should emit the value byte-identical, so no future field can be
+        folded by accident.
+    """
+    # Act
+    query = to_query({field: [value]})
+
+    # Assert
+    assert query == {field: value}
