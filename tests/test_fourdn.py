@@ -11,9 +11,260 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from cfdb.accessions import normalize_accession
 from cfdb.models import NUMERIC_PROTOCOL_FIELDS, EnrichedFourdnCollection
 from cfdb.services import fourdn
-from cfdb.services.fourdn import parse_experiment_metadata, parse_extra_files
+from cfdb.services.fourdn import (
+    extract_accession,
+    extract_experiment_accession,
+    parse_experiment_metadata,
+    parse_extra_files,
+)
+
+_PORTAL = "https://data.4dnucleome.org"
+
+
+class TestExtractAccession:
+    def test_extract_accession_should_return_the_accession_from_a_bare_url(self):
+        """Test the canonical persistent_id shape.
+
+        Given:
+            A 4DN persistent_id that is the portal URL plus the accession.
+        When:
+            extract_accession is called.
+        Then:
+            It should return the accession.
+        """
+        # Act, assert
+        assert extract_accession(f"{_PORTAL}/4DNFIMCJXZKH") == "4DNFIMCJXZKH"
+
+    def test_extract_accession_should_return_the_accession_from_a_download_url(self):
+        """Test the longer download form, where the accession repeats.
+
+        Given:
+            A download URL carrying the accession twice, once in the path
+            and once in the filename.
+        When:
+            extract_accession is called.
+        Then:
+            It should return the first occurrence, both being identical.
+        """
+        # Arrange
+        url = f"{_PORTAL}/files-processed/4DNFI1234ABC/@@download/4DNFI1234ABC.mcool"
+
+        # Act, assert
+        assert extract_accession(url) == "4DNFI1234ABC"
+
+    @pytest.mark.parametrize(
+        "typed",
+        ["4DNFImcjxzkh", "4dnfimcjxzkh", "4DNFIMCJXZKH"],
+        ids=["mixed", "lower", "upper"],
+    )
+    def test_extract_accession_should_fold_any_casing_to_one_accession(self, typed):
+        """Test that casing cannot truncate or lose the accession.
+
+        An upper-case-only pattern degrades badly rather than simply
+        missing here: on a mixed-case value it matched only the upper-case
+        prefix and returned a truncated accession, which is a
+        plausible-looking wrong answer, and every such value truncated to
+        the same short prefix.
+
+        Asserted on the extractor's own return value rather than on
+        ``normalize_accession(extract_accession(...))``: folding the result
+        before asserting would pass whether or not the extractor folds, and
+        the extractor's output is what keys the Search API round trip.
+
+        Given:
+            The same accession published in mixed, lower and upper case.
+        When:
+            extract_accession is called.
+        Then:
+            All three should yield the one canonical accession.
+        """
+        # Act
+        result = extract_accession(f"{_PORTAL}/{typed}")
+
+        # Assert
+        assert result == "4DNFIMCJXZKH"
+
+    def test_extract_accession_should_stop_at_a_file_extension(self):
+        """Test the token boundary against a trailing extension.
+
+        Given:
+            A persistent_id whose accession is followed by a dot and an
+            upper-case extension.
+        When:
+            extract_accession is called.
+        Then:
+            It should stop at the separator rather than absorbing the
+            extension.
+        """
+        # Act, assert
+        assert extract_accession(f"{_PORTAL}/4DNFIMCJXZKH.MCOOL") == "4DNFIMCJXZKH"
+
+    def test_extract_accession_should_find_an_accession_in_a_query_string(self):
+        """Test that matching is not anchored to the path.
+
+        Given:
+            A URL carrying the accession in a query parameter.
+        When:
+            extract_accession is called.
+        Then:
+            It should still return it, pinning the unanchored match as
+            intended rather than incidental.
+        """
+        # Act, assert
+        assert extract_accession(f"{_PORTAL}/s/?accession=4DNFIABC") == "4DNFIABC"
+
+    def test_extract_accession_should_return_none_for_an_experiment_accession(self):
+        """Test that the two extractors do not poach each other's inputs.
+
+        Given:
+            A persistent_id carrying an experiment accession.
+        When:
+            extract_accession is called.
+        Then:
+            It should return None, so a collection URL cannot be stamped
+            with a file accession.
+        """
+        # Act, assert
+        assert extract_accession(f"{_PORTAL}/4DNEXNHE6X77") is None
+
+    @pytest.mark.parametrize("value", ["", None, f"{_PORTAL}/nothing-here"])
+    def test_extract_accession_should_return_none_when_there_is_nothing_to_find(
+        self, value
+    ):
+        """Test the guard and no-match branches.
+
+        Given:
+            An empty string, None, and a URL with no accession token.
+        When:
+            extract_accession is called.
+        Then:
+            It should return None without raising, so a malformed row is
+            counted and logged rather than aborting the sync.
+        """
+        # Act, assert
+        assert extract_accession(value) is None
+
+    @given(
+        accession=st.text(
+            alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", min_size=1, max_size=12
+        )
+    )
+    @settings(max_examples=100)
+    def test_extract_accession_should_round_trip_through_normalization(
+        self, accession
+    ):
+        """Test that what the extractor emits is already in stored form.
+
+        Given:
+            Any accession over the DCC alphabet, embedded in a portal URL.
+        When:
+            It is extracted.
+        Then:
+            It should already equal its own folded form, so re-stamping on
+            a later sync cannot change what is stored and the Search API
+            key and the stored value cannot diverge.
+        """
+        # Act
+        extracted = extract_accession(f"{_PORTAL}/4DNF{accession}")
+
+        # Assert
+        assert extracted == f"4DNF{accession}"
+        assert normalize_accession(extracted) == extracted
+
+
+class TestExtractExperimentAccession:
+    @pytest.mark.parametrize(
+        "accession",
+        ["4DNEXNHE6X77", "4DNESQWI9K2F"],
+        ids=["experiment", "experiment-set"],
+    )
+    def test_extract_experiment_accession_should_return_both_accession_kinds(
+        self, accession
+    ):
+        """Test that experiments and experiment sets are both matched.
+
+        Given:
+            A persistent_id for an experiment and one for an experiment set.
+        When:
+            extract_experiment_accession is called.
+        Then:
+            It should return each accession.
+        """
+        # Act, assert
+        assert extract_experiment_accession(f"{_PORTAL}/{accession}") == accession
+
+    def test_extract_experiment_accession_should_fold_any_casing(self):
+        """Test that a lower-case experiment accession is not lost.
+
+        Asserted on the extractor's own return value: folding it here
+        before asserting would pass whether or not the extractor folds.
+
+        Given:
+            An experiment accession published in lower case.
+        When:
+            extract_experiment_accession is called.
+        Then:
+            It should return the canonical accession.
+        """
+        # Act
+        result = extract_experiment_accession(f"{_PORTAL}/4dnexnhe6x77")
+
+        # Assert
+        assert result == "4DNEXNHE6X77"
+
+    def test_extract_experiment_accession_should_stop_at_a_suffix(self):
+        """Test the token boundary against a trailing suffix.
+
+        Given:
+            An experiment accession followed by a hyphenated suffix.
+        When:
+            extract_experiment_accession is called.
+        Then:
+            It should stop at the hyphen.
+        """
+        # Act, assert
+        assert (
+            extract_experiment_accession(f"{_PORTAL}/4DNEXNHE6X77-rep2")
+            == "4DNEXNHE6X77"
+        )
+
+    def test_extract_experiment_accession_should_return_none_for_a_file_accession(
+        self,
+    ):
+        """Test the reverse cross-contamination guard.
+
+        Given:
+            A persistent_id carrying a file accession.
+        When:
+            extract_experiment_accession is called.
+        Then:
+            It should return None.
+        """
+        # Act, assert
+        assert extract_experiment_accession(f"{_PORTAL}/4DNFIMCJXZKH") is None
+
+    @pytest.mark.parametrize("value", ["", None, f"{_PORTAL}/4DNE"])
+    def test_extract_experiment_accession_should_return_none_when_nothing_matches(
+        self, value
+    ):
+        """Test the guard, no-match, and minimum-length branches.
+
+        The bare prefix case pins an undocumented constraint: the pattern
+        requires at least two characters after 4DNE, so a truncated
+        accession yields None rather than a short false positive.
+
+        Given:
+            An empty string, None, and a bare 4DNE prefix.
+        When:
+            extract_experiment_accession is called.
+        Then:
+            It should return None without raising.
+        """
+        # Act, assert
+        assert extract_experiment_accession(value) is None
 
 
 def test_parse_extra_files_should_store_token_when_file_format_is_cv_object():
