@@ -59,6 +59,7 @@ input CollectionInput {
   biosamples: [BiosampleInput!] = null
   idNamespace: [String!] = null
   localId: [String!] = null
+  accessionId: [String!] = null
   persistentId: [String!] = null
   creationTime: [String!] = null
   abbreviation: [String!] = null
@@ -77,6 +78,7 @@ type CollectionType {
   biosamples: [BiosampleType!]!
   idNamespace: String!
   localId: String!
+  accessionId: String
   persistentId: String
   creationTime: String
   abbreviation: String
@@ -408,6 +410,7 @@ input FileMetadataInput {
   project: [ProjectInput!] = null
   idNamespace: [String!] = null
   localId: [String!] = null
+  accessionId: [String!] = null
   projectIdNamespace: [String!] = null
   projectLocalId: [String!] = null
   persistentId: [String!] = null
@@ -444,6 +447,7 @@ type FileMetadataType {
   project: ProjectType
   idNamespace: String!
   localId: String!
+  accessionId: String
   projectIdNamespace: String!
   projectLocalId: String!
   persistentId: String
