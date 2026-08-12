@@ -17,7 +17,16 @@ Field mapping from the 4D Nucleome (4DN) Search API and C2M2 datapackage to the 
 | Collection | `persistent_id` contains `4DNEX*` or `4DNES*` | `accession` (e.g., `4DNEXH4ZUIH6`) |
 | Biosource tier | `extra.fourdn.biosource_name` | `Biosource.display_title` |
 
-Accessions are extracted from persistent_id URLs via regex: `4DNF[A-Z0-9]+` for files, `4DNE[A-Z][A-Z0-9]+` for experiments.
+Accessions are extracted from persistent_id URLs via regex: `4DNF[A-Z0-9]+` for files, `4DNE[A-Z][A-Z0-9]+` for experiments. Both are matched case-insensitively, and the extracted value is case-folded before use — an upper-case-only pattern does not merely miss a mixed-case accession, it matches the upper-case prefix and returns a truncated one.
+
+Both accessions are also persisted, so they can be queried directly rather than reconstructed:
+
+| CFDB Field | Source | Notes |
+|------------|--------|-------|
+| `accession_id` | `file.persistent_id` `4DNF*` | Stamped onto the raw `file` collection pre-materialization, case-folded |
+| `collections[].accession_id` | `collection.persistent_id` `4DNE*` | Stamped onto the raw `collection` collection pre-materialization, case-folded |
+
+Both are stamped *before* materialization deliberately. The materializer rebuilds `files` from the raw collections on every run, so a value written afterwards would be erased by any standalone `make materialize-dcc DCC=4dn` — silently, leaving accession lookups returning nothing for the whole DCC.
 
 ## Materialization (Rust)
 

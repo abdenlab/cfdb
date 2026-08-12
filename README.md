@@ -490,6 +490,7 @@ The central entity representing a stable digital asset.
 | `sha256` | string? | SHA-256 checksum (preferred) |
 | `md5` | string? | MD5 checksum (if SHA-256 unavailable) |
 | `filename` | string | Filename without path |
+| `accession_id` | string? | The DCC's own accession for this file, stored upper-cased so an `accessionId` filter matches in any casing. Populated for 4DN and ENCODE; always null for HuBMAP (see the note below). |
 | `file_format` | FileFormat? | EDAM CV term for digital format |
 | `compression_format` | string? | EDAM CV term ID for compression (e.g., `format:3989` for gzip); `""` when no compression is recorded or recognized; null/absent when undetermined. Read the note below before relying on it. |
 | `data_type` | DataType? | EDAM CV term for data type |
@@ -507,6 +508,8 @@ The central entity representing a stable digital asset.
 **A note on `compression_format`, because it is easy to over-read.** The field reports compression that is *extrinsic* to `file_format` — a wrapper the source reveals and `file_format` does not. It is not a statement about whether the bytes are compressed. A BAM, bigWig or bigBed carries `""` despite being internally compressed, because its `file_format` already names that container. Conversely 4DN and HuBMAP take the value straight from their upstream C2M2 datapackage, which in practice leaves it blank on every file — including gzipped ones — so `""` from those DCCs means "upstream recorded nothing", not "uncompressed". Never treat `""` as a licence to skip inspecting the bytes.
 
 ENCODE derives the value from the download URL's filename suffix, because the ENCODE metadata TSV has no compression column. Two consequences are worth knowing. The field is **absent** (rendered as null) rather than `""` when nothing could be determined — no filename in the URL, or a compression suffix no EDAM term expresses (`.bz2`, `.xz`, `.zst`, `.zip`, `.starch`) — so treat null as "sniff the bytes", never as "uncompressed". And `format:3989` means "gzip-family stream": ENCODE names both plain gzip and BGZF `.gz` (it publishes no `.bgz` at all, and roughly a quarter of its `.gz` files are BGZF), so the value cannot distinguish them. Anything deciding on `gunzip | bgzip` must read the BGZF header — which is what `cfdb.workflows.processors.tabix` does, deliberately, and that byte-level check remains the decision of record.
+
+**A note on `accession_id`, because a null does not mean what it looks like.** The field exists so one input works across DCCs: 4DN puts an opaque UUID in `local_id` and carries its accession only inside the `persistent_id` URL, while ENCODE stores the accession *as* `local_id`. It is stored case-folded and filter values are folded identically, so `accessionId: ["4dnfimcjxzkh"]` and `["4DNFIMCJXZKH"]` match the same file. Three different situations all render as a null field and a `totalCount` of 0, and the API cannot distinguish them for you: the accession genuinely does not exist; the DCC issues none (all of HuBMAP, which matches files by filename within a dataset — tracked in [#102](https://github.com/abdenlab/cfdb/issues/102)); or that DCC has not been synced since the field was added. **A deployment must re-sync each DCC before `accessionId` returns anything.** Each sync logs its coverage (`4DN accession coverage: 53697/53697 files carry accession_id`), which is the only place that distinction is visible.
 
 #### Dcc
 
@@ -535,6 +538,7 @@ A grouping of files, biosamples, and/or subjects.
 | `name` | string | Human-readable label |
 | `description` | string? | Human-readable description |
 | `lab` | string? | Lab/PI name (shared across 4DN and ENCODE) |
+| `accession_id` | string? | The DCC's accession for the experiment this collection represents, stored upper-cased (shared across 4DN and ENCODE). Null on ENCODE's biosample-keyed fallback collections, which name no experiment, and on all of HuBMAP. |
 | `extra` | EnrichedCollection? | DCC-specific collection metadata (see EnrichedCollection) |
 
 #### Biosample
