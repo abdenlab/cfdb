@@ -840,6 +840,10 @@ fn index_keys() -> Vec<Document> {
     vec![
         doc! { "id_namespace": 1 },
         doc! { "local_id": 1 },
+        // Cross-DCC accession lookup. Stored already case-folded (see
+        // cfdb.accessions), so this plain index serves the case-insensitive
+        // match DocumentDB 5.0 cannot serve via collation.
+        doc! { "accession_id": 1 },
         doc! { "id_namespace": 1, "local_id": 1 },
         doc! { "persistent_id": 1 },
         doc! { "filename": 1 },
@@ -854,6 +858,7 @@ fn index_keys() -> Vec<Document> {
         doc! { "assay_type.name": 1 },
         doc! { "collections.id_namespace": 1 },
         doc! { "collections.local_id": 1 },
+        doc! { "collections.accession_id": 1 },
         doc! { "collections.name": 1 },
         // Collection anatomy indexes
         doc! { "collections.anatomy.id": 1 },
@@ -1029,6 +1034,62 @@ mod tests {
             let bio = first_biosample(&result);
             assert!(!bio.contains_key("anatomy"),
                 "anatomy field should be removed when raw value is empty string");
+        }
+
+        #[test]
+        /// Test that accession_id survives materialization at both levels.
+        ///
+        /// Both 4DN accessions are stamped on the raw collections
+        /// pre-materialization, so both reach the files collection only
+        /// because enrich_file carries them: the file's by mutating the raw
+        /// document in place, the collection's by cloning the whole
+        /// collection document. Nothing else verifies either hop, and both
+        /// would fail silently -- the accession would simply be absent,
+        /// indistinguishable from a DCC that issues none.
+        ///
+        /// This is also what makes stamping the raw collections load-bearing
+        /// rather than incidental: the materializer rebuilds files from the
+        /// raw documents on every run, so a value written to files instead
+        /// would not survive a standalone `make materialize-dcc`.
+        ///
+        /// Given:
+        ///     A raw file document and a raw collection document, each carrying
+        ///     an accession_id.
+        /// When:
+        ///     enrich_file processes the file.
+        /// Then:
+        ///     It should carry both accessions onto the materialized document.
+        fn test_enrich_file_propagates_accession_id() {
+            // Arrange
+            let biosample = doc! {
+                "id_namespace": "4dn",
+                "local_id": "bio-001",
+            };
+            let (mut file, mut lookups) =
+                lookups_with_biosample(biosample, HashMap::new());
+            file.insert("accession_id", "4DNFIMCJXZKH");
+            lookups
+                .collections
+                .get_mut(&("4dn".to_string(), "coll-001".to_string()))
+                .expect("collection fixture present")
+                .insert("accession_id", "4DNEXNHE6X77");
+
+            // Act
+            let result = enrich_file(file, &lookups);
+
+            // Assert
+            assert_eq!(
+                result.get_str("accession_id").unwrap(),
+                "4DNFIMCJXZKH",
+                "file accession_id should survive materialization"
+            );
+            let collections = result.get_array("collections").unwrap();
+            let coll = collections[0].as_document().unwrap();
+            assert_eq!(
+                coll.get_str("accession_id").unwrap(),
+                "4DNEXNHE6X77",
+                "collection accession_id should be carried by the document clone"
+            );
         }
 
         #[test]
@@ -1219,14 +1280,15 @@ mod tests {
     fn index_keys_returns_expected_set() {
         // GIVEN the index_keys function
         // WHEN called
-        // THEN it returns exactly 47 index key documents matching the expected fields
+        // THEN it returns exactly 49 index key documents matching the expected fields
         let keys = index_keys();
-        assert_eq!(keys.len(), 47);
+        assert_eq!(keys.len(), 49);
         assert_eq!(
             keys,
             vec![
                 doc! { "id_namespace": 1 },
                 doc! { "local_id": 1 },
+                doc! { "accession_id": 1 },
                 doc! { "id_namespace": 1, "local_id": 1 },
                 doc! { "persistent_id": 1 },
                 doc! { "filename": 1 },
@@ -1241,6 +1303,7 @@ mod tests {
                 doc! { "assay_type.name": 1 },
                 doc! { "collections.id_namespace": 1 },
                 doc! { "collections.local_id": 1 },
+                doc! { "collections.accession_id": 1 },
                 doc! { "collections.name": 1 },
                 doc! { "collections.anatomy.id": 1 },
                 doc! { "collections.anatomy.name": 1 },

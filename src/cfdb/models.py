@@ -354,6 +354,15 @@ class FileMetadataModel(BaseModel):
             An identifier representing this file, unique within this id_namespace.
             Part 2 of 2-component composite primary key.
 
+        accession_id:
+            The DCC-issued file accession users recognize this file by (e.g.
+            "4DNFIMCJXZKH", "ENCFF525XQX"), giving every DCC one queryable name
+            for it regardless of where the DCC keeps it -- 4DN carries it only
+            inside persistent_id, ENCODE stores it as local_id. Stored already
+            folded by ``cfdb.accessions.normalize_accession`` so the equality
+            match is case-insensitive to callers without a collation DocumentDB
+            5.0 does not support. None when the DCC issues no file accession.
+
         project_id_namespace:
             The id_namespace of the primary project within which this file was
             created. Part 1 of 2-component composite foreign key.
@@ -448,6 +457,7 @@ class FileMetadataModel(BaseModel):
     project: Optional[Project] = None
     id_namespace: str = str()
     local_id: str = str()
+    accession_id: Optional[str] = None
     project_id_namespace: str = str()
     project_local_id: str = str()
     persistent_id: Optional[str] = None
@@ -480,6 +490,7 @@ class FileMetadataModel(BaseModel):
 
     @field_validator(
         "file_format", "data_type", "assay_type", "project", "extra",
+        "accession_id",
         mode="before",
     )
     @classmethod
@@ -618,6 +629,15 @@ class Collection(BaseModel):
             An identifier representing this collection, unique within this
             id_namespace. Part 2 of 2-component composite primary key.
 
+        accession_id:
+            The DCC-issued experiment accession users recognize this collection
+            by (e.g. "4DNEXNHE6X77", "ENCSR918ZSJ"), giving every DCC one
+            queryable name for it regardless of where the DCC keeps it. Stored
+            already folded by ``cfdb.accessions.normalize_accession`` so the
+            equality match is case-insensitive to callers without a collation
+            DocumentDB 5.0 does not support. None when the DCC issues no
+            experiment accession.
+
         persistent_id:
             A persistent, resolvable (not necessarily retrievable) URI or compact
             ID permanently attached to this collection.
@@ -651,6 +671,7 @@ class Collection(BaseModel):
     biosamples: List[Biosample]
     id_namespace: str = str()
     local_id: str = str()
+    accession_id: Optional[str] = None
     persistent_id: Optional[str] = None
     creation_time: Optional[str] = None
     abbreviation: Optional[str] = None
@@ -664,7 +685,7 @@ class Collection(BaseModel):
     subjects: List[Subject] = []
     extra: Optional[EnrichedCollection] = None
 
-    @field_validator("extra", mode="before")
+    @field_validator("extra", "accession_id", mode="before")
     @classmethod
     def empty_string_to_none(cls, v):
         if v == "":

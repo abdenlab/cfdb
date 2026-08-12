@@ -158,12 +158,38 @@ def operational_index_specs() -> list[IndexSpec]:
     ]
 
 
+def materialized_files_index_specs() -> list[IndexSpec]:
+    """Accession indexes on the materialized ``files`` collection.
+
+    The Rust materializer owns ``files`` and creates its full index set at
+    the end of every run, so this list deliberately does not mirror it --
+    duplicating ~49 keys in a second writer is what
+    :func:`data_index_specs` exists to avoid.
+
+    It exists for the one path that never reaches the materializer at all:
+    ``_sync_encode`` writes ENCODE documents straight into ``files``, so on
+    a database where ENCODE is the only DCC synced, ``files`` would carry
+    no indexes whatsoever and every accession lookup would scan the whole
+    collection on a public endpoint. Ensuring just the accession keys there
+    costs nothing when the materializer has already created them: identical
+    keys derive identical default names, so the create is a no-op.
+    """
+    return [
+        IndexSpec("files", [("accession_id", 1)]),
+        IndexSpec("files", [("collections.accession_id", 1)]),
+    ]
+
+
 def data_index_specs() -> list[IndexSpec]:
     """Query-performance indexes for the loaded C2M2 data collections.
 
     Mirrors the data-collection portion of ``scripts/create-indexes.js``.
     Only useful after a sync has loaded data, so these are ensured in the
     sync/materialize path rather than at API startup.
+
+    Deliberately excludes the materialized ``files`` collection, which the
+    Rust materializer owns; see :func:`materialized_files_index_specs` for
+    the narrow exception and why it does not conflict.
     """
     specs: list[IndexSpec] = []
 

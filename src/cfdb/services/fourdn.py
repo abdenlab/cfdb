@@ -24,6 +24,21 @@ Entity Matching
 File          persistent_id contains 4DNF[A-Z0-9]+ accession
 Collection    persistent_id contains 4DNE[A-Z][A-Z0-9]+ accession
 
+Both patterns are matched case-insensitively and the extractors return the
+accession already case-folded, so the value that keys the Search API round
+trip is the same one stored in ``accession_id``.
+
+Accession Stamping (persistent_id → CFDB)
+-----------------------------------------
+Both run *pre*-materialization, against the raw C2M2 collections, so the
+materializer carries the values into ``files`` on every rebuild. Writing
+them post-materialization instead would leave them to be erased by any
+standalone ``make materialize-dcc`` / ``make materialize-files``.
+
+file.persistent_id 4DNF* accession       → file.accession_id (case-folded)
+collection.persistent_id 4DNE* accession → collection.accession_id
+                                           (case-folded)
+
 Field Mapping (4DN API → CFDB)
 -------------------------------
 
@@ -85,6 +100,7 @@ from typing import Optional
 
 import aiohttp
 
+from cfdb.accessions import normalize_accession
 from cfdb.dcc_registry import get_dcc_config
 from cfdb.models import (
     NUMERIC_PROTOCOL_FIELDS,
@@ -103,11 +119,31 @@ _REQUEST_INTERVAL = 0.1
 # requested file rather than a truncated deep-pagination window.
 _FILE_METADATA_BATCH_SIZE = 100
 
-# 4DN accession pattern: 4DNF followed by alphanumeric characters
-_ACCESSION_RE = re.compile(r"4DNF[A-Z0-9]+")
+# 4DN accession pattern: 4DNF followed by alphanumeric characters.
+#
+# Case-insensitive deliberately. 4DN publishes accessions upper-cased and
+# every one of the 53,697 files currently in the corpus is, but an
+# upper-case-only pattern degrades badly rather than simply missing: on a
+# mixed-case value it matches the upper-case prefix and returns a
+# *truncated* accession (``4DNFImcjxzkh`` -> ``4DNFI``), which is a
+# plausible-looking wrong answer rather than a None the callers already
+# count and log. Worse, every such value truncates to the same short
+# prefix, so a handful of mixed-case rows would collide onto one accession.
+#
+# The extractors below therefore fold what they match, making the canonical
+# accession the only value any caller can obtain. Matching leniently while
+# returning the raw match would have moved the failure rather than removed
+# it: the extracted value is also the key for the Search API round trip,
+# and the portal answers with its own upper-case form, so a mixed-case
+# match would join against nothing and that file would silently lose all
+# its enrichment -- while still carrying a correct accession_id, and
+# without being counted in the unparseable warning that is the operator's
+# only signal.
+_ACCESSION_RE = re.compile(r"4DNF[A-Z0-9]+", re.IGNORECASE)
 
-# 4DN experiment/experiment set accession pattern: 4DNEX* or 4DNES*
-_EXPERIMENT_ACCESSION_RE = re.compile(r"4DNE[A-Z][A-Z0-9]+")
+# 4DN experiment/experiment set accession pattern: 4DNEX* or 4DNES*.
+# Case-insensitive for the same reason as above.
+_EXPERIMENT_ACCESSION_RE = re.compile(r"4DNE[A-Z][A-Z0-9]+", re.IGNORECASE)
 
 
 def extract_accession(persistent_id: str) -> Optional[str]:
@@ -117,12 +153,15 @@ def extract_accession(persistent_id: str) -> Optional[str]:
     Handles format: https://data.4dnucleome.org/files-processed/4DNFI1234ABC/@@download/4DNFI1234ABC.mcool
     or: https://data.4dnucleome.org/4DNFI1234ABC
 
-    Returns accession string (e.g., "4DNFI1234ABC") or None.
+    Returns the accession case-folded to its canonical form (e.g.,
+    "4DNFI1234ABC") or None. Folded here rather than at each call site so
+    the one value every caller holds is the one both the stored field and
+    the Search API are keyed on.
     """
     if not persistent_id:
         return None
     match = _ACCESSION_RE.search(persistent_id)
-    return match.group(0) if match else None
+    return normalize_accession(match.group(0)) if match else None
 
 
 def extract_experiment_accession(persistent_id: str) -> Optional[str]:
@@ -131,12 +170,14 @@ def extract_experiment_accession(persistent_id: str) -> Optional[str]:
 
     Handles accessions starting with 4DNEX (experiments) or 4DNES (experiment sets).
 
-    Returns accession string (e.g., "4DNEXH4ZUIH6") or None.
+    Returns the accession case-folded to its canonical form (e.g.,
+    "4DNEXH4ZUIH6") or None, for the same reason as
+    :func:`extract_accession`.
     """
     if not persistent_id:
         return None
     match = _EXPERIMENT_ACCESSION_RE.search(persistent_id)
-    return match.group(0) if match else None
+    return normalize_accession(match.group(0)) if match else None
 
 
 def parse_extra_files(extra_files_raw: list) -> list[dict]:

@@ -2,7 +2,22 @@ from __future__ import annotations
 
 import strawberry
 
+from cfdb.accessions import normalize_accession
 from cfdb.api.gql.types import BigInt
+
+#: Fully-flattened filter paths whose values are folded by
+#: :func:`cfdb.accessions.normalize_accession` before becoming a MongoDB
+#: predicate. Enumerated in full rather than matched on the last dotted
+#: segment: the set of paths whose stored form is folded is fixed and known
+#: statically, and leaf matching would silently opt in any future field
+#: named ``accession_id`` at any depth. A DCC-native ``extra.<dcc>.accession_id``
+#: -- the shape this codebase already uses for upstream values -- would be
+#: stored exactly as the DCC published it while being folded on query,
+#: which is the failure ``cfdb.accessions`` warns about: nothing raises,
+#: the documents simply become permanently unmatchable. Matching the whole
+#: path makes a new field fail closed (unfolded, byte-exact, like every
+#: other field) instead.
+_NORMALIZED_PATHS = {"accession_id", "collections.accession_id"}
 
 
 @strawberry.input
@@ -143,6 +158,7 @@ class CollectionInput:
     biosamples: list[BiosampleInput] | None = None
     id_namespace: list[str] | None = None
     local_id: list[str] | None = None
+    accession_id: list[str] | None = None
     persistent_id: list[str] | None = None
     creation_time: list[str] | None = None
     abbreviation: list[str] | None = None
@@ -241,6 +257,7 @@ class FileMetadataInput:
     project: list[ProjectInput] | None = None
     id_namespace: list[str] | None = None
     local_id: list[str] | None = None
+    accession_id: list[str] | None = None
     project_id_namespace: list[str] | None = None
     project_local_id: list[str] | None = None
     persistent_id: list[str] | None = None
@@ -289,9 +306,43 @@ def to_dict(obj):
     return result
 
 
+def _predicate(key, value):
+    """Build a single equality predicate, folding normalized fields.
+
+    Every leaf of a filter becomes a bare equality match, so a value that
+    does not match the stored form byte-for-byte matches nothing. For
+    ``accession_id`` the stored form is
+    :func:`cfdb.accessions.normalize_accession`'s output, so the filter
+    value is folded the same way here -- the one place a scalar becomes a
+    predicate -- rather than at each ``to_query`` call site, where a later
+    caller could bypass it.
+
+    An accession that folds to ``None`` (blank or whitespace only)
+    contributes no clause: the empty dict returned here is dropped by
+    ``to_query``. Emitting ``{field: None}`` instead would match documents
+    whose accession is null *or absent* -- every HuBMAP file, every 4DN
+    file whose accession did not parse, and the whole corpus before the
+    first post-deploy sync. That made a blank value the only filter in the
+    schema that *widens* the result set, where every sibling string field
+    matches nothing; a search box wired straight to the variable returned
+    a page of unrelated files rather than no results.
+    """
+    if key in _NORMALIZED_PATHS and isinstance(value, str):
+        folded = normalize_accession(value)
+        return {key: folded} if folded is not None else {}
+    return {key: value}
+
+
 def to_query(obj, prefix=""):
     """
     Convert a nested dict/list structure into a flattened MongoDB query.
+
+    A branch that contributes no constraint -- an unset field, an accession
+    that folds away, or an empty list -- yields ``{}`` and is dropped by its
+    parent rather than left in place. MongoDB rejects ``{"$and": []}`` and
+    ``{"$or": []}`` outright, so an empty clause list has to collapse to
+    ``{}`` (match everything) rather than be emitted; without that, a filter
+    whose only value folded away would 500 instead of returning rows.
     """
     if isinstance(obj, dict):
         and_clause = []
@@ -301,25 +352,29 @@ def to_query(obj, prefix=""):
                 flattened = to_query(v, key)
                 if isinstance(flattened, dict) and "$and" in flattened:
                     and_clause.extend(flattened["$and"])
-                else:
+                elif flattened:
                     and_clause.append(flattened)
             elif v is not None:
-                and_clause.append({key: v})
+                predicate = _predicate(key, v)
+                if predicate:
+                    and_clause.append(predicate)
+        if not and_clause:
+            return {}
         if len(and_clause) == 1:
             return and_clause[0]
-        else:
-            return {"$and": and_clause}
+        return {"$and": and_clause}
     elif isinstance(obj, list):
         or_clause = []
         for item in obj:
             flattened = to_query(item, prefix)
             if isinstance(flattened, dict) and "$or" in flattened:
                 or_clause.extend(flattened["$or"])
-            else:
+            elif flattened:
                 or_clause.append(flattened)
+        if not or_clause:
+            return {}
         if len(or_clause) == 1:
             return or_clause[0]
-        else:
-            return {"$or": or_clause}
+        return {"$or": or_clause}
     else:
-        return {prefix: obj} if prefix else obj
+        return _predicate(prefix, obj) if prefix else obj

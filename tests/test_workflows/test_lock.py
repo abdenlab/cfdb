@@ -45,7 +45,7 @@ def _insert_job(
 
 def _install_jobs_index(mock_db) -> None:
     """Register the partial unique index on the FakeDB jobs collection."""
-    mock_db.jobs.create_index(
+    mock_db.jobs.register_index(
         {"workflow_key": 1},
         unique=True,
         # Match production: the mutex partial-unique index filters on the

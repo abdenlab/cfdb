@@ -13,6 +13,7 @@ from cfdb.indexes import (
     all_index_specs,
     data_index_specs,
     ensure_indexes,
+    materialized_files_index_specs,
     operational_index_specs,
 )
 
@@ -602,3 +603,94 @@ async def test_ensure_indexes_should_reraise_unexpected_failure(mocker):
     with pytest.raises(OperationFailure):
         await ensure_indexes(db, [spec])
     collection.drop_index.assert_not_awaited()
+
+
+def test_data_index_specs_should_not_target_the_materialized_files_collection():
+    """Test the ownership split between the two index sources.
+
+    This module owns the raw C2M2 collections; the Rust materializer owns
+    the denormalized ``files`` collection it builds, and indexes it in
+    ``index_keys``. The module docstring states that split in prose only,
+    so this pins it: adding a ``files`` spec here would create a second
+    writer for those indexes, silently competing with the materializer.
+
+    Given:
+        The data index specs.
+    When:
+        The set of collections they target is collected.
+    Then:
+        It should include the raw ``file`` collection and not ``files``.
+    """
+    # Act
+    targets = {spec.collection for spec in data_index_specs()}
+
+    # Assert
+    assert "file" in targets
+    assert "files" not in targets
+
+
+def test_materialized_files_index_specs_should_not_overlap_the_data_specs():
+    """Test that the narrow files exception does not become a second writer.
+
+    ``files`` has exactly one owner for its full index set -- the
+    materializer. The accession specs exist only because ``_sync_encode``
+    writes ``files`` directly and never runs it, so an ENCODE-only database
+    would otherwise have no index at all. Keeping the two sources disjoint
+    is what stops that exception from growing into a duplicate of
+    ``index_keys``.
+
+    Given:
+        Both Python-side index sources.
+    When:
+        Their (collection, name) pairs are compared.
+    Then:
+        They should share none, and the files specs should target only
+        ``files``.
+    """
+    # Act
+    data = {(s.collection, s.name) for s in data_index_specs()}
+    files = {(s.collection, s.name) for s in materialized_files_index_specs()}
+
+    # Assert
+    assert not data & files
+    assert {s.collection for s in materialized_files_index_specs()} == {"files"}
+
+
+def test_materialized_files_index_specs_should_cover_both_accession_paths():
+    """Test that both queryable accession paths are indexed.
+
+    These are exactly the two predicates ``to_query`` can emit for an
+    accession filter; an accession lookup that missed either would scan the
+    whole collection on a public endpoint.
+
+    Given:
+        The materialized files index specs.
+    When:
+        Their key tuples are collected.
+    Then:
+        They should cover the file-level and nested collection accessions.
+    """
+    # Act
+    keys = {spec.keys for spec in materialized_files_index_specs()}
+
+    # Assert
+    assert keys == {(("accession_id", 1),), (("collections.accession_id", 1),)}
+
+
+def test_all_index_specs_should_not_repeat_a_collection_and_name():
+    """Test that no index is declared twice.
+
+    Given:
+        The full operational-plus-data spec list.
+    When:
+        Its (collection, name) pairs are collected.
+    Then:
+        None should repeat, so appending a field to two loops -- or to the
+        same loop twice -- fails here rather than issuing a redundant
+        createIndex against a live database.
+    """
+    # Act
+    pairs = [(spec.collection, spec.name) for spec in all_index_specs()]
+
+    # Assert
+    assert len(pairs) == len(set(pairs))

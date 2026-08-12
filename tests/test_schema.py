@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 import pytest
+from bson import ObjectId
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from mongomock_motor import AsyncMongoMockClient
@@ -54,9 +55,29 @@ def test_from_pydantic_should_convert_nested_model_lists_and_leave_json_untouche
 
 
 def _make_file_doc(
-    local_id: str, submission: str = "hubmap", size_in_bytes: int | None = None
+    local_id: str,
+    submission: str = "hubmap",
+    size_in_bytes: int | None = None,
+    accession_id: str | None = None,
+    collection_accession_id: str | None = None,
 ) -> dict:
-    """Return a minimal file document that satisfies FileMetadataModel."""
+    """Return a minimal file document that satisfies FileMetadataModel.
+
+    ``accession_id`` and ``collection_accession_id`` default to None so
+    existing callers are unaffected; pass them in the stored (already
+    case-folded) form the sync pipeline writes.
+    """
+    collections = []
+    if collection_accession_id is not None:
+        collections = [
+            {
+                "id_namespace": "ns",
+                "local_id": "coll1",
+                "name": "a collection",
+                "accession_id": collection_accession_id,
+                "biosamples": [],
+            }
+        ]
     return {
         "id_namespace": "ns",
         "local_id": local_id,
@@ -66,11 +87,12 @@ def _make_file_doc(
         "submission": submission,
         "data_access_level": "public",
         "size_in_bytes": size_in_bytes,
+        "accession_id": accession_id,
         "dcc": {
             "dcc_name": submission.upper(),
             "dcc_abbreviation": submission,
         },
-        "collections": [],
+        "collections": collections,
     }
 
 
@@ -104,6 +126,153 @@ class TestFilesQuery:
     def _patch_cutover(self, mocker):
         """No-op ``locks.wait_for_cutover`` for every test in this class."""
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "typed",
+        ["4dnfimcjxzkh", "4DNFIMCJXZKH", "4DnFiMcJxZkH", "  4dnfimcjxzkh  "],
+        ids=["lower", "upper", "mixed", "padded"],
+    )
+    async def test_files_should_match_a_stored_accession_in_any_casing(
+        self, mock_db, typed
+    ):
+        """Test the round trip the accession field exists to provide.
+
+        This is the one invariant no other test covers: the ingest side and
+        the query side each fold, and every other test pins only one of
+        them. If either fold changed, they would all still pass while every
+        accession lookup silently returned nothing.
+
+        Given:
+            A file stored with the folded accession the sync pipeline writes.
+        When:
+            The files query filters on that accession as a caller might
+            type it -- lower, upper, mixed case, or padded.
+        Then:
+            It should return the file in every casing.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1", accession_id="4DNFIMCJXZKH")]
+
+        # Act
+        result = await schema.execute(
+            "query($a: [String!]) { files(input: [{accessionId: $a}]) "
+            "{ totalCount items { accessionId } } }",
+            variable_values={"a": [typed]},
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 1
+        assert result.data["files"]["items"][0]["accessionId"] == "4DNFIMCJXZKH"
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_the_nested_collection_accession(self, mock_db):
+        """Test that the accession survives onto the generated collection type.
+
+        The nested output type is built by build_strawberry_type from the
+        pydantic model and populated through from_pydantic's wrapper
+        peeling, so it is a separate path from the file-level field.
+
+        Given:
+            A file whose nested collection carries an accession.
+        When:
+            The files query selects collections { accessionId }.
+        Then:
+            It should return the stored collection accession.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1", collection_accession_id="4DNEXNHE6X77")
+        ]
+
+        # Act
+        result = await schema.execute(
+            "{ files { items { collections { accessionId } } } }"
+        )
+
+        # Assert
+        assert result.errors is None
+        collections = result.data["files"]["items"][0]["collections"]
+        assert collections[0]["accessionId"] == "4DNEXNHE6X77"
+
+    @pytest.mark.asyncio
+    async def test_files_should_serialize_a_missing_accession_as_null(self, mock_db):
+        """Test that an accession-less file is not an error.
+
+        Given:
+            A file with no accession at either level, as every HuBMAP file
+            permanently is.
+        When:
+            The files query selects both accession fields.
+        Then:
+            It should serialize the file-level field as null and return the
+            empty collection list, without a GraphQL error.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1")]
+
+        # Act
+        result = await schema.execute(
+            "{ files { items { accessionId collections { accessionId } } } }"
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"][0]["accessionId"] is None
+        assert result.data["files"]["items"][0]["collections"] == []
+
+    @pytest.mark.asyncio
+    async def test_files_should_return_no_matches_for_an_unknown_accession(
+        self, mock_db
+    ):
+        """Test that a folded predicate matching nothing is a clean miss.
+
+        Given:
+            A file stored under one accession.
+        When:
+            The files query filters on a different accession.
+        Then:
+            It should return zero matches with no error, rather than a
+            malformed query.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_file_doc("f1", accession_id="ENCFF525XQX")]
+
+        # Act
+        result = await schema.execute(
+            '{ files(input: [{accessionId: ["4DNFIMCJXZKH"]}]) { totalCount } }'
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 0
+
+    @pytest.mark.asyncio
+    async def test_file_should_return_the_accession_for_a_single_lookup(self, mock_db):
+        """Test the second, independent from_pydantic call site.
+
+        Given:
+            One accession-bearing file addressed by its ObjectId.
+        When:
+            The single-file query selects accessionId.
+        Then:
+            It should return the stored accession, since the file resolver
+            builds its type through a separate conversion from files.
+        """
+        # Arrange
+        doc = _make_file_doc("f1", accession_id="ENCFF525XQX")
+        doc["_id"] = ObjectId()
+        mock_db.files.docs = [doc]
+
+        # Act
+        result = await schema.execute(
+            '{ file(id: "%s") { accessionId } }' % doc["_id"]
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["file"]["accessionId"] == "ENCFF525XQX"
 
     @pytest.mark.asyncio
     async def test_files_should_return_page_size_items_when_more_documents_match(
@@ -1130,6 +1299,41 @@ class TestDistinctValuesQuery:
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field", ["accession_id", "collections.accession_id"]
+    )
+    async def test_distinct_values_should_reject_the_accession_fields(
+        self, mock_db, field
+    ):
+        """Test that accessions stay out of the distinct-values allowlist.
+
+        That allowlist is for low-cardinality facet fields a client can
+        enumerate in a filter UI. An accession is unique per document, so
+        distinct over it would return one value per row -- hundreds of
+        thousands on the live corpus. The exclusion is deliberate, and
+        this pins it against a later well-meaning addition.
+
+        Given:
+            Neither accession field is in ALLOWED_DISTINCT_FIELDS.
+        When:
+            The distinctValues query requests one of them.
+        Then:
+            It should return an error naming the rejected field.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_distinct_doc("f1", "4DN", "4dn")]
+
+        # Act
+        result = await schema.execute(
+            "query($f: [String!]!) { distinctValues(fields: $f) { field values } }",
+            variable_values={"f": [field]},
+        )
+
+        # Assert
+        assert result.errors is not None
+        assert field in str(result.errors[0].message)
+
+    @pytest.mark.asyncio
     async def test_distinct_values_returns_all_unique_values_for_single_field(
         self, mock_db
     ):
@@ -1506,6 +1710,36 @@ class TestFileCountQuery:
     def _patch_cutover(self, mocker):
         """No-op ``locks.wait_for_cutover`` for every test in this class."""
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_file_count_should_fold_a_lower_case_accession_filter(self, mock_db):
+        """Test that folding reaches the count resolver, not just the paged one.
+
+        fileCount builds its query through a separate to_query call site,
+        so a fold wired only into the files resolver would leave counts
+        disagreeing with the page they describe.
+
+        Given:
+            Two files, one stored under an accession and one without.
+        When:
+            fileCount filters on that accession in lower case.
+        Then:
+            It should return 1.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_file_doc("f1", accession_id="ENCFF525XQX"),
+            _make_file_doc("f2"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            '{ fileCount(input: [{accessionId: ["encff525xqx"]}]) }'
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["fileCount"] == 1
 
     @pytest.mark.asyncio
     async def test_file_count_should_return_total_when_no_filter(self, mock_db):
@@ -2430,3 +2664,58 @@ def test_render_should_match_the_checked_in_sdl():
     assert SCHEMA_PATH.read_text(encoding="utf-8") == generated, (
         "schema.graphql is stale — run `make schema` to regenerate it."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("type_name", "kind"),
+    [
+        ("FileMetadataType", "output"),
+        ("CollectionType", "output"),
+        ("FileMetadataInput", "input"),
+        ("CollectionInput", "input"),
+    ],
+)
+async def test_schema_should_publish_accession_id_on_all_four_surfaces(
+    type_name, kind
+):
+    """Test the accession's declared shape on every type that carries it.
+
+    The SDL drift guard above cannot cover this: regenerating a wrong
+    schema makes it pass. This pins intent instead -- an accession is
+    optional on output because most DCCs issue none, and a list on input
+    because the filter convention expands a list into an OR.
+
+    Given:
+        The published schema, where the accession appears on two output
+        types and two input types.
+    When:
+        Each type is introspected.
+    Then:
+        It should expose accessionId as a nullable String on the output
+        types and a list of non-null String on the input types.
+    """
+    # Act
+    result = await schema.execute(
+        """
+        query($n: String!) {
+          __type(name: $n) {
+            fields { name type { kind name ofType { kind name } } }
+            inputFields { name type { kind name ofType { kind name ofType { kind name } } } }
+          }
+        }
+        """,
+        variable_values={"n": type_name},
+    )
+
+    # Assert
+    assert result.errors is None
+    declared = result.data["__type"]["fields" if kind == "output" else "inputFields"]
+    field = next(f for f in declared if f["name"] == "accessionId")
+    if kind == "output":
+        # Nullable: the named scalar is reached without a NON_NULL wrapper.
+        assert field["type"]["kind"] == "SCALAR"
+        assert field["type"]["name"] == "String"
+    else:
+        assert field["type"]["kind"] == "LIST"
+        assert _named_type(field["type"]) == "String"

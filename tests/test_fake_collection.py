@@ -1,9 +1,10 @@
 """Tests for the in-memory ``FakeCollection`` test double.
 
 These tests pin behavior of the FakeCollection extensions that the
-workflow tests rely on — partial-filter awareness on unique indexes,
-``$setOnInsert`` upserts, dotted-path resolution in queries, the ``$lt``
-operator, and ``$addToSet`` deduplication. Treating the fake as part of
+workflow and sync tests rely on — partial-filter awareness on unique
+indexes, ``$setOnInsert`` upserts, dotted-path resolution in queries, the
+``$lt`` operator, ``$addToSet`` deduplication, and ``bulk_write``'s
+dotted-key nesting and changed-row counting. Treating the fake as part of
 the test contract surface keeps regressions in the helper from masking
 real production behavior.
 """
@@ -13,12 +14,72 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 from tests.conftest import FakeCollection
 
 
 class TestFakeCollectionContract:
+    @pytest.mark.asyncio
+    async def test_bulk_write_should_nest_a_dotted_set_key(self):
+        """Test that a dotted $set nests rather than landing flat.
+
+        Real Mongo treats ``{"$set": {"extra.fourdn": ...}}`` as a path, so
+        a double that assigned the key literally would let a test assert an
+        enrichment payload shape against a document Mongo would have
+        written differently -- the assertion passes, production differs.
+
+        Given:
+            A document and an UpdateOne carrying a dotted $set key.
+        When:
+            bulk_write applies it.
+        Then:
+            The value should be nested under the path's segments, with no
+            flat key left behind.
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs = [{"_id": "d1"}]
+
+        # Act
+        await coll.bulk_write(
+            [UpdateOne({"_id": "d1"}, {"$set": {"extra.fourdn": {"status": "released"}}})]
+        )
+
+        # Assert
+        assert coll.docs[0]["extra"] == {"fourdn": {"status": "released"}}
+        assert "extra.fourdn" not in coll.docs[0]
+
+    @pytest.mark.asyncio
+    async def test_bulk_write_should_count_changed_rows_not_matched_rows(self):
+        """Test that modified_count means modified, as Mongo reports it.
+
+        A double counting matched rows makes every ``modified_count``
+        assertion in the suite fiction: a re-applied identical update would
+        report work it did not do, which is exactly the signal a sync uses
+        to report how much it stamped.
+
+        Given:
+            A document already carrying the value an update would set.
+        When:
+            bulk_write applies that update.
+        Then:
+            It should match the document but report zero modifications.
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs = [{"_id": "d1", "accession_id": "4DNFIMCJXZKH"}]
+
+        # Act
+        result = await coll.bulk_write(
+            [UpdateOne({"_id": "d1"}, {"$set": {"accession_id": "4DNFIMCJXZKH"}})]
+        )
+
+        # Assert
+        assert result.modified_count == 0
+        assert coll.docs[0]["accession_id"] == "4DNFIMCJXZKH"
+
     @pytest.mark.asyncio
     async def test_insert_one_should_raise_duplicate_when_partial_filter_matches(self):
         """Test that the partial unique index blocks two active rows.
@@ -35,7 +96,7 @@ class TestFakeCollectionContract:
         """
         # Arrange
         coll = FakeCollection()
-        coll.create_index(
+        await coll.create_index(
             {"workflow_key": 1},
             unique=True,
             partialFilterExpression={"status": {"$in": ["pending", "running"]}},
@@ -66,7 +127,7 @@ class TestFakeCollectionContract:
         """
         # Arrange
         coll = FakeCollection()
-        coll.create_index(
+        await coll.create_index(
             {"workflow_key": 1},
             unique=True,
             partialFilterExpression={"status": {"$in": ["pending", "running"]}},

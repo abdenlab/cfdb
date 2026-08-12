@@ -83,6 +83,7 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 | CFDB Field | ENCODE TSV Column | Type | Notes |
 |------------|-------------------|------|-------|
 | `local_id` | `File accession` | string | ENCODE accession (e.g., `ENCFF001ABC`) |
+| `accession_id` | `File accession` | string | The same accession, case-folded to upper case. Duplicates `local_id` for ENCODE, which stores the accession there; the separate field exists for cross-DCC uniformity, since 4DN's `local_id` is an opaque UUID. Folded so an `accessionId` filter matches in any casing, which means it can legitimately differ from `local_id` in case. |
 | `id_namespace` | — | string | Constant: `https://www.encodeproject.org` |
 | `filename` | `File download URL` | string | Basename extracted from URL |
 | `access_url` | `File download URL` | string | Full HTTPS download URL |
@@ -124,6 +125,7 @@ One collection per unique experiment accession, embedded on `file.collections[]`
 | CFDB Field | ENCODE TSV Column | Notes |
 |------------|-------------------|-------|
 | `local_id` | `Experiment accession` | e.g., `"ENCSR000AAA"` |
+| `accession_id` | `Experiment accession` | The same accession, case-folded to upper case |
 | `name` | `Experiment accession` | Same as `local_id` |
 | `persistent_id` | `Experiment accession` | `https://www.encodeproject.org/experiments/{accession}/` |
 | `anatomy[]` | `Biosample term id` + `Biosample term name` | `{id, name}` object |
@@ -131,7 +133,7 @@ One collection per unique experiment accession, embedded on `file.collections[]`
 | `subjects[]` | `Donor(s)` | Subject records (see below) |
 | `extra.encode` | — | Experiment-level metadata (see below) |
 
-**Fallback**: if `Experiment accession` is missing, falls back to biosample-keyed collection (`biosample:{name}`).
+**Fallback**: if `Experiment accession` is missing, falls back to biosample-keyed collection (`biosample:{name}`). That fallback collection is synthesized locally and names no ENCODE experiment, so it carries no `accession_id` rather than a fabricated one. Note also that the whole collection block is gated on `Biosample term name`: a row with an experiment accession but no biosample term produces no collection at all, so that experiment's accession is queryable nowhere.
 
 #### Collection Lab (top-level)
 
