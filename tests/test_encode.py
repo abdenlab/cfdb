@@ -1,19 +1,30 @@
-"""Tests for ENCODE compression-format derivation and row transformation."""
+"""Tests for the ENCODE metadata fetch, compression derivation and transform."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
+import aiohttp
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cfdb.accessions import normalize_accession
+from cfdb.services import encode as encode_module
 from cfdb.services.encode import (
     COMPRESSION_SUFFIX_TO_EDAM,
     UNCOMPRESSED,
     UNMAPPABLE_COMPRESSION_SUFFIXES,
     derive_compression_format,
+    fetch_encode_metadata,
     transform_to_c2m2,
 )
+
+#: The variable the metadata fetch reads its budget from. Named here rather
+#: than imported so the tests pin the operator-facing contract: renaming it in
+#: the module should fail these tests, not silently follow along.
+TIMEOUT_ENV = "ENCODE_METADATA_TIMEOUT_SECONDS"
 
 DOWNLOAD_URL = "https://www.encodeproject.org/files/ENCFF123ABC/@@download/{name}"
 
@@ -37,6 +48,403 @@ def _encode_row(**overrides) -> dict:
     }
     row.update(overrides)
     return row
+
+
+class _FakeContent:
+    """Async-iterable stand-in for ``response.content``.
+
+    Yields each line as bytes, the way aiohttp delivers a streamed body, so
+    the parser's own decode and newline handling are exercised rather than
+    bypassed. ``fail_after`` raises once that many lines have been yielded,
+    modelling a stream that dies partway.
+    """
+
+    def __init__(self, lines: list[str], fail_after: int | None = None):
+        self._lines = lines
+        self._fail_after = fail_after
+
+    async def __aiter__(self):  # pragma: no cover - delegated to __anext__
+        for index, line in enumerate(self._lines):
+            if self._fail_after is not None and index == self._fail_after:
+                raise asyncio.TimeoutError
+            yield f"{line}\n".encode()
+
+
+class _FakeResponse:
+    """Async-context-manager stand-in for a streamed aiohttp response."""
+
+    def __init__(self, status: int, content: _FakeContent):
+        self.status = status
+        self.content = content
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _StreamingSession:
+    """Fake aiohttp session that serves one streamed TSV body.
+
+    Records the kwargs of every ``get`` -- unlike the 4DN fakes, which
+    discard them -- because the request's timeout is the behavior under
+    test. ``error`` raises instead of responding, modelling a network
+    failure before any body arrives.
+    """
+
+    def __init__(self, lines=None, status=200, fail_after=None, error=None):
+        self._lines = lines or []
+        self._status = status
+        self._fail_after = fail_after
+        self._error = error
+        self.get_kwargs: list[dict] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        self.get_kwargs.append(kwargs)
+        if self._error is not None:
+            raise self._error
+        return _FakeResponse(
+            self._status, _FakeContent(self._lines, self._fail_after)
+        )
+
+
+def _tsv(*rows: str) -> list[str]:
+    """Return a header line plus the given data lines."""
+    return ["File accession\tFile format", *rows]
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_bound_the_request_by_the_configured_timeout(
+    mocker, monkeypatch
+):
+    """Test the request budget is the configured timeout, not a short literal.
+
+    A 600-second total aborted the sync around 230,000 of ~810,000 rows: the
+    budget covers the whole streamed body, and every row is inserted as it
+    streams, so the clock tracks insert throughput rather than latency. Since
+    the DCC is cleared before reloading, the abort left the corpus smaller
+    than it started.
+
+    Given:
+        A streamed metadata response and no timeout override.
+    When:
+        fetch_encode_metadata drains it.
+    Then:
+        It should have requested with a budget of at least an hour.
+    """
+    # Arrange
+    monkeypatch.delenv(TIMEOUT_ENV, raising=False)
+    session = _StreamingSession(lines=_tsv("ENCFF1\tbed"))
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert session.get_kwargs[0]["timeout"].total >= 3600
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_honor_the_timeout_from_the_environment(
+    mocker, monkeypatch
+):
+    """Test an operator can raise the budget without a deploy.
+
+    Asserted through the fetch rather than against the parser alone, so the
+    whole chain is covered: the variable is read, parsed, and reaches the
+    request. A parser test would pass even if the value never got that far.
+
+    Given:
+        The timeout variable set to two hours.
+    When:
+        fetch_encode_metadata drains a response.
+    Then:
+        It should bound the request by that value rather than the default.
+    """
+    # Arrange
+    monkeypatch.setenv(TIMEOUT_ENV, "7200")
+    session = _StreamingSession(lines=_tsv("ENCFF1\tbed"))
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert session.get_kwargs[0]["timeout"].total == 7200
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_fall_back_to_the_default_when_unset(
+    mocker, monkeypatch
+):
+    """Test the default applies when no override is present.
+
+    Given:
+        No timeout variable in the environment.
+    When:
+        fetch_encode_metadata drains a response.
+    Then:
+        It should bound the request by the one-hour default.
+    """
+    # Arrange
+    monkeypatch.delenv(TIMEOUT_ENV, raising=False)
+    session = _StreamingSession(lines=_tsv("ENCFF1\tbed"))
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert session.get_kwargs[0]["timeout"].total == 3600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value", ["not-a-number", "0", "-1"], ids=["malformed", "zero", "negative"]
+)
+async def test_fetch_encode_metadata_should_reject_an_unusable_timeout(
+    mocker, monkeypatch, value
+):
+    """Test a misconfigured budget fails the sync rather than the API.
+
+    aiohttp treats a non-positive total as no timeout at all, so a typo that
+    parsed to zero would turn a bounded request into an unbounded one --
+    failing in the direction hardest to notice. Raising here rather than at
+    import keeps a bad knob from taking down every read the API serves.
+
+    Given:
+        The timeout variable set to a non-integer, zero, or a negative.
+    When:
+        fetch_encode_metadata is drained.
+    Then:
+        It should raise ValueError naming the variable, without issuing a
+        request.
+    """
+    # Arrange
+    monkeypatch.setenv(TIMEOUT_ENV, value)
+    session = _StreamingSession(lines=_tsv("ENCFF1\tbed"))
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with pytest.raises(ValueError, match=TIMEOUT_ENV):
+        [row async for row in fetch_encode_metadata()]
+
+    assert session.get_kwargs == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_yield_a_row_per_data_line(mocker):
+    """Test the header is consumed and each remaining line becomes a row.
+
+    Pins that the double is faithful to the parser: without it the timeout
+    test above could pass against a stub that never exercised the loop.
+
+    Given:
+        A streamed body of a header plus two data lines.
+    When:
+        fetch_encode_metadata drains it.
+    Then:
+        It should yield one dict per data line, keyed by column name.
+    """
+    # Arrange
+    session = _StreamingSession(lines=_tsv("ENCFF1\tbed", "ENCFF2\tbam"))
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    rows = [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert rows == [
+        {"File accession": "ENCFF1", "File format": "bed"},
+        {"File accession": "ENCFF2", "File format": "bam"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_yield_nothing_when_only_a_header(
+    mocker,
+):
+    """Test a header-only body is an empty corpus, not a malformed one.
+
+    Given:
+        A response carrying the header line and no data lines.
+    When:
+        fetch_encode_metadata drains it.
+    Then:
+        It should yield no rows and complete without raising, so an empty
+        upstream is distinguishable from a broken response.
+    """
+    # Arrange
+    session = _StreamingSession(lines=_tsv())
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    rows = [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_skip_blank_lines(mocker):
+    """Test a blank line does not become an empty row.
+
+    A real TSV ends with a trailing newline, so the stream's final line is
+    routinely empty; parsing it would yield a row whose every column is
+    empty and whose accession is missing.
+
+    Given:
+        A body with a blank line between data lines and a trailing blank.
+    When:
+        fetch_encode_metadata drains it.
+    Then:
+        It should yield only the populated rows.
+    """
+    # Arrange
+    session = _StreamingSession(
+        lines=["File accession\tFile format", "ENCFF1\tbed", "", "ENCFF2\tbam", ""]
+    )
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    rows = [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert rows == [
+        {"File accession": "ENCFF1", "File format": "bed"},
+        {"File accession": "ENCFF2", "File format": "bam"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_strip_crlf_line_endings(mocker):
+    """Test a carriage return does not contaminate the last column.
+
+    ENCODE serves the TSV over HTTP and the body may use CRLF. A stray
+    trailing "\\r" would attach to every row's final field, so a format of
+    "bed" would silently become "bed\\r" and never match a CV lookup.
+
+    Given:
+        A body whose lines end with CRLF.
+    When:
+        fetch_encode_metadata drains it.
+    Then:
+        It should yield values with no carriage return.
+    """
+    # Arrange
+    session = _StreamingSession(
+        lines=["File accession\tFile format\r", "ENCFF1\tbed\r"]
+    )
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    rows = [row async for row in fetch_encode_metadata()]
+
+    # Assert
+    assert rows == [{"File accession": "ENCFF1", "File format": "bed"}]
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_report_how_far_it_got_when_it_times_out(
+    mocker, caplog
+):
+    """Test a timeout names the row count it reached.
+
+    The row count is the one fact that separates "the budget is too small"
+    from "the endpoint is down", and the previous handler caught only
+    ClientError, so a timeout surfaced as a bare traceback saying neither.
+
+    Given:
+        A stream that times out after two data lines.
+    When:
+        fetch_encode_metadata drains it.
+    Then:
+        It should log the count reached and re-raise TimeoutError unchanged,
+        so the caller's handling does not depend on this logging.
+    """
+    # Arrange
+    session = _StreamingSession(
+        lines=_tsv("ENCFF1\tbed", "ENCFF2\tbam", "ENCFF3\tbed"), fail_after=3
+    )
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.TimeoutError):
+        [row async for row in fetch_encode_metadata()]
+
+    assert "timed out after 2 rows" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_raise_when_the_response_is_not_ok(
+    mocker,
+):
+    """Test a non-200 aborts rather than yielding an empty corpus.
+
+    Given:
+        A metadata endpoint returning HTTP 503.
+    When:
+        fetch_encode_metadata is drained.
+    Then:
+        It should raise naming the status, so the sync fails instead of
+        clearing the DCC and reloading nothing.
+    """
+    # Arrange
+    session = _StreamingSession(status=503)
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with pytest.raises(Exception, match="503"):
+        [row async for row in fetch_encode_metadata()]
+
+
+@pytest.mark.asyncio
+async def test_fetch_encode_metadata_should_wrap_a_network_error(mocker):
+    """Test a transport failure is reported as such.
+
+    Given:
+        A session whose request raises aiohttp.ClientError.
+    When:
+        fetch_encode_metadata is drained.
+    Then:
+        It should raise naming the network error.
+    """
+    # Arrange
+    session = _StreamingSession(error=aiohttp.ClientError("connection reset"))
+    mocker.patch.object(
+        encode_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with pytest.raises(Exception, match="network error"):
+        [row async for row in fetch_encode_metadata()]
 
 
 def test_compression_suffix_tables_should_hold_the_verified_edam_terms():

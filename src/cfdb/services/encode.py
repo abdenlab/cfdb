@@ -102,7 +102,9 @@ Static / config-derived:          dcc.id, dcc.dcc_name, dcc.dcc_abbreviation,
                                   dcc.project_id_namespace, dcc.project_local_id
 """
 
+import asyncio
 import logging
+import os
 import re
 from typing import AsyncGenerator, Optional
 from urllib.parse import unquote, urlsplit
@@ -119,6 +121,38 @@ from cfdb.services.ontology_mappings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _timeout_from_env(name: str, default: int) -> int:
+    """Parse a positive-int timeout env var, failing loudly at import.
+
+    A bare ``int(os.getenv(...))`` raises a bare ``ValueError`` from deep in
+    the import machinery when an operator sets the variable to something
+    non-numeric, naming neither the variable nor the value. Zero or negative
+    is rejected too: aiohttp treats a non-positive total as "no timeout",
+    which would silently turn a misconfiguration into an unbounded request.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Environment variable {name}={raw!r} is not a valid integer"
+        ) from exc
+    if parsed <= 0:
+        raise ValueError(f"Environment variable {name}={parsed} must be > 0")
+    return parsed
+
+
+#: Environment variable overriding the metadata download budget, and the
+#: default applied when it is unset. Resolved per call rather than at import:
+#: a malformed value should fail the sync that reads it, not the import of
+#: this module, which would take the whole API down over a knob only the
+#: sync uses.
+_METADATA_TIMEOUT_ENV = "ENCODE_METADATA_TIMEOUT_SECONDS"
+_METADATA_TIMEOUT_DEFAULT_SECONDS = 3600
 
 
 async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
@@ -144,12 +178,22 @@ async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
 
     total_fetched = 0
 
+    # Bounds the entire streamed response rather than inactivity: every row is
+    # transformed and inserted as it streams, so the wall clock tracks insert
+    # throughput against the target database, not network latency. Ten minutes
+    # was not enough against DocumentDB -- the sync aborted around 230,000 of
+    # ~810,000 rows and, because the DCC is cleared before reloading, left the
+    # corpus smaller than it started.
+    timeout_seconds = _timeout_from_env(
+        _METADATA_TIMEOUT_ENV, _METADATA_TIMEOUT_DEFAULT_SECONDS
+    )
+
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(
                 metadata_url,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=600),
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as response:
                 if response.status != 200:
                     logger.error(f"ENCODE metadata API error: HTTP {response.status}")
@@ -181,6 +225,20 @@ async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
                 logger.info(
                     f"ENCODE metadata fetch complete: {total_fetched} rows"
                 )
+
+        except asyncio.TimeoutError:
+            # Re-raised unchanged so the caller still sees a TimeoutError; the
+            # log line is the point. Without it the failure is a bare
+            # traceback that says nothing about how far the load got, which
+            # is the one fact that distinguishes "the budget is too small"
+            # from "the endpoint is down".
+            logger.error(
+                f"ENCODE metadata fetch timed out after {total_fetched} rows "
+                f"({timeout_seconds}s budget); the files collection is left "
+                f"partially loaded. Raise {_METADATA_TIMEOUT_ENV} and re-run "
+                "the sync."
+            )
+            raise
 
         except aiohttp.ClientError as e:
             logger.error(f"ENCODE metadata API network error: {e}")
