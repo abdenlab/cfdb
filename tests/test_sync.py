@@ -993,6 +993,62 @@ class TestEnrich4dnCollections:
         assert doc["extra"]["fourdn"] == {"status": "released"}
 
 
+class TestLogAccessionCoverage:
+    @pytest.mark.asyncio
+    async def test__log_accession_coverage_should_report_partial_coverage(
+        self, mock_db, caplog
+    ):
+        """Test that the operator can see how much of a DCC is queryable.
+
+        Given:
+            Three 4DN files of which two carry an accession.
+        When:
+            _log_accession_coverage runs for that DCC.
+        Then:
+            It should log the covered and total counts.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            {"_id": "f1", "submission": "4dn", "accession_id": "4DNFAAA"},
+            {"_id": "f2", "submission": "4dn", "accession_id": "4DNFBBB"},
+            {"_id": "f3", "submission": "4dn"},
+        ]
+
+        # Act
+        with caplog.at_level(logging.INFO):
+            await sync_module._log_accession_coverage("4dn")
+
+        # Assert
+        assert "2/3" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test__log_accession_coverage_should_warn_when_nothing_is_covered(
+        self, mock_db, caplog
+    ):
+        """Test the signal that distinguishes empty from unpopulated.
+
+        A filter against an unstamped corpus returns totalCount 0 with no
+        error, which reads exactly like "no such accession". Zero coverage
+        is the one case an operator has to be told about -- it is also what
+        a standalone re-materialization leaves behind.
+
+        Given:
+            A DCC whose files carry no accession at all.
+        When:
+            _log_accession_coverage runs.
+        Then:
+            It should warn that accession filters will not match.
+        """
+        # Arrange
+        mock_db.files.docs = [{"_id": "f1", "submission": "hubmap"}]
+
+        # Act
+        with caplog.at_level(logging.WARNING):
+            await sync_module._log_accession_coverage("hubmap")
+
+        # Assert
+        assert "will return no matches" in caplog.text
+
 class TestSyncEncodeIndexes:
     @pytest.mark.asyncio
     async def test__sync_encode_should_ensure_the_accession_indexes(

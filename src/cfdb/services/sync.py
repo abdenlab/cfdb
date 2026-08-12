@@ -143,6 +143,7 @@ async def _sync_dccs(task: SyncTask) -> None:
             await _sync_c2m2_zip(task, data_path, downloads_path)
 
         logger.info(f"{dcc.upper()} synced successfully")
+        await _log_accession_coverage(dcc)
 
     # Ensure the data-collection query indexes now that data is loaded.
     # Idempotent: a no-op on subsequent syncs. Kept out of API startup
@@ -157,6 +158,48 @@ async def _sync_dccs(task: SyncTask) -> None:
 
     task.progress = "All DCCs synced successfully"
     logger.info(task.progress)
+
+
+async def _log_accession_coverage(dcc: str) -> None:
+    """Report how much of a DCC is queryable by accession after a sync.
+
+    ``accession_id`` fails silently in both directions: a filter against an
+    unpopulated corpus returns ``totalCount: 0`` with no error, which reads
+    exactly like "no such accession", and a DCC that issues no accession at
+    all looks identical. Neither the API nor the client can tell those
+    apart, so this log is the only place the distinction is visible --
+    which also makes it the signal that a standalone re-materialization
+    dropped the 4DN file accessions.
+
+    Advisory only: a coverage shortfall is not a sync failure, and this
+    never raises into the sync path.
+    """
+    if api.db is None:
+        return
+
+    try:
+        total = await api.db.files.count_documents({"submission": dcc})
+        covered = await api.db.files.count_documents(
+            {"submission": dcc, "accession_id": {"$ne": None}}
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics must not break sync
+        logger.warning(f"{dcc.upper()} accession coverage unavailable: {exc}")
+        return
+
+    if not total:
+        return
+
+    pct = 100.0 * covered / total
+    message = (
+        f"{dcc.upper()} accession coverage: {covered}/{total} files "
+        f"carry accession_id ({pct:.1f}%)"
+    )
+    if covered:
+        logger.info(message)
+    else:
+        logger.warning(
+            f"{message}; accession filters will return no matches for this DCC"
+        )
 
 
 async def _sync_c2m2_zip(
