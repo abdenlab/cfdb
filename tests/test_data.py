@@ -113,7 +113,7 @@ class TestStreamFileWorkflowPath:
         """
         # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-        mock_db.jobs.create_index(
+        await mock_db.jobs.create_index(
             {"workflow_key": 1},
             unique=True,
             partialFilterExpression={"active": True},
