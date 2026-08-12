@@ -993,6 +993,40 @@ class TestEnrich4dnCollections:
         assert doc["extra"]["fourdn"] == {"status": "released"}
 
 
+class TestSyncEncodeIndexes:
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_ensure_the_accession_indexes(
+        self, mocker, mock_db
+    ):
+        """Test that an ENCODE-only database is not left unindexed.
+
+        The materializer creates the files indexes at the end of its run,
+        and _sync_encode never invokes it -- it writes documents straight
+        into files. On a database where ENCODE is the only DCC synced, that
+        left files with no index at all, so every accession lookup scanned
+        the whole collection on a public endpoint.
+
+        Given:
+            An ENCODE sync over a single row.
+        When:
+            _sync_encode completes.
+        Then:
+            It should have ensured both accession indexes on files.
+        """
+        # Arrange
+        row = _encode_metadata_row("encff001aaa", "encff001aaa.bed.gz")
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda: _async_iter([row])
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        indexed = {tuple(keys.items()) for keys, _ in mock_db.files._indexes}
+        assert (("accession_id", 1),) in indexed
+        assert (("collections.accession_id", 1),) in indexed
+
 class TestSetAccessionIds:
     @pytest.mark.asyncio
     async def test__set_accession_ids_should_continue_when_a_batch_fails(

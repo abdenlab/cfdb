@@ -24,7 +24,11 @@ from cfdb.dcc_registry import (
     normalize_dcc_name,
 )
 from cfdb.downloader import cleanup_zip, download_file, extract_zip
-from cfdb.indexes import data_index_specs, ensure_indexes
+from cfdb.indexes import (
+    data_index_specs,
+    ensure_indexes,
+    materialized_files_index_specs,
+)
 from cfdb.services import locks
 
 logger = logging.getLogger(__name__)
@@ -1023,6 +1027,12 @@ async def _sync_encode(task: SyncTask) -> None:
         if batch:
             await api.db.files.insert_many(batch)
             logger.info(f"Inserted final batch, total: {count} ENCODE files")
+
+    # ENCODE writes straight into the materialized collection and never runs
+    # the materializer, which is the only other creator of files indexes. On
+    # a database where ENCODE is the only DCC synced, that leaves files with
+    # no indexes at all and makes every accession lookup a full scan.
+    await ensure_indexes(api.db, materialized_files_index_specs())
 
     task.progress = f"ENCODE sync complete: {count} files"
     logger.info(task.progress)
