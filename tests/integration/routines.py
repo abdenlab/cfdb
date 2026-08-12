@@ -115,6 +115,18 @@ async def echo(value: str) -> str:
     return value
 
 
+@wool.routine
+async def sleep_then_return(seconds: float, value: str) -> str:
+    """Occupy the worker for ``seconds``, then return ``value``.
+
+    Gives the stop-grace tests a task that is reliably still in flight
+    when the stop lands, so the question they ask — does the drain let
+    it finish, or does it die mid-run — has a deterministic answer.
+    """
+    await asyncio.sleep(seconds)
+    return value
+
+
 def stub_file_meta() -> dict[str, Any]:
     """Return a minimal BAM file_meta accepted by ``StubProcessor``."""
     return {
