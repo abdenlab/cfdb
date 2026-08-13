@@ -15,14 +15,19 @@ from cfdb import api
 ISSUE_83_SIZE = 6262125716
 
 
-def _resolve(doc: dict, key: str):
+#: Distinguishes "no such path" from "a path holding None", which ``$exists``
+#: has to tell apart and a bare ``None`` default cannot.
+_MISSING = object()
+
+
+def _resolve(doc: dict, key: str, default=None):
     """Resolve a possibly dot-notated key against a nested dict."""
     value = doc
     for part in key.split("."):
-        if isinstance(value, dict):
-            value = value.get(part)
+        if isinstance(value, dict) and part in value:
+            value = value[part]
         else:
-            return None
+            return default
     return value
 
 
@@ -53,9 +58,12 @@ def _match(doc: dict, query: dict) -> bool:
                     if value == operand:
                         return False
                 elif op == "$exists":
-                    if operand and key not in doc:
-                        return False
-                    if not operand and key in doc:
+                    # Resolved rather than tested with ``in doc``, which sees
+                    # only top-level keys and so reports every dotted path as
+                    # absent -- making {"a.b": {"$exists": False}} match
+                    # everything, including the documents that do have it.
+                    present = _resolve(doc, key, _MISSING) is not _MISSING
+                    if bool(operand) is not present:
                         return False
                 elif op == "$regex":
                     import re
