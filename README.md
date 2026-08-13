@@ -560,10 +560,12 @@ Anatomy, FileFormat, DataType, and AssayType share an identical schema: `id` (st
 | Entity | Ontology Source |
 |--------|----------------|
 | Anatomy | UBERON (Uber-anatomy ontology) |
-| FileFormat | EDAM CV `format:` terms |
+| FileFormat | EDAM CV `format:` terms, or a `cfdb:`-prefixed token minted where EDAM has none |
 | DataType | EDAM CV `data:` terms |
 | AssayType | OBI (Ontology for Biomedical Investigations) |
 | NcbiTaxonomy | NCBI Taxonomy Database |
+
+Every `id` above resolves in its source ontology except the minted `FileFormat` tokens. EDAM has no term for a few formats cfdb ingests — `bedpe` and `bigInteract` at present — and aliasing them onto the nearest EDAM term would make each indistinguishable from the format it was aliased to, so a `cfdb:` token is minted instead. A client resolving `file_format.id` against EDAM should skip ids carrying that prefix rather than treat them as resolvable.
 
 #### Subject
 

@@ -1,5 +1,14 @@
 """Ontology mappings for ENCODE metadata transformation to C2M2 format."""
 
+# Prefix marking a CV term minted here rather than drawn from EDAM. EDAM has
+# no term for every format ENCODE publishes, and the alternative -- aliasing
+# an unrepresented format onto the nearest EDAM term -- is what produced the
+# starch/BED conflation (#69, #72): the format becomes indistinguishable from
+# the one it was aliased to, and the processor that claims that EDAM term
+# picks it up and mangles it. A minted token says "no standard term exists"
+# without lying about what the file is.
+MINTED_FORMAT_PREFIX = "cfdb:"
+
 # ENCODE file_format to EDAM format CV terms
 # Reference: https://edamontology.org/page/formats
 FILE_FORMAT_TO_EDAM = {
@@ -12,7 +21,16 @@ FILE_FORMAT_TO_EDAM = {
     "cram": {"id": "format:3462", "name": "CRAM"},
     # Genomic interval formats
     "bed": {"id": "format:3003", "name": "BED"},
-    "bedpe": {"id": "format:3003", "name": "BED"},  # BED paired-end
+    # Deliberately NOT format:3003/BED. BEDPE columns are chrom1/start1/end1/
+    # chrom2/start2/end2, so the BED tabix pipeline would sort and index the
+    # first mate and leave the second unindexed -- a cached artifact that
+    # looks successful and is wrong. EDAM has no BEDPE term (OLS4:
+    # q=bedpe&ontology=edam returns nothing), so the token is minted. The
+    # distinct *name* is what matters operationally: processor lookup keys on
+    # ``file_format.name`` (``processors.tools.format_name``), and "bedpe" is
+    # in no processor's ``supported_formats``, so /data streams the raw
+    # upstream file instead of a mangled index until a real processor exists.
+    "bedpe": {"id": f"{MINTED_FORMAT_PREFIX}bedpe", "name": "bedpe"},
     "broadpeak": {"id": "format:3614", "name": "BroadPeak"},
     "narrowpeak": {"id": "format:3613", "name": "NarrowPeak"},
     "gappedpeak": {"id": "format:3003", "name": "BED"},  # gappedPeak is BED variant
@@ -52,7 +70,18 @@ FILE_FORMAT_TO_EDAM = {
     "database": {"id": "format:2330", "name": "Plain text"},
     "starch": {"id": "format:3003", "name": "BED"},  # BEDOPS compressed BED archive
     "tagalign": {"id": "format:3003", "name": "BED"},  # tagAlign is a BED variant
-    "biginteract": {"id": "format:3004", "name": "bigBed"},  # bigInteract is a bigBed variant
+    # Structurally a bigBed, but its trailing columns encode an interaction's
+    # source and target endpoints. Extracting it with bigBedToBed and indexing
+    # the leading three columns is range-coherent but silently degrades the
+    # interaction to an interval, so it is kept distinct for the same reason
+    # as "bedpe" above. EDAM has no bigInteract term either.
+    #
+    # Unlike bedpe, this trades a working capability for an honest one:
+    # the old index answered range queries correctly, so /index on these
+    # files goes from degraded-but-usable to 404 until the tileset
+    # endpoints land. That reaches bigInteract already in the experiment
+    # corpus, not only newly ingested annotation files.
+    "biginteract": {"id": f"{MINTED_FORMAT_PREFIX}biginteract", "name": "bigInteract"},
     "csfasta": {"id": "format:1929", "name": "FASTA"},  # color-space FASTA (SOLiD)
     "csqual": {"id": "format:2330", "name": "Plain text"},  # color-space quality scores
     "h5ad": {"id": "format:3590", "name": "HDF5"},  # AnnData HDF5 format

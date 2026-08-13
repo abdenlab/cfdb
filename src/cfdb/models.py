@@ -393,7 +393,9 @@ class FileMetadataModel(BaseModel):
 
         file_format:
             An EDAM CV term identifying the digital format of this file
-            (e.g., TSV or FASTQ). If compressed, this is the uncompressed format.
+            (e.g., TSV or FASTQ), or a ``cfdb:``-prefixed token where EDAM
+            has no term for it; see :class:`FileFormat`. If compressed,
+            this is the uncompressed format.
 
         compression_format:
             An EDAM CV term ID identifying compression that is extrinsic to
@@ -571,20 +573,34 @@ class AssayType(BaseModel):
 
 class FileFormat(BaseModel):
     """
-    An EDAM CV 'format:' term.
+    An EDAM CV 'format:' term, or a term minted here where EDAM has none.
 
     Describes the digital format of C2M2 files.
 
+    Most ids are EDAM CV ``format:`` terms and resolve at edamontology.org.
+    A few formats EDAM does not cover -- ``bedpe`` and ``bigInteract`` at
+    the time of writing -- carry a token minted here instead, prefixed
+    ``cfdb:`` (:data:`cfdb.services.ontology_mappings.MINTED_FORMAT_PREFIX`,
+    the stable discriminator to test against). Those ids resolve nowhere:
+    aliasing such a format onto the nearest EDAM term would make it
+    indistinguishable from the format it was aliased to, and the processor
+    claiming that term would pick it up and mangle it. A consumer resolving
+    ids against EDAM must therefore skip the minted prefix rather than
+    assume every id is resolvable.
+
     Attributes:
         id:
-            An EDAM CV format term identifier.
+            An EDAM CV format term identifier, or a ``cfdb:``-prefixed
+            token minted where EDAM has no term for the format.
 
         name:
-            A short, human-readable, machine-read-friendly label for this EDAM
-            format term.
+            A short, human-readable, machine-read-friendly label for this
+            format term. Distinct per format even where the id is minted:
+            workflow processor routing keys on this field, so two formats
+            sharing a name share a pipeline.
 
         description:
-            A human-readable description of this EDAM format term.
+            A human-readable description of this format term.
     """
 
     id: str = str()
