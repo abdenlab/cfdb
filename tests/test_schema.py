@@ -96,6 +96,34 @@ def _make_file_doc(
     }
 
 
+def _make_annotation_doc(
+    local_id: str,
+    annotation_type: str = "candidate Cis-Regulatory Elements",
+    organism: str = "Homo sapiens",
+    genome_assembly: str = "GRCh38",
+) -> dict:
+    """Return an ENCODE annotation file document as the sync writes one."""
+    return {
+        "id_namespace": "ns",
+        "local_id": local_id,
+        "project_id_namespace": "ns",
+        "project_local_id": "proj",
+        "filename": f"{local_id}.bed.gz",
+        "submission": "encode",
+        "data_access_level": "public",
+        "genome_assembly": genome_assembly,
+        "dcc": {"dcc_name": "ENCODE", "dcc_abbreviation": "encode"},
+        "collections": [],
+        "extra": {
+            "encode": {
+                "annotation_type": annotation_type,
+                "organism": organism,
+                "assembly": genome_assembly,
+            }
+        },
+    }
+
+
 def _named_type(type_ref: dict) -> str | None:
     """Unwrap an introspection type reference down to its named type."""
     while type_ref is not None and type_ref.get("name") is None:
@@ -913,6 +941,174 @@ class TestFilesQuery:
         assert returned == {"f1": "", "f2": "format:3989"}
 
     @pytest.mark.asyncio
+    async def test_files_should_filter_documents_by_annotation_type(self, mock_db):
+        """Test a client can ask for cCRE files without matching filenames.
+
+        The headline promise of the annotation ingest, asserted through
+        the same GraphQL surface a client uses rather than at the
+        transform.
+
+        Given:
+            Two cCRE files, one interaction-prediction file, and one
+            experiment file carrying no annotation type.
+        When:
+            The files query filters on the cCRE annotation type.
+        Then:
+            It should return only the two cCRE files.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_annotation_doc("f1", "candidate Cis-Regulatory Elements"),
+            _make_annotation_doc("f2", "candidate Cis-Regulatory Elements"),
+            _make_annotation_doc(
+                "f3", "element gene regulatory interaction predictions"
+            ),
+            _make_file_doc("f4", submission="encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: [{ extra: [{ encode: [{
+                    annotationType: ["candidate Cis-Regulatory Elements"]
+                }] }] }]) {
+                    totalCount
+                    items { localId }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["totalCount"] == 2
+        assert result.data["files"]["items"] == [{"localId": "f1"}, {"localId": "f2"}]
+
+    @pytest.mark.asyncio
+    async def test_files_should_filter_documents_by_organism(self, mock_db):
+        """Test a multi-organism annotation result set can be narrowed.
+
+        The released cCREs span human and mouse, and an annotation row
+        names no donor -- so without the file-level organism there is
+        nothing to narrow on but the filename.
+
+        Given:
+            A human cCRE file and a mouse one.
+        When:
+            The files query filters on the mouse organism.
+        Then:
+            It should return only the mouse file.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_annotation_doc("f1", organism="Homo sapiens"),
+            _make_annotation_doc("f2", organism="Mus musculus"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: [{ extra: [{ encode: [{
+                    organism: ["Mus musculus"]
+                }] }] }]) {
+                    totalCount
+                    items { localId }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"] == [{"localId": "f2"}]
+
+    @pytest.mark.asyncio
+    async def test_files_should_narrow_an_annotation_type_by_assembly(self, mock_db):
+        """Test the multi-assembly result set the issue describes.
+
+        A client asking for cCREs unqualified gets GRCh38, mm10 and hg19
+        together; both fields have to compose for that to be narrowable.
+
+        Given:
+            cCRE files under GRCh38, mm10 and hg19, plus an mm10 file of a
+            different annotation type.
+        When:
+            The files query filters on the cCRE type and the mm10
+            assembly together.
+        Then:
+            It should return only the mm10 cCRE file.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_annotation_doc("f1", genome_assembly="GRCh38"),
+            _make_annotation_doc("f2", genome_assembly="mm10"),
+            _make_annotation_doc("f3", genome_assembly="hg19"),
+            _make_annotation_doc(
+                "f4",
+                annotation_type="element gene regulatory interaction predictions",
+                genome_assembly="mm10",
+            ),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files(input: [{
+                    genomeAssembly: ["mm10"],
+                    extra: [{ encode: [{
+                        annotationType: ["candidate Cis-Regulatory Elements"]
+                    }] }]
+                }]) {
+                    totalCount
+                    items { localId }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"] == [{"localId": "f2"}]
+
+    @pytest.mark.asyncio
+    async def test_files_should_serialize_the_annotation_fields(self, mock_db):
+        """Test the annotation fields are readable, not only filterable.
+
+        Given:
+            One annotation file document.
+        When:
+            The files query selects its ENCODE extra fields.
+        Then:
+            It should return the annotation type, organism and assembly.
+        """
+        # Arrange
+        mock_db.files.docs = [_make_annotation_doc("f1")]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                files {
+                    items {
+                        extra { encode { annotationType organism assembly } }
+                    }
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        assert result.data["files"]["items"][0]["extra"]["encode"] == {
+            "annotationType": "candidate Cis-Regulatory Elements",
+            "organism": "Homo sapiens",
+            "assembly": "GRCh38",
+        }
+
+    @pytest.mark.asyncio
     async def test_files_should_filter_documents_by_compression_format(self, mock_db):
         """Test that the derived term is queryable through the input filter.
 
@@ -1297,6 +1493,96 @@ class TestDistinctValuesQuery:
     def _patch_cutover(self, mocker):
         """No-op ``locks.wait_for_cutover`` for every test in this class."""
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_should_enumerate_the_annotation_types(
+        self, mock_db
+    ):
+        """Test a client can discover which annotation types exist.
+
+        Filtering by annotation type is only useful if the vocabulary is
+        discoverable -- otherwise a client has to already know the exact
+        ENCODE spelling, which is precisely the string-matching the
+        annotation ingest set out to replace. Low cardinality, so it
+        belongs in the allowlist where accessions do not.
+
+        Given:
+            Files spanning two annotation types and one with none.
+        When:
+            distinctValues is asked for extra.encode.annotation_type.
+        Then:
+            It should return the two types.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_annotation_doc("f1", "candidate Cis-Regulatory Elements"),
+            _make_annotation_doc("f2", "candidate Cis-Regulatory Elements"),
+            _make_annotation_doc(
+                "f3", "element gene regulatory interaction predictions"
+            ),
+            _make_distinct_doc("f4", "ENCODE", "encode"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["extra.encode.annotation_type"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        entry = result.data["distinctValues"][0]
+        assert sorted(entry["values"]) == [
+            "candidate Cis-Regulatory Elements",
+            "element gene regulatory interaction predictions",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_distinct_values_should_enumerate_the_assemblies(self, mock_db):
+        """Test a client can discover which assemblies exist.
+
+        Assembly is named alongside organism in the same acceptance
+        criterion, and cCREs are published against several of them, so
+        narrowing to one is the first move a client makes -- which it can
+        only do knowing the vocabulary. Same small closed vocabulary as its
+        two sibling facets.
+
+        Given:
+            ENCODE files spanning two assemblies.
+        When:
+            distinctValues is asked for extra.encode.assembly.
+        Then:
+            It should return both assemblies.
+        """
+        # Arrange
+        mock_db.files.docs = [
+            _make_annotation_doc("f1", genome_assembly="GRCh38"),
+            _make_annotation_doc("f2", genome_assembly="GRCh38"),
+            _make_annotation_doc("f3", genome_assembly="mm10"),
+        ]
+
+        # Act
+        result = await schema.execute(
+            """
+            query {
+                distinctValues(fields: ["extra.encode.assembly"]) {
+                    field
+                    values
+                }
+            }
+            """
+        )
+
+        # Assert
+        assert result.errors is None
+        entry = result.data["distinctValues"][0]
+        assert sorted(entry["values"]) == ["GRCh38", "mm10"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -1,8 +1,21 @@
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cfdb.accessions import normalize_accession
-from cfdb.api.gql.inputs import CollectionInput, FileMetadataInput, to_dict, to_query
+from cfdb.api.gql.inputs import (
+    BiosampleInput,
+    CollectionInput,
+    EnrichedBiosampleInput,
+    EnrichedCollectionInput,
+    EnrichedEncodeBiosampleInput,
+    EnrichedEncodeCollectionInput,
+    EnrichedEncodeFileInput,
+    EnrichedFileInput,
+    FileMetadataInput,
+    to_dict,
+    to_query,
+)
 
 #: Alphabet the DCCs actually issue accessions from.
 _ACCESSION_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -381,6 +394,159 @@ def test_to_query_should_accept_accession_id_from_the_graphql_inputs():
             {"accession_id": "4DNFIMCJXZKH"},
         ]
     }
+
+
+#: Every path the ENCODE annotation ingest writes, paired with the filter
+#: that must reach it. A mismatch between the two would leave the whole
+#: annotation corpus unfilterable while every ingest test still passed, so
+#: these are asserted against the paths ``transform_annotation_to_c2m2``
+#: actually emits rather than against the schema alone.
+_ANNOTATION_FILTER_PATHS = [
+    ("annotation_type", "extra.encode.annotation_type"),
+    ("organism", "extra.encode.organism"),
+    ("assembly", "extra.encode.assembly"),
+]
+
+
+@pytest.mark.parametrize("field, path", _ANNOTATION_FILTER_PATHS)
+def test_to_query_should_reach_the_file_level_encode_fields(field, path):
+    """Test a file-level ENCODE filter flattens to the stored path.
+
+    Given:
+        A FileMetadataInput naming one of the ENCODE file-level fields.
+    When:
+        The input is converted with to_dict and then to_query.
+    Then:
+        It should produce a predicate on the dotted path the ingest
+        writes.
+    """
+    # Arrange
+    payload = FileMetadataInput(
+        extra=[EnrichedFileInput(encode=[EnrichedEncodeFileInput(**{field: ["v"]})])]
+    )
+
+    # Act
+    query = to_query(to_dict(payload))
+
+    # Assert
+    assert query == {path: "v"}
+
+
+@pytest.mark.parametrize(
+    "field, path",
+    [
+        ("annotation_type", "collections.extra.encode.annotation_type"),
+        ("software_used", "collections.extra.encode.software_used"),
+        ("encyclopedia_version", "collections.extra.encode.encyclopedia_version"),
+    ],
+)
+def test_to_query_should_reach_the_dataset_level_encode_fields(field, path):
+    """Test a dataset-level ENCODE filter flattens to the stored path.
+
+    Given:
+        A FileMetadataInput naming one of the ENCODE dataset-level fields
+        inside a nested CollectionInput.
+    When:
+        The input is converted with to_dict and then to_query.
+    Then:
+        It should produce a predicate on the dotted path the ingest
+        writes.
+    """
+    # Arrange
+    payload = FileMetadataInput(
+        collections=[
+            CollectionInput(
+                extra=[
+                    EnrichedCollectionInput(
+                        encode=[EnrichedEncodeCollectionInput(**{field: ["v"]})]
+                    )
+                ]
+            )
+        ]
+    )
+
+    # Act
+    query = to_query(to_dict(payload))
+
+    # Assert
+    assert query == {path: "v"}
+
+
+@pytest.mark.parametrize("field", ["life_stage", "age", "age_units"])
+def test_to_query_should_reach_the_biosample_level_encode_fields(field):
+    """Test the deepest ENCODE filter flattens to the stored path.
+
+    Five segments through two array levels -- the shape most likely to be
+    got wrong, and the one a client would notice last.
+
+    Given:
+        A FileMetadataInput naming a donor-trait field nested under
+        collections.biosamples.
+    When:
+        The input is converted with to_dict and then to_query.
+    Then:
+        It should produce a predicate on the dotted path the ingest
+        writes.
+    """
+    # Arrange
+    payload = FileMetadataInput(
+        collections=[
+            CollectionInput(
+                biosamples=[
+                    BiosampleInput(
+                        extra=[
+                            EnrichedBiosampleInput(
+                                encode=[
+                                    EnrichedEncodeBiosampleInput(**{field: ["v"]})
+                                ]
+                            )
+                        ]
+                    )
+                ]
+            )
+        ]
+    )
+
+    # Act
+    query = to_query(to_dict(payload))
+
+    # Assert
+    assert query == {f"collections.biosamples.extra.encode.{field}": "v"}
+
+
+@given(
+    value=st.text(min_size=1, max_size=40),
+    field_and_path=st.sampled_from(_ANNOTATION_FILTER_PATHS),
+)
+@settings(max_examples=100)
+def test_to_query_should_not_fold_an_encode_annotation_filter(value, field_and_path):
+    """Test the annotation filters match byte-exactly.
+
+    ENCODE's vocabulary is case- and space-significant -- "candidate
+    Cis-Regulatory Elements" is stored exactly as published -- so folding
+    any of these the way accessions are folded would make them
+    permanently unmatchable.
+
+    Given:
+        Any text value on any ENCODE file-level annotation field.
+    When:
+        to_query builds the predicate.
+    Then:
+        It should carry the value unaltered under its full dotted path.
+    """
+    # Arrange
+    field, path = field_and_path
+    payload = FileMetadataInput(
+        extra=[
+            EnrichedFileInput(encode=[EnrichedEncodeFileInput(**{field: [value]})])
+        ]
+    )
+
+    # Act
+    query = to_query(to_dict(payload))
+
+    # Assert
+    assert query == {path: value}
 
 
 def test_to_query_should_collapse_a_single_clause():
