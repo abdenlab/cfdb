@@ -78,6 +78,18 @@ ALLOWED_DISTINCT_FIELDS: frozenset[str] = frozenset(
         "output_type",
         "status",
         "data_access_level",
+        # ENCODE annotation facets. All three are small closed vocabularies
+        # -- a handful of annotation types, organisms and assemblies --
+        # which is what this allowlist is for; unlike accession_id,
+        # deliberately absent because enumerating it would return the whole
+        # corpus. Without annotation_type here a client can discover which
+        # assemblies exist but not which annotation types do, which is the
+        # facet the annotation ingest exists to expose (issue #94).
+        # ``assembly`` mirrors the core ``genome_assembly`` above; both are
+        # written by the ENCODE ingest and either may be filtered on.
+        "extra.encode.annotation_type",
+        "extra.encode.organism",
+        "extra.encode.assembly",
     }
 )
 

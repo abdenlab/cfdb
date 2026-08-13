@@ -173,10 +173,30 @@ def materialized_files_index_specs() -> list[IndexSpec]:
     collection on a public endpoint. Ensuring just the accession keys there
     costs nothing when the materializer has already created them: identical
     keys derive identical default names, so the create is a no-op.
+
+    The ``extra.encode`` keys are here for the same reason and are likewise
+    not the materializer's: they are written only by the ENCODE ingest, and
+    ``annotation_type`` in particular is the filter the whole annotation
+    corpus is meant to be reached through (issue #94). Without an index that
+    is a full scan of ~300k documents on an unauthenticated endpoint.
+
+    ``genome_assembly`` is the exception to "not the materializer's": it is
+    a core field every DCC populates and the materializer does index it.
+    It is repeated here because an ENCODE-only database never runs the
+    materializer, and assembly is the other half of the same acceptance
+    criterion as organism -- narrowing to GRCh38 is the first move a client
+    makes. The `extra.encode.assembly` mirror is indexed alongside it since
+    the ENCODE ingest writes both and either may be filtered on. Repeating
+    a key the materializer also creates costs nothing: identical keys derive
+    identical default names, so the create is a no-op.
     """
     return [
         IndexSpec("files", [("accession_id", 1)]),
         IndexSpec("files", [("collections.accession_id", 1)]),
+        IndexSpec("files", [("extra.encode.annotation_type", 1)]),
+        IndexSpec("files", [("extra.encode.organism", 1)]),
+        IndexSpec("files", [("extra.encode.assembly", 1)]),
+        IndexSpec("files", [("genome_assembly", 1)]),
     ]
 
 
