@@ -130,9 +130,33 @@ class EnrichedFourdnFile(BaseModel):
 
 
 class EnrichedEncodeFile(BaseModel):
-    """ENCODE file-level metadata from metadata TSV."""
+    """ENCODE file-level metadata from metadata TSV.
+
+    Populated from either the Experiment or the Annotation metadata TSV.
+    The two share only part of their column sets, so a field sourced from a
+    column the other TSV does not publish is None on those documents rather
+    than derived from something else -- see the annotation mapping in
+    :mod:`cfdb.services.encode`.
+
+    Attributes:
+        annotation_type:
+            The kind of annotation this file belongs to (e.g. "candidate
+            Cis-Regulatory Elements"). The field that gives an annotation
+            file its meaning, and the one a client filters on to ask for
+            cCREs without string-matching filenames. None on experiment
+            files, whose TSV has no such column.
+
+        organism:
+            Scientific name of the source organism (e.g. "Homo sapiens").
+            Also reaches ``subjects[].taxonomy`` on experiment files, but
+            annotation rows name no donor and so build no subject -- this is
+            the only place the organism of a multi-organism annotation
+            result set is queryable.
+    """
 
     assembly: Optional[str] = None
+    annotation_type: Optional[str] = None
+    organism: Optional[str] = None
     file_format_type: Optional[str] = None
     output_type: Optional[str] = None
     genome_annotation: Optional[str] = None
@@ -227,12 +251,37 @@ class EnrichedSubject(BaseModel):
 
 
 class EnrichedEncodeCollection(BaseModel):
-    """ENCODE experiment-level metadata from metadata TSV."""
+    """ENCODE dataset-level metadata from metadata TSV.
+
+    A "dataset" is an Experiment or an Annotation depending on which TSV the
+    document came from; ``platform`` and ``rbns_protein_concentration`` are
+    experiment-only, ``annotation_type``, ``software_used`` and
+    ``encyclopedia_version`` annotation-only.
+
+    Attributes:
+        annotation_type:
+            The annotation kind this dataset publishes, mirroring
+            :attr:`EnrichedEncodeFile.annotation_type`. Held on the dataset
+            as well as the file because that is the entity the property
+            actually describes.
+
+        software_used:
+            Software that produced the annotation, as a comma-separated
+            list (e.g. "ABC-Enhancer-Gene-Prediction, Distal regulation
+            ENCODE-rE2G"). Blank for some annotation types.
+
+        encyclopedia_version:
+            The ENCODE Encyclopedia release the annotation belongs to (e.g.
+            "ENCODE v4", "ENCODE v3, current").
+    """
 
     project: Optional[str] = None
     platform: Optional[str] = None
     dbxrefs: Optional[str] = None
     rbns_protein_concentration: Optional[str] = None
+    annotation_type: Optional[str] = None
+    software_used: Optional[str] = None
+    encyclopedia_version: Optional[str] = None
 
 
 class EnrichedFourdnCollection(BaseModel):
@@ -298,9 +347,31 @@ class EnrichedEncodeBiosample(BaseModel):
     ENCODE biosample-level metadata from metadata TSV.
 
     Contains biosample classification, treatment, and library information.
+
+    Attributes:
+        life_stage:
+            Developmental stage of the source organism when the biosample
+            was taken (e.g. "embryonic", "adult", "young adult", "unknown").
+
+        age:
+            Age of the source organism at sampling, in ``age_units``, kept
+            as the upstream string. NOT parsed to a number: the released
+            annotation corpus contains "2-4" and "unknown" alongside plain
+            decimals, and it distinguishes "10.5" from "10.50". This is also
+            why the value does not go to :attr:`Subject.age_at_sampling`,
+            which is a float in years -- that field could represent neither
+            the ranges nor the sentinels, and an annotation row names no
+            donor to build a Subject from in the first place.
+
+        age_units:
+            Unit for :attr:`age` ("year", "month", "week", "day"). Blank
+            when ``age`` is absent or a sentinel.
     """
 
     biosample_type: Optional[str] = None
+    life_stage: Optional[str] = None
+    age: Optional[str] = None
+    age_units: Optional[str] = None
     biosample_treatments: Optional[str] = None
     biosample_treatments_amount: Optional[str] = None
     biosample_treatments_duration: Optional[str] = None

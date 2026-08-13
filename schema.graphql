@@ -156,6 +156,9 @@ type EnrichedCollectionType {
 
 input EnrichedEncodeBiosampleInput {
   biosampleType: [String!] = null
+  lifeStage: [String!] = null
+  age: [String!] = null
+  ageUnits: [String!] = null
   biosampleTreatments: [String!] = null
   biosampleTreatmentsAmount: [String!] = null
   biosampleTreatmentsDuration: [String!] = null
@@ -172,6 +175,9 @@ input EnrichedEncodeBiosampleInput {
 
 type EnrichedEncodeBiosampleType {
   biosampleType: String
+  lifeStage: String
+  age: String
+  ageUnits: String
   biosampleTreatments: String
   biosampleTreatmentsAmount: String
   biosampleTreatmentsDuration: String
@@ -192,6 +198,9 @@ input EnrichedEncodeCollectionInput {
   platform: [String!] = null
   dbxrefs: [String!] = null
   rbnsProteinConcentration: [String!] = null
+  annotationType: [String!] = null
+  softwareUsed: [String!] = null
+  encyclopediaVersion: [String!] = null
 }
 
 type EnrichedEncodeCollectionType {
@@ -199,10 +208,15 @@ type EnrichedEncodeCollectionType {
   platform: String
   dbxrefs: String
   rbnsProteinConcentration: String
+  annotationType: String
+  softwareUsed: String
+  encyclopediaVersion: String
 }
 
 input EnrichedEncodeFileInput {
   assembly: [String!] = null
+  annotationType: [String!] = null
+  organism: [String!] = null
   fileFormatType: [String!] = null
   outputType: [String!] = null
   genomeAnnotation: [String!] = null
@@ -225,6 +239,8 @@ input EnrichedEncodeFileInput {
 
 type EnrichedEncodeFileType {
   assembly: String
+  annotationType: String
+  organism: String
   fileFormatType: String
   outputType: String
   genomeAnnotation: String
