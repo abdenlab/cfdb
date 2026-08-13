@@ -106,8 +106,9 @@ import asyncio
 import logging
 import os
 import re
+from contextlib import aclosing
 from typing import AsyncGenerator, Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 import aiohttp
 
@@ -151,27 +152,121 @@ def _timeout_from_env(name: str, default: int) -> int:
 #: a malformed value should fail the sync that reads it, not the import of
 #: this module, which would take the whole API down over a knob only the
 #: sync uses.
+#:
+#: The budget covers *the whole sync*, not each stream in it. A sync runs one
+#: stream per configured ``annotation_type`` plus one for experiments, all
+#: inside a single cutover lock that gates the read surface, so a per-stream
+#: budget would multiply the outage by the number of phases and put the worst
+#: case past the sync lock's one-hour stale threshold -- at which point a
+#: second sync is admitted and clears the corpus while the first is still
+#: writing into it. Callers share one deadline; see
+#: :func:`metadata_budget_seconds`.
 _METADATA_TIMEOUT_ENV = "ENCODE_METADATA_TIMEOUT_SECONDS"
 _METADATA_TIMEOUT_DEFAULT_SECONDS = 3600
 
 
-async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
-    """
-    Fetch all released experiment files from ENCODE metadata TSV endpoint.
+def metadata_budget_seconds() -> int:
+    """Resolve the whole-sync metadata download budget, in seconds.
 
-    Uses the /metadata/ endpoint which returns a single TSV file containing
-    all matching records, avoiding the need for paginated JSON API calls.
-    The response is streamed line-by-line to avoid loading the full TSV
-    (hundreds of MB) into memory.
+    Exposed so a sync running several streams resolves the budget once and
+    shares one deadline across them, rather than granting each stream its
+    own full allowance.
+    """
+    return _timeout_from_env(
+        _METADATA_TIMEOUT_ENV, _METADATA_TIMEOUT_DEFAULT_SECONDS
+    )
+
+#: Environment variable overriding which ``annotation_type`` values are
+#: ingested, and the allowlist applied when it is unset. An allowlist rather
+#: than a filter retrofitted later: ENCODE publishes 580,910 annotation
+#: datasets and 86% of them are footprints, so ingesting the type space
+#: wholesale and pruning afterwards would be a corpus-scale mistake to undo.
+#: The two defaults are ~7,773 datasets, proportionate against the 27,043
+#: experiments already ingested.
+_ANNOTATION_TYPES_ENV = "ENCODE_ANNOTATION_TYPES"
+_ANNOTATION_TYPES_DEFAULT: tuple[str, ...] = (
+    "candidate Cis-Regulatory Elements",
+    "element gene regulatory interaction predictions",
+)
+
+
+def annotation_types_from_env() -> tuple[str, ...]:
+    """Resolve the ``annotation_type`` allowlist to ingest.
+
+    Reads a comma-separated ``ENCODE_ANNOTATION_TYPES``, stripping each
+    entry and dropping blanks. An unset variable yields the default
+    allowlist; a variable set to an empty (or all-blank) value yields an
+    empty tuple, which disables annotation ingest entirely. That distinction
+    is deliberate -- turning the annotation path off is a legitimate
+    operator choice, and having to edit code to make it is worse than
+    honoring an explicitly empty setting. It is also the opposite of what
+    :func:`_timeout_from_env` does with an empty value, so the empty case
+    logs a warning rather than leaving the operator to infer it from an
+    absence in the per-phase log.
+
+    Repeats are collapsed, first occurrence winning, because the sync runs
+    one ingest phase per returned entry and ENCODE files are written with
+    ``insert_many`` into a collection with no unique key: a duplicated token
+    in a task definition would otherwise insert every file of that type
+    twice, with nothing to reject it and no way back short of a full
+    re-sync.
+
+    Resolved per call rather than at import, matching
+    :func:`_timeout_from_env`: the value is only meaningful to the sync, so
+    a bad one should fail the sync rather than the API's import of this
+    module.
+    """
+    raw = os.getenv(_ANNOTATION_TYPES_ENV)
+    if raw is None:
+        return _ANNOTATION_TYPES_DEFAULT
+    entries = (entry.strip() for entry in raw.split(","))
+    # dict.fromkeys rather than a set: order is the ingest order, and a
+    # reordered allowlist would shuffle the log and the phase sequence.
+    allowlist = tuple(dict.fromkeys(entry for entry in entries if entry))
+
+    if not allowlist:
+        # Warned about because the neighbouring :func:`_timeout_from_env`
+        # reads an empty value as "unset, use the default" and this one
+        # reads it as "ingest nothing" -- a difference an operator has no
+        # reason to expect between two variables of the same module. Empty
+        # values arrive by accident routinely: an unset CloudFormation
+        # parameter, a docker-compose ``${VAR}`` that expanded to nothing,
+        # an ECS task definition entry with an empty ``value``. Disabling
+        # the annotation ingest is a legitimate choice, so this stays a
+        # warning rather than an error -- but silently loading no
+        # annotations shows up only as an absence in the per-phase log,
+        # and an absence is what nobody notices.
+        logger.warning(
+            "%s is set but empty: annotation ingest is disabled and no "
+            "annotation files will be loaded. Unset it entirely to restore "
+            "the default allowlist (%s).",
+            _ANNOTATION_TYPES_ENV,
+            ", ".join(_ANNOTATION_TYPES_DEFAULT),
+        )
+
+    return allowlist
+
+
+async def _stream_metadata_tsv(
+    metadata_url: str, label: str, deadline: float | None = None
+) -> AsyncGenerator[dict, None]:
+    """Stream one ENCODE ``/metadata/`` TSV, yielding a dict per data row.
+
+    ``label`` names the stream in log lines so that, with several streams
+    per sync, a progress or timeout message identifies which one it came
+    from.
+
+    Args:
+        metadata_url: Fully-formed ``/metadata/`` URL to stream.
+        label: Human-readable name for this stream, used in log messages.
+        deadline: Event-loop clock reading (:meth:`asyncio.AbstractEventLoop.time`)
+            by which this stream must finish, shared with every other stream
+            in the same sync. ``None`` grants a fresh full budget, which is
+            correct only for a stream running on its own.
 
     Yields:
         Dicts keyed by TSV column names for each file row
     """
-    config = get_dcc_config("encode")
-    api_base = config["api_base"]
-
-    metadata_url = f"{api_base}/metadata/?type=Experiment&status=released"
-
     headers = {
         "User-Agent": "cfdb/1.0",
     }
@@ -184,9 +279,21 @@ async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
     # was not enough against DocumentDB -- the sync aborted around 230,000 of
     # ~810,000 rows and, because the DCC is cleared before reloading, left the
     # corpus smaller than it started.
-    timeout_seconds = _timeout_from_env(
-        _METADATA_TIMEOUT_ENV, _METADATA_TIMEOUT_DEFAULT_SECONDS
-    )
+    timeout_seconds: float
+    if deadline is None:
+        timeout_seconds = metadata_budget_seconds()
+    else:
+        timeout_seconds = deadline - asyncio.get_running_loop().time()
+        if timeout_seconds <= 0:
+            # Refused rather than clamped to zero: aiohttp reads a
+            # non-positive total as "no timeout", so passing the exhausted
+            # remainder through would turn a spent budget into an unbounded
+            # request -- the exact failure the budget exists to prevent.
+            raise asyncio.TimeoutError(
+                f"ENCODE {label} metadata fetch not attempted: the "
+                f"{_METADATA_TIMEOUT_ENV} budget was already spent by an "
+                "earlier phase of this sync"
+            )
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -196,9 +303,13 @@ async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
                 timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as response:
                 if response.status != 200:
-                    logger.error(f"ENCODE metadata API error: HTTP {response.status}")
+                    logger.error(
+                        f"ENCODE {label} metadata API error: "
+                        f"HTTP {response.status}"
+                    )
                     raise Exception(
-                        f"ENCODE metadata API error: HTTP {response.status}"
+                        f"ENCODE {label} metadata API error: "
+                        f"HTTP {response.status}"
                     )
 
                 # Stream line-by-line to keep memory usage constant
@@ -219,11 +330,13 @@ async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
 
                     if total_fetched % 50000 == 0:
                         logger.info(
-                            f"Parsed {total_fetched} ENCODE metadata rows..."
+                            f"Parsed {total_fetched} ENCODE {label} "
+                            "metadata rows..."
                         )
 
                 logger.info(
-                    f"ENCODE metadata fetch complete: {total_fetched} rows"
+                    f"ENCODE {label} metadata fetch complete: "
+                    f"{total_fetched} rows"
                 )
 
         except asyncio.TimeoutError:
@@ -233,16 +346,105 @@ async def fetch_encode_metadata() -> AsyncGenerator[dict, None]:
             # is the one fact that distinguishes "the budget is too small"
             # from "the endpoint is down".
             logger.error(
-                f"ENCODE metadata fetch timed out after {total_fetched} rows "
-                f"({timeout_seconds}s budget); the files collection is left "
-                f"partially loaded. Raise {_METADATA_TIMEOUT_ENV} and re-run "
-                "the sync."
+                f"ENCODE {label} metadata fetch timed out after "
+                f"{total_fetched} rows ({timeout_seconds:.0f}s of the "
+                f"{_METADATA_TIMEOUT_ENV} budget remained when it started); "
+                "the files collection is left partially loaded. Raise "
+                f"{_METADATA_TIMEOUT_ENV} and re-run the sync."
             )
             raise
 
         except aiohttp.ClientError as e:
-            logger.error(f"ENCODE metadata API network error: {e}")
-            raise Exception(f"ENCODE metadata API network error: {e}")
+            logger.error(f"ENCODE {label} metadata API network error: {e}")
+            raise Exception(f"ENCODE {label} metadata API network error: {e}")
+
+
+async def fetch_encode_metadata(
+    deadline: float | None = None,
+) -> AsyncGenerator[dict, None]:
+    """
+    Fetch all released experiment files from ENCODE metadata TSV endpoint.
+
+    Uses the /metadata/ endpoint which returns a single TSV file containing
+    all matching records, avoiding the need for paginated JSON API calls.
+    The response is streamed line-by-line to avoid loading the full TSV
+    (hundreds of MB) into memory.
+
+    Args:
+        deadline: Event-loop clock reading by which this fetch must finish,
+            shared with the other streams of the same sync. ``None`` grants
+            a fresh full budget; see :func:`metadata_budget_seconds`.
+
+    Yields:
+        Dicts keyed by TSV column names for each file row
+    """
+    config = get_dcc_config("encode")
+    api_base = config["api_base"]
+
+    metadata_url = f"{api_base}/metadata/?type=Experiment&status=released"
+
+    # ``aclosing`` because ``async for`` does not close the iterator it
+    # abandons: without it, closing this generator raises GeneratorExit here
+    # and leaves the inner one -- which owns the aiohttp session -- suspended
+    # at its yield with the session still open.
+    async with aclosing(
+        _stream_metadata_tsv(metadata_url, "experiment", deadline)
+    ) as stream:
+        async for row in stream:
+            yield row
+
+
+async def fetch_encode_annotation_metadata(
+    annotation_type: str,
+    deadline: float | None = None,
+) -> AsyncGenerator[dict, None]:
+    """
+    Fetch all released annotation files of one ``annotation_type``.
+
+    The same ``/metadata/`` endpoint as the experiment fetch, against
+    ``type=Annotation``. The two TSVs do not share a column set -- Annotation
+    publishes 32 columns to Experiment's 59, with six of the shared ones
+    renamed -- so rows from here must go through
+    :func:`transform_annotation_to_c2m2`, not :func:`transform_to_c2m2`.
+
+    One request per annotation type, rather than one request carrying
+    repeated ``annotation_type`` parameters, so that a failure or a timeout
+    on one type costs only that type. It also keeps each response small
+    enough to come back: the portal returns 504 on requests that take too
+    long to assemble.
+
+    Args:
+        annotation_type: An ENCODE ``annotation_type`` value, e.g.
+            "candidate Cis-Regulatory Elements". Passed through URL
+            encoding, so spaces and punctuation need no pre-escaping.
+        deadline: Event-loop clock reading by which this fetch must finish,
+            shared with the other streams of the same sync. ``None`` grants
+            a fresh full budget; see :func:`metadata_budget_seconds`.
+
+    Yields:
+        Dicts keyed by TSV column names for each file row
+    """
+    config = get_dcc_config("encode")
+    api_base = config["api_base"]
+
+    query = urlencode(
+        {
+            "type": "Annotation",
+            "status": "released",
+            "annotation_type": annotation_type,
+        }
+    )
+    metadata_url = f"{api_base}/metadata/?{query}"
+
+    # See fetch_encode_metadata for why the inner stream is closed
+    # explicitly rather than left to ``async for``.
+    async with aclosing(
+        _stream_metadata_tsv(
+            metadata_url, f"annotation[{annotation_type}]", deadline
+        )
+    ) as stream:
+        async for row in stream:
+            yield row
 
 
 def _nonempty(value: str | None) -> str | None:
@@ -380,12 +582,45 @@ def _extract_donor_ids(donors_str: str | None) -> list[str]:
     return ids
 
 
-def transform_to_c2m2(row: dict) -> Optional[dict]:
+# Annotation TSV column -> the Experiment TSV column holding the same datum.
+# Verified against the live headers of both ingested annotation types (both
+# 32 columns, identical to each other). Applied by
+# :func:`transform_annotation_to_c2m2` before the shared transformation, so
+# that a rename is the only thing standing between the two TSVs and one
+# mapping serves both. Every other shared column already agrees by name.
+ANNOTATION_COLUMN_ALIASES = {
+    "Dataset accession": "Experiment accession",
+    "Assay term name": "Assay",
+    "Assembly": "File assembly",
+    "Dataset date released": "Experiment date released",
+    "S3 URL": "s3_uri",
+    "Organism": "Biosample organism",
+}
+
+
+def _transform_row(
+    row: dict, *, dataset_path: str, require_biosample: bool
+) -> Optional[dict]:
     """
     Transform an ENCODE metadata TSV row to C2M2-compatible document for MongoDB.
 
+    Shared by the experiment and annotation ingest paths. Every field is read
+    under its *experiment* column name; the annotation path renames its
+    columns to match before calling here (see
+    :data:`ANNOTATION_COLUMN_ALIASES`). A column the caller's TSV does not
+    publish is simply absent from ``row``, so the corresponding field comes
+    out unset rather than derived from something else.
+
     Args:
         row: Dict keyed by TSV column names
+        dataset_path: Path segment for the collection's persistent_id --
+            "experiments" or "annotations". ENCODE serves the two dataset
+            kinds under different URLs, and a link to the wrong one 404s.
+        require_biosample: When True, a row with no ``Biosample term name``
+            produces no collection at all -- preserving the experiment
+            path's long-standing behavior. When False, the collection is
+            built from the dataset accession alone and simply carries no
+            biosamples, so that the accession stays queryable.
 
     Returns:
         C2M2-compatible dict for insertion into files collection, or None if invalid
@@ -474,10 +709,19 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     biosample_organism = _nonempty(row.get("Biosample organism"))
     donors_raw = _nonempty(row.get("Donor(s)"))
 
-    if biosample_term_name:
+    # A biosample can only be built from a biosample term. Whether its
+    # absence also suppresses the *collection* is the caller's call: 48 of
+    # the released cCRE files name no biosample term, and dropping their
+    # collection would make 24 dataset accessions unqueryable.
+    build_biosample = bool(biosample_term_name)
+    build_collection = build_biosample or (
+        not require_biosample and bool(experiment_accession)
+    )
+
+    if build_collection:
         # Build anatomy from biosample term
         anatomy = None
-        if biosample_term_id:
+        if biosample_term_id and biosample_term_name:
             anatomy = {"id": biosample_term_id, "name": biosample_term_name}
 
         # Build subjects from donor(s) and organism
@@ -500,6 +744,15 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         biosample_extra = {}
         if biosample_type:
             biosample_extra["biosample_type"] = biosample_type
+
+        # Donor characteristics, which ENCODE resolves onto the biosample
+        # upstream -- which is why the annotation TSV publishes them despite
+        # having no Donor(s) column. Kept as the upstream strings; see
+        # EnrichedEncodeBiosample for why they are not parsed into
+        # Subject.age_at_sampling.
+        _add_extra(biosample_extra, "life_stage", row.get("Life stage"))
+        _add_extra(biosample_extra, "age", row.get("Age"))
+        _add_extra(biosample_extra, "age_units", row.get("Age units"))
 
         # Treatment fields
         treatments = _nonempty(row.get("Biosample treatments"))
@@ -555,19 +808,22 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         )
 
         # Build biosample
-        biosample = {
-            "id_namespace": id_namespace,
-            "local_id": f"biosample:{biosample_term_name}",
-            "project_id_namespace": id_namespace,
-            "project_local_id": "ENCODE",
-            "subjects": subjects,
-        }
-        if anatomy:
-            biosample["anatomy"] = anatomy
-        if biosample_extra:
-            biosample["extra"] = {"encode": biosample_extra}
+        biosamples = []
+        if build_biosample:
+            biosample = {
+                "id_namespace": id_namespace,
+                "local_id": f"biosample:{biosample_term_name}",
+                "project_id_namespace": id_namespace,
+                "project_local_id": "ENCODE",
+                "subjects": subjects,
+            }
+            if anatomy:
+                biosample["anatomy"] = anatomy
+            if biosample_extra:
+                biosample["extra"] = {"encode": biosample_extra}
+            biosamples.append(biosample)
 
-        # Build collection extra (experiment-level fields)
+        # Build collection extra (dataset-level fields)
         collection_encode_extra = {}
         _add_extra(collection_encode_extra, "project", row.get("Project"))
         _add_extra(collection_encode_extra, "platform", row.get("Platform"))
@@ -578,12 +834,13 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
             row.get("RBNS protein concentration"),
         )
 
-        # Build collection — keyed by experiment accession, fallback to biosample
+        # Build collection — keyed by dataset accession, fallback to biosample
         if experiment_accession:
             collection_local_id = experiment_accession
             collection_name = experiment_accession
             collection_persistent_id = (
-                f"https://www.encodeproject.org/experiments/{experiment_accession}/"
+                f"https://www.encodeproject.org/{dataset_path}/"
+                f"{experiment_accession}/"
             )
         else:
             collection_local_id = f"biosample:{biosample_term_name}"
@@ -594,12 +851,12 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
             "id_namespace": id_namespace,
             "local_id": collection_local_id,
             "name": collection_name,
-            "biosamples": [biosample],
+            "biosamples": biosamples,
             "subjects": subjects,
         }
-        # Only the experiment-keyed branch has an accession. The
+        # Only the dataset-keyed branch has an accession. The
         # ``biosample:``-keyed fallback collection is synthesized locally and
-        # names no ENCODE experiment, so it is left unset rather than given a
+        # names no ENCODE dataset, so it is left unset rather than given a
         # fabricated accession.
         if experiment_accession:
             collection["accession_id"] = normalize_accession(experiment_accession)
@@ -650,6 +907,23 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
     _add_extra(extra, "s3_uri", row.get("s3_uri"))
     _add_extra(extra, "azure_url", row.get("Azure URL"))
 
+    # Mirrors the top-level genome_assembly under the DCC namespace, the way
+    # extra.fourdn.genome_assembly and extra.hubmap.genome_assembly mirror it
+    # for their DCCs. The field was declared and published in the SDL but
+    # never written, so a client reading the schema and reaching for
+    # extra.encode.assembly -- the natural move once cCREs made assembly a
+    # filter people actually use -- silently matched nothing.
+    _add_extra(extra, "assembly", row.get("File assembly"))
+
+    # Organism, from the same column that feeds subjects[].taxonomy above.
+    # Recorded here as well because an annotation row names no donor, so it
+    # builds no subject -- without this, the organism of a multi-organism
+    # result set (the released cCREs span Homo sapiens and Mus musculus)
+    # would be recoverable only by inspecting filenames. Set on experiment
+    # rows too, from the identical datum, so the filter means the same thing
+    # across the whole corpus rather than only over annotations.
+    _add_extra(extra, "organism", row.get("Biosample organism"))
+
     # Analysis metadata
     _add_extra(extra, "file_analysis_title", row.get("File analysis title"))
     _add_extra(extra, "file_analysis_status", row.get("File analysis status"))
@@ -674,6 +948,81 @@ def transform_to_c2m2(row: dict) -> Optional[dict]:
         "project_id_namespace": id_namespace,
         "project_local_id": "ENCODE",
     }
+
+    return doc
+
+
+def transform_to_c2m2(row: dict) -> Optional[dict]:
+    """
+    Transform an ENCODE *experiment* metadata TSV row to a C2M2 document.
+
+    Args:
+        row: Dict keyed by TSV column names, as yielded by
+            :func:`fetch_encode_metadata`
+
+    Returns:
+        C2M2-compatible dict for insertion into files collection, or None if invalid
+    """
+    return _transform_row(row, dataset_path="experiments", require_biosample=True)
+
+
+def transform_annotation_to_c2m2(row: dict) -> Optional[dict]:
+    """
+    Transform an ENCODE *annotation* metadata TSV row to a C2M2 document.
+
+    Renames the annotation TSV's columns to their experiment equivalents
+    (:data:`ANNOTATION_COLUMN_ALIASES`), runs the shared transformation, then
+    applies the seven annotation-only columns. Experiment-only fields are
+    left unset rather than derived: the aliased row simply does not carry
+    those keys, so, for instance, ``_extract_donor_ids`` receives nothing and
+    the document ends up with no subjects rather than an invented donor.
+
+    Args:
+        row: Dict keyed by TSV column names, as yielded by
+            :func:`fetch_encode_annotation_metadata`
+
+    Returns:
+        C2M2-compatible dict for insertion into files collection, or None if invalid
+    """
+    aliased = dict(row)
+    for annotation_column, experiment_column in ANNOTATION_COLUMN_ALIASES.items():
+        if annotation_column in aliased:
+            aliased[experiment_column] = aliased.pop(annotation_column)
+
+    doc = _transform_row(
+        aliased, dataset_path="annotations", require_biosample=False
+    )
+    if doc is None:
+        return None
+
+    annotation_type = _nonempty(row.get("Annotation type"))
+
+    # On the file as well as the dataset. The dataset is where the property
+    # belongs, but filtering files by annotation_type is the actual use case
+    # -- "give me the cCRE files" -- and routing that through a collection
+    # subdocument for every query is not worth the single duplicated string.
+    if annotation_type:
+        doc.setdefault("extra", {}).setdefault("encode", {})["annotation_type"] = (
+            annotation_type
+        )
+
+    for collection in doc.get("collections", []):
+        collection_extra = collection.setdefault("extra", {}).setdefault("encode", {})
+        if annotation_type:
+            collection_extra["annotation_type"] = annotation_type
+        _add_extra(collection_extra, "software_used", row.get("Software used"))
+        _add_extra(
+            collection_extra, "encyclopedia_version", row.get("Encyclopedia Version")
+        )
+        if not collection_extra:
+            del collection["extra"]
+
+        # Reuses the scalar experiment_target rather than adding a parallel
+        # list field: the TSV hands over a string either way. Note that
+        # ENCODE does not order it -- both "CTCF-human, H3K4me3-human" and
+        # "H3K4me3-human, CTCF-human" occur in the released corpus -- so an
+        # equality filter on the whole value matches one permutation only.
+        _add_extra(collection, "experiment_target", row.get("Targets"))
 
     return doc
 
