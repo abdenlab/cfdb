@@ -1,14 +1,30 @@
 # ENCODE Metadata Mapping
 
-Field mapping from the ENCODE metadata TSV to the CFDB data model. ENCODE does not use C2M2 — all data is fetched from the ENCODE REST API and pre-materialized directly into the `files` collection, bypassing the C2M2 load and Rust materializer steps.
+Field mapping from the ENCODE metadata TSVs to the CFDB data model. ENCODE does not use C2M2 — all data is fetched from the ENCODE REST API and pre-materialized directly into the `files` collection, bypassing the C2M2 load and Rust materializer steps.
+
+Two TSVs are ingested: released **experiments** and released **annotations** of configured types. They share most of their mapping; the sections below describe the experiment TSV, and [Annotation Mapping](#annotation-mapping) states every way an annotation row differs.
 
 ## Data Source
 
 | Source | URL | What It Provides |
 |--------|-----|------------------|
-| ENCODE metadata TSV | `GET /metadata/?type=Experiment&status=released` | Streaming TSV of all released experiment files (~700k rows, hundreds of MB) |
+| ENCODE experiment metadata TSV | `GET /metadata/?type=Experiment&status=released` | Streaming TSV of all released experiment files (~700k rows, hundreds of MB), 59 columns |
+| ENCODE annotation metadata TSV | `GET /metadata/?type=Annotation&status=released&annotation_type=<type>` | Streaming TSV of all released files of one annotation type, 32 columns. Requested once per configured type |
 
-The TSV is streamed line-by-line to keep memory usage constant. Each row represents one file with its experiment, biosample, library, and donor metadata denormalized inline.
+The TSV is streamed line-by-line to keep memory usage constant. Each row represents one file with its experiment/dataset, biosample, library, and donor metadata denormalized inline.
+
+### Which annotation types are ingested
+
+`ENCODE_ANNOTATION_TYPES` — comma-separated `annotation_type` values. Unset yields the default allowlist below; set to an empty value to disable annotation ingest entirely, which logs a warning since `ENCODE_METADATA_TIMEOUT_SECONDS` reads an empty value the other way, as "unset, use the default". Entries are trimmed, blanks dropped, and repeats collapsed — one ingest phase runs per distinct entry, and since ENCODE files are written with `insert_many` into a collection with no unique key, a duplicated token would otherwise load every file of that type twice.
+
+| `annotation_type` | Datasets | Files | Formats | Assemblies |
+|---|---|---|---|---|
+| `candidate Cis-Regulatory Elements` | 6,230 | 12,448 | `bed bed9+`, `bigBed bed9+`, `bed bed3+`, `bigBed bed3+`, `bigBed bed9` | GRCh38, mm10, hg19 |
+| `element gene regulatory interaction predictions` | 1,543 | 16,692 | `bed bed3+`, `bedpe`, `bigInteract`, `bed bed3` | GRCh38 |
+
+This is an allowlist rather than a filter applied after the fact. ENCODE publishes 580,910 annotation datasets, 86% of them footprints; ingesting the type space wholesale and pruning later would be a corpus-scale mistake to undo.
+
+One request per type, not one request carrying repeated `annotation_type` parameters: a failure or timeout on one type then costs only that type, and each response stays small enough for the portal to assemble without a gateway timeout.
 
 ## Ontology Mappings
 
@@ -28,10 +44,24 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 | `broadPeak` | `format:3614` | BroadPeak |
 | `bigWig` | `format:3006` | bigWig |
 | `bigBed` | `format:3004` | bigBed |
+| `bedpe` | `cfdb:bedpe` | bedpe |
+| `bigInteract` | `cfdb:biginteract` | bigInteract |
 | `vcf` | `format:3016` | VCF |
 | `gtf` | `format:2306` | GTF |
 | `tsv` | `format:3475` | TSV |
 | `hdf5` | `format:3590` | HDF5 |
+
+#### Minted (non-EDAM) format terms
+
+`cfdb:` marks a term minted here because EDAM has none (verified against OLS4). The alternative — aliasing an unrepresented format onto the nearest EDAM term — is what produced the starch/BED conflation behind #69 and #72: the format becomes indistinguishable from the one it was aliased to, and the processor claiming that term picks it up and mangles it.
+
+`bedpe` and `bigInteract` both pair two loci per record. Routed into the BED tabix pipeline they would be sorted and indexed by the first locus alone, committing a cached artifact that looks successful and is wrong — and the byte-sniff guard from #71 does not catch it, since both are plaintext or gzip. The distinct **name** is what does the work: processor lookup keys on `file_format.name`, and neither name is in any processor's `supported_formats`, so `GET /data/...` streams the raw upstream file rather than a mangled index. Tileset endpoints that understand these formats are planned separately.
+
+**`bigInteract` loses a working index in the meantime.** The two formats were not equally broken before this change. A `bedpe` routed through tabix produced an index that was simply wrong — the second mate of every record was unindexed and invisible. A `bigInteract` routed through `bigBedToBed` produced one that was *range-coherent*: the leading three columns are a genuine interval, so the index answered range queries correctly while silently degrading each interaction to a single locus. Re-typing both means `GET /index/...` now returns 404 for either, so `bigInteract` files that previously returned a usable-if-degraded index return nothing at all, and that applies to `bigInteract` already in the experiment corpus as well as to newly ingested annotation files. The tradeoff is accepted deliberately: a 404 states the truth, where the degraded index quietly answered a question the caller did not ask. The tileset work is what restores the capability.
+
+This applies to `.bedpe` already in the ENCODE experiment corpus, not only to annotation files — but it reaches no further than ENCODE. `FILE_FORMAT_TO_EDAM` and `get_file_format` have exactly one consumer, the ENCODE transform; 4DN and HuBMAP take `file_format` from their upstream C2M2 datapackage or portal API and never consult the table. A 4DN `.bedpe` whose upstream declares BED therefore still carries `file_format.name == "BED"`, is still claimed by `TabixIntervalProcessor`, and still gets an index built from its first mate. Closing that means routing incoming formats from every DCC through the same table, or refusing a `.bedpe` filename at the processor regardless of declared format; both are follow-up work.
+
+**Cache artifacts left behind.** Files of these two formats that were indexed before the re-typing still have their incorrect `.tbi` artifacts in the workflow cache. Nothing reads them any more — `lookup_for` returns `None` and the router bails before probing the cache — and nothing purges them either, so they are unreachable storage cost until someone sweeps them. They also make a latent cache-key hazard concrete: `cache_key` identifies a processor only by its `processor_version`, not by which processor it is, so a future paired-interval processor sharing a version number with `TabixIntervalProcessor` would derive the same key and read those stale artifacts back as cache hits. A processor identity has to be folded into the key before that processor lands; see the warning on `cfdb.workflows.keys.cache_key`.
 
 ### Output Type -> EDAM Data
 
@@ -47,6 +77,13 @@ ENCODE uses human-readable strings for file formats, assay types, output types, 
 | `methylation state at CpG` | `data:1772` | Methylation data |
 | `variant calls` | `data:3498` | Sequence variations |
 | `contact matrix` | `data:2082` | Matrix |
+| `candidate Cis-Regulatory Elements` | `data:1255` | Sequence features |
+| `elements reference` | `data:1255` | Sequence features |
+| `element gene links` | `data:0006` | Data |
+| `thresholded element gene links` | `data:0006` | Data |
+| `thresholded links` | `data:0006` | Data |
+
+The last five are the complete `Output type` domain of the two ingested annotation types, verified against the live TSVs. Without them every annotation file would carry `data_type: null`. The element/gene link types resolve to the generic `data:0006` because EDAM has no term for a predicted regulatory relationship between two loci — the pre-existing `chromatin interactions` entry already made that call the same way.
 
 ### Assay -> OBI
 
@@ -150,6 +187,9 @@ Experiment-level fields stored on `collection.extra.encode` (`EnrichedEncodeColl
 | `extra.encode.platform` | `Platform` |
 | `extra.encode.dbxrefs` | `dbxrefs` |
 | `extra.encode.rbns_protein_concentration` | `RBNS protein concentration` |
+| `extra.encode.annotation_type` | `Annotation type` (annotation TSV only) |
+| `extra.encode.software_used` | `Software used` (annotation TSV only) |
+| `extra.encode.encyclopedia_version` | `Encyclopedia Version` (annotation TSV only) |
 
 ### Biosample
 
@@ -161,6 +201,9 @@ One biosample per file, nested inside the collection:
 | `anatomy` | `Biosample term id` + `Biosample term name` | `{id, name}` object |
 | `subjects[]` | `Donor(s)` | Same subjects as collection |
 | `extra.encode.biosample_type` | `Biosample type` | e.g., `"primary cell"`, `"tissue"`, `"cell line"` |
+| `extra.encode.life_stage` | `Life stage` | Annotation TSV only. e.g., `"embryonic"`, `"adult"`, `"young adult"`, `"unknown"` |
+| `extra.encode.age` | `Age` | Annotation TSV only. Kept as the upstream string — the released corpus contains `"2-4"` and `"unknown"` alongside decimals, and distinguishes `"10.5"` from `"10.50"` |
+| `extra.encode.age_units` | `Age units` | Annotation TSV only. `year` / `month` / `week` / `day`; blank when `age` is absent or a sentinel |
 | `extra.encode.biosample_treatments` | `Biosample treatments` | Treatment details |
 | `extra.encode.biosample_treatments_amount` | `Biosample treatments amount` | Dosage |
 | `extra.encode.biosample_treatments_duration` | `Biosample treatments duration` | Duration |
@@ -215,8 +258,10 @@ All stored on `file.extra.encode` (`EnrichedEncodeFile`). Every field is `Option
 |------------|-------------------|
 | `extra.encode.genome_annotation` | `Genome annotation` |
 | `extra.encode.controlled_by` | `Controlled by` |
-| `extra.encode.s3_uri` | `s3_uri` |
+| `extra.encode.s3_uri` | `s3_uri` (annotation TSV: `S3 URL`) |
 | `extra.encode.azure_url` | `Azure URL` |
+| `extra.encode.organism` | `Biosample organism` (annotation TSV: `Organism`) |
+| `extra.encode.annotation_type` | `Annotation type` (annotation TSV only) |
 
 ### Analysis Metadata
 
@@ -233,6 +278,52 @@ All stored on `file.extra.encode` (`EnrichedEncodeFile`). Every field is `Option
 | `extra.encode.audit_not_compliant` | `Audit NOT_COMPLIANT` |
 | `extra.encode.audit_error` | `Audit ERROR` |
 
+## Annotation Mapping
+
+Everything above applies to an annotation row too, except as stated here. `transform_annotation_to_c2m2` renames the annotation TSV's columns to their experiment equivalents, runs the shared transformation, then applies the annotation-only columns — so one mapping serves both TSVs.
+
+### Renamed columns
+
+Applied via `ANNOTATION_COLUMN_ALIASES` in `encode.py`. Verified against the live headers of both ingested types (both 32 columns, identical to each other). Every other shared column already agrees by name.
+
+| Annotation TSV | Experiment TSV | Lands on |
+|---|---|---|
+| `Dataset accession` | `Experiment accession` | `collections[].local_id`, `accession_id`, `name`, `persistent_id` |
+| `Assay term name` | `Assay` | `assay_type`, `collections[].experiment_type` |
+| `Assembly` | `File assembly` | `genome_assembly` |
+| `Dataset date released` | `Experiment date released` | `creation_time` |
+| `S3 URL` | `s3_uri` | `extra.encode.s3_uri` |
+| `Organism` | `Biosample organism` | `extra.encode.organism`, `subjects[].taxonomy` |
+
+### Annotation-only columns
+
+| Annotation TSV | Lands on |
+|---|---|
+| `Annotation type` | `extra.encode.annotation_type` **and** `collections[].extra.encode.annotation_type` |
+| `Software used` | `collections[].extra.encode.software_used` |
+| `Encyclopedia Version` | `collections[].extra.encode.encyclopedia_version` |
+| `Targets` | `collections[].experiment_target` |
+| `Life stage` | `…biosamples[].extra.encode.life_stage`, when the row names a biosample |
+| `Age` | `…biosamples[].extra.encode.age`, when the row names a biosample |
+| `Age units` | `…biosamples[].extra.encode.age_units`, when the row names a biosample |
+
+`annotation_type` is stored on the file as well as the dataset. The dataset is where the property belongs, but filtering *files* by it is the actual use case — "give me the cCRE files" — and routing that through a collection subdocument on every query is not worth avoiding one duplicated string.
+
+`Targets` reuses the scalar `experiment_target` rather than adding a parallel list field; the TSV hands over a string either way. Note that ENCODE does not order it — both `"CTCF-human, H3K4me3-human"` and `"H3K4me3-human, CTCF-human"` occur in the released corpus — so an equality filter on the whole value matches one permutation only.
+
+`Life stage` / `Age` / `Age units` go to the biosample, not to `Subject.age_at_sampling`. They are biosample-scoped in ENCODE's own model (resolved from the donor upstream), which is why the annotation TSV publishes them despite having no `Donor(s)` column — and `age_at_sampling` is a float in years, which could represent neither the `"2-4"` ranges nor the `"unknown"` sentinels the corpus contains.
+
+The biosample is the destination, so a row that names no `Biosample term name` has nowhere to put them and they are dropped. That is exactly the row the annotation transform relaxed `require_biosample` for, so the caveat matters more here than on the experiment path: an annotation row with donor traits but no biosample loses them. Nothing was lost against the corpus as last checked — of the biosample-less rows in the two configured annotation types, none published any of the three — and inventing a biosample to hold them would be worse than dropping them. `test_transform_annotation_to_c2m2_should_drop_donor_traits_with_no_biosample` pins the behavior.
+
+### Experiment-only columns
+
+Absent from the annotation TSV, and therefore **unset** on annotation documents rather than derived: all eight `Library *`, all six `Biosample genetic modifications *`, `Biosample treatments *`, `Biological`/`Technical replicate(s)`, `Donor(s)`, `Experiment target`, `File analysis title`/`status`, `File format type`, `Genome annotation`, `Index of`, `Read length`, `Mapped read length`, `Run type`, `Paired end`, `Paired with`, `Platform`, `RBNS protein concentration`, `Controlled by`.
+
+Two consequences worth naming:
+
+- **No subjects.** With no `Donor(s)` column there is nothing to key a `Subject` on, so annotation documents carry `collections[].subjects == []` and no donor is fabricated. The organism that would have reached `subjects[].taxonomy` is on `extra.encode.organism` instead — which is the only way the organism of a multi-organism result set (the released cCREs span *Homo sapiens* and *Mus musculus*) is recoverable without inspecting filenames.
+- **The dataset does not require a biosample.** Unlike the experiment path, the annotation collection is built from `Dataset accession` alone. 48 released cCRE files name no biosample term; gating on one would leave 24 dataset accessions unqueryable. Its `persistent_id` points at `/annotations/`, not `/experiments/`.
+
 ## Sync Flow
 
 ENCODE sync bypasses the C2M2 ZIP pipeline entirely. Files are pre-materialized during ingest.
@@ -243,19 +334,37 @@ ENCODE sync bypasses the C2M2 ZIP pipeline entirely. Files are pre-materialized 
 
 ### Data Flow
 
+`_sync_encode` runs one phase for released experiments plus one per configured `annotation_type`:
+
 ```text
-fetch_encode_metadata()                 # Streaming TSV from ENCODE API
-  │                                     # Yields one dict per row
+_sync_encode()
+  ├─ clear ENCODE data + upsert the DCC record  (inside the cutover lock)
   │
-  └─> transform_to_c2m2(row)            # Per-row transformation
+  ├─ phase "experiment"
+  │     fetch_encode_metadata()               # Streaming TSV from ENCODE API
+  │       └─> transform_to_c2m2(row)          # Yields one dict per row
+  │
+  ├─ phase "annotation[<type>]"  × one per configured type
+  │     fetch_encode_annotation_metadata(type)
+  │       └─> transform_annotation_to_c2m2(row)
+  │             └─ rename columns, then the shared transformation
+  │
+  └─ each transformation:
         ├─ Map File format -> EDAM      # ontology_mappings.get_file_format()
         ├─ Derive compression -> EDAM   # from the download URL's suffix
         ├─ Map Output type -> EDAM      # ontology_mappings.get_data_type()
         ├─ Map Assay -> OBI             # ontology_mappings.get_assay_type()
         ├─ Map Organism -> NCBI         # ontology_mappings.get_taxonomy()
         ├─ Build collection + biosample + subjects inline
-        ├─ Build extra.encode dict (21 file fields)
         └─ Insert into files collection (batches of 1000)
 ```
+
+**Phase isolation.** A phase that raises is logged and recorded, and the remaining phases still run — a transient failure on one stream does not cost the corpus the others. A stream that dies *mid-flight* (the shape an `asyncio.TimeoutError` against the metadata budget takes) has its trailing partial batch committed rather than discarded, and still reports the rows it loaded, so the per-phase counts, the summary tallies and the collection all agree. The indexes are ensured unconditionally afterwards, so whatever did load is servable without a full collection scan. The sync then fails, naming the phases that broke: reporting a clean sync over a partially loaded collection would be worse than a visible failure.
+
+**Each phase replaces only its own slice.** `files` is not cleared corpus-wide before the fan-out. Each phase owns a slice — experiments are the documents with no `extra.encode.annotation_type`, each annotation phase the documents carrying its type — and deletes that slice only once it has replacement rows in hand. A phase that fails before delivering any row, the shape a portal 504 or an exhausted download budget takes, therefore leaves its previous rows being served instead of emptying them; clearing up front meant a failed experiment phase left the API serving the ~29k annotation documents as the entire corpus. A stream that drains cleanly with no rows is the opposite case and does clear, so a type ENCODE stopped publishing stops being served. A phase that dies partway through still leaves its own slice partially loaded — only loading into a shadow collection and swapping on success would close that, and it is not part of this change.
+
+**One budget for the fan-out.** `ENCODE_METADATA_TIMEOUT_SECONDS` (default 3600) bounds the whole sync, not each stream within it. The budget is resolved once and every phase shares a single deadline, each receiving whatever remains; a phase that finds the budget spent fails immediately rather than opening a request it has no time to finish. Per-stream budgets would have multiplied the ceiling by the number of phases — three by default, and unbounded as the allowlist grows — while the whole fan-out sits inside the cutover lock that gates the read surface. That matters beyond availability: the sync lock treats itself as abandoned after one hour (`STALE_LOCK_THRESHOLD`) with nothing refreshing `started_at`, so a run that outlives the threshold admits a second sync, which clears the ENCODE corpus while the first is still inserting into it.
+
+**Queryability.** `extra.encode.annotation_type` and `extra.encode.organism` are indexed by `materialized_files_index_specs()` — the ENCODE sync writes `files` directly and never reaches the Rust materializer that owns the rest, so nothing else would create them — and both are in `ALLOWED_DISTINCT_FIELDS`, so a client can enumerate the available annotation types rather than having to know ENCODE's exact spelling in advance.
 
 No post-ingest enrichment pass. All metadata is captured during the initial TSV transformation.

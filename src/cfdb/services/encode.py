@@ -1,11 +1,15 @@
 """ENCODE metadata TSV client and CFDB transformation service.
 
-Fetches the released-experiment metadata TSV from ENCODE and transforms
-each row into a CFDB file document.
+Fetches the released-experiment and released-annotation metadata TSVs from
+ENCODE and transforms each row into a CFDB file document.
 
-Metadata URL
-------------
+Metadata URLs
+-------------
 https://www.encodeproject.org/metadata/?type=Experiment&status=released
+https://www.encodeproject.org/metadata/?type=Annotation&status=released&annotation_type=<type>
+
+The annotation URL is requested once per configured ``annotation_type``
+(``ENCODE_ANNOTATION_TYPES``; see :func:`annotation_types_from_env`).
 
 Field Mapping (ENCODE TSV → CFDB)
 ----------------------------------
@@ -43,6 +47,7 @@ Derived from                    → extra.encode.derived_from
 Controlled by                   → extra.encode.controlled_by
 s3_uri                          → extra.encode.s3_uri
 Azure URL                       → extra.encode.azure_url
+Biosample organism              → extra.encode.organism
 File analysis title             → extra.encode.file_analysis_title
 File analysis status            → extra.encode.file_analysis_status
 Audit WARNING                   → extra.encode.audit_warning
@@ -100,6 +105,63 @@ Static / config-derived:          dcc.id, dcc.dcc_name, dcc.dcc_abbreviation,
                                   dcc.dcc_description, dcc.contact_email,
                                   dcc.contact_name, dcc.dcc_url,
                                   dcc.project_id_namespace, dcc.project_local_id
+
+
+Annotation TSV
+--------------
+
+The Annotation TSV publishes 32 columns to the Experiment TSV's 59, and the
+overlap is partial. Everything above applies to an annotation row too, except
+as stated here.
+
+Renamed columns (annotation name → the experiment name the mapping uses).
+Applied by ``transform_annotation_to_c2m2`` via ANNOTATION_COLUMN_ALIASES
+before the shared transformation, so the table above covers both TSVs:
+
+Dataset accession               → Experiment accession
+Assay term name                 → Assay
+Assembly                        → File assembly
+Dataset date released           → Experiment date released
+S3 URL                          → s3_uri
+Organism                        → Biosample organism
+
+Annotation-only columns:
+
+Annotation type                 → extra.encode.annotation_type, and
+                                  collections[].extra.encode.annotation_type
+Software used                   → collections[].extra.encode.software_used
+Encyclopedia Version            → collections[].extra.encode.encyclopedia_version
+Targets                         → collections[].experiment_target (reuses the
+                                  scalar; ENCODE does not order the value, so
+                                  an equality filter matches one permutation)
+Life stage                      → …biosamples[].extra.encode.life_stage
+Age                             → …biosamples[].extra.encode.age
+Age units                       → …biosamples[].extra.encode.age_units
+
+The three donor traits land on the biosample, so a row naming no
+``Biosample term name`` -- the row the annotation transform relaxed
+``require_biosample`` for -- has nowhere to put them and drops them.
+No biosample-less row in the configured annotation types publishes any
+of the three today, and inventing a biosample to hold them would be
+worse than dropping them.
+
+Columns the Annotation TSV does not publish, left unset rather than derived:
+all eight ``Library *``, all six ``Biosample genetic modifications *``,
+``Biosample treatments *``, ``Biological/Technical replicate(s)``,
+``Donor(s)``, ``Experiment target``, ``File analysis title``/``status``,
+``File format type``, ``Genome annotation``, ``Index of``, ``Read length``,
+``Mapped read length``, ``Run type``, ``Paired end``, ``Paired with``,
+``Platform``, ``RBNS protein concentration``, ``Controlled by``.
+
+Two consequences worth naming:
+
+* No ``Donor(s)`` column means no subjects are built, so an annotation
+  document has ``collections[].subjects == []`` and no donor is invented.
+  The organism it would have carried is on ``extra.encode.organism``.
+* The dataset collection is built from ``Dataset accession`` alone, without
+  requiring a biosample term -- 48 released cCRE files name no biosample,
+  and gating on one would make 24 dataset accessions unqueryable. Its
+  ``persistent_id`` points at ``/annotations/``, not ``/experiments/``.
 """
 
 import asyncio
@@ -750,6 +812,13 @@ def _transform_row(
         # having no Donor(s) column. Kept as the upstream strings; see
         # EnrichedEncodeBiosample for why they are not parsed into
         # Subject.age_at_sampling.
+        #
+        # Note these are attached only under ``if build_biosample`` below,
+        # so a row naming no biosample term parses them and drops them.
+        # Deliberate: the biosample is their destination and inventing one
+        # to hold them would be worse. No biosample-less row in the
+        # configured annotation types published any of the three when the
+        # released corpus was last checked.
         _add_extra(biosample_extra, "life_stage", row.get("Life stage"))
         _add_extra(biosample_extra, "age", row.get("Age"))
         _add_extra(biosample_extra, "age_units", row.get("Age units"))
