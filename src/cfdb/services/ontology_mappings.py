@@ -144,6 +144,24 @@ OUTPUT_TYPE_TO_EDAM = {
     "transcription start sites": {"id": "data:1255", "name": "Sequence features"},
     "enhancer predictions": {"id": "data:1255", "name": "Sequence features"},
     "long range chromatin interactions": {"id": "data:0006", "name": "Data"},
+    # Annotation datasets (type=Annotation ingest)
+    #
+    # Verified against the live annotation TSVs: these five values are the
+    # complete Output type domain of the two ingested annotation_types, and
+    # none of them appeared above, so without these entries every annotation
+    # file would carry data_type=None.
+    #
+    # The element/gene link types resolve to the generic "data:0006" rather
+    # than to a features or track term. EDAM has nothing for a predicted
+    # regulatory relationship between two loci, and the pre-existing
+    # "chromatin interactions" entry already made that call the same way. A
+    # deliberately vague term is preferable to claiming these files are
+    # something they are not.
+    "candidate Cis-Regulatory Elements": {"id": "data:1255", "name": "Sequence features"},
+    "elements reference": {"id": "data:1255", "name": "Sequence features"},
+    "element gene links": {"id": "data:0006", "name": "Data"},
+    "thresholded element gene links": {"id": "data:0006", "name": "Data"},
+    "thresholded links": {"id": "data:0006", "name": "Data"},
     # Reference data
     "genome reference": {"id": "data:2340", "name": "Genome identifier"},
     "sequence alignability": {"id": "data:0006", "name": "Data"},
