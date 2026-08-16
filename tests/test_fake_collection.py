@@ -194,16 +194,40 @@ class TestFakeCollectionContract:
         )
 
         # Assert
-        # ``$exists`` in the FakeCollection matcher checks ``key in doc``;
-        # the dotted path ``extra.fourdn.extra_files`` is not a top-level
-        # key, so the matcher's strict behavior may or may not return the
-        # doc. Just assert that the call does not raise — the test pins
-        # the present contract.
-        # If the matcher does return the doc, confirm the dotted resolver
-        # delivered the right one. If not, the matcher considers the
-        # dotted key absent — also valid for the current implementation.
-        if found is not None:
-            assert found["local_id"] == "x"
+        assert found is not None
+        assert found["local_id"] == "x"
+
+    @pytest.mark.asyncio
+    async def test_find_one_should_not_match_an_absent_dotted_path(self):
+        """Test that a negated ``$exists`` excludes docs that have the path.
+
+        Matching by top-level key reports every dotted path as absent, so
+        this predicate matched the whole collection -- which is how the
+        ENCODE per-slice clearing selects the documents carrying no
+        annotation type. A delete built on it would have taken the corpus.
+
+        Given:
+            One doc carrying a nested path and one without it.
+        When:
+            ``find_one`` negates ``$exists`` on that dotted path.
+        Then:
+            It should return only the doc that lacks the path.
+        """
+        # Arrange
+        coll = FakeCollection()
+        coll.docs.append(
+            {"local_id": "has", "extra": {"encode": {"annotation_type": "cCRE"}}}
+        )
+        coll.docs.append({"local_id": "lacks", "extra": {"encode": {}}})
+
+        # Act
+        found = await coll.find_one(
+            {"extra.encode.annotation_type": {"$exists": False}}
+        )
+
+        # Assert
+        assert found is not None
+        assert found["local_id"] == "lacks"
 
     @pytest.mark.asyncio
     async def test_find_one_and_update_should_match_lt_operator_on_datetime(self):
