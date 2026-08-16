@@ -125,7 +125,16 @@ async def _run_sync(task: SyncTask) -> None:
 
 
 async def _sync_dccs(task: SyncTask) -> None:
-    """Core sync implementation for API."""
+    """Core sync implementation for API.
+
+    Each DCC is isolated the same way ``_sync_encode`` isolates its phases:
+    one that raises is logged and recorded, and the remaining DCCs still
+    run. Letting the first failure escape meant every DCC ordered after it
+    was skipped -- ``get_all_dcc_names`` sorts, so one failed ENCODE phase
+    cost the whole HuBMAP sync -- along with the data-collection indexes
+    built at the end. The run still fails once every DCC has been attempted,
+    naming the ones that broke.
+    """
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
@@ -134,15 +143,28 @@ async def _sync_dccs(task: SyncTask) -> None:
     downloads_path = data_path / "downloads"
     downloads_path.mkdir(exist_ok=True)
 
+    failures: list[tuple[str, Exception]] = []
+
     for dcc in task.dcc_names:
         task.current_dcc = dcc
         dcc_type = get_dcc_type(dcc)
 
-        # Branch on DCC type
-        if dcc_type == "rest_api" and dcc == "encode":
-            await _sync_encode(task)
-        else:
-            await _sync_c2m2_zip(task, data_path, downloads_path)
+        try:
+            # Branch on DCC type
+            if dcc_type == "rest_api" and dcc == "encode":
+                await _sync_encode(task)
+            else:
+                await _sync_c2m2_zip(task, data_path, downloads_path)
+        except Exception as exc:
+            # Narrower than BaseException on purpose, so a CancelledError
+            # still cancels the run rather than being recorded as one DCC's
+            # failure and followed by every remaining DCC.
+            logger.exception(
+                "%s sync failed; continuing with the remaining DCCs",
+                dcc.upper(),
+            )
+            failures.append((dcc, exc))
+            continue
 
         logger.info(f"{dcc.upper()} synced successfully")
         await _log_accession_coverage(dcc)
@@ -152,11 +174,25 @@ async def _sync_dccs(task: SyncTask) -> None:
     # (operational indexes only) so we never build these against an
     # empty database on a cold start; likewise skip when no DCC was
     # actually synced so an empty request doesn't build them either.
+    # Runs even when a DCC failed: whatever did load still has to be
+    # queryable without a full collection scan.
     if task.dcc_names:
         task.current_step = "indexing"
         task.progress = "Ensuring data indexes..."
         logger.info(task.progress)
         await ensure_indexes(api.db, data_index_specs())
+
+    if failures:
+        failed_names = ", ".join(dcc for dcc, _ in failures)
+        task.progress = (
+            f"Sync incomplete: {len(task.dcc_names) - len(failures)} of "
+            f"{len(task.dcc_names)} DCCs synced"
+        )
+        logger.info(task.progress)
+        raise RuntimeError(
+            f"Sync completed with {len(failures)} failed DCC(s) "
+            f"({failed_names})"
+        ) from failures[0][1]
 
     task.progress = "All DCCs synced successfully"
     logger.info(task.progress)

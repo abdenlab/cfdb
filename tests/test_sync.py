@@ -185,6 +185,199 @@ class TestSyncDccsDataIndexing:
         ensure_mock.assert_not_awaited()
 
 
+class TestSyncDccsFailureIsolation:
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_sync_the_remaining_dccs_when_one_fails(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test one DCC's failure does not cost the others their sync.
+
+        get_all_dcc_names sorts, so ENCODE is attempted before HuBMAP on a
+        whole-corpus sync. Letting the failure escape the loop meant one
+        failed ENCODE phase -- three network streams by default, against a
+        portal that 504s on slow requests -- skipped HuBMAP entirely.
+
+        Given:
+            A three-DCC sync whose first DCC raises.
+        When:
+            _sync_dccs runs.
+        Then:
+            It should still attempt both remaining DCCs before failing.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=RuntimeError("encode died")),
+        )
+        zip_sync = mocker.patch.object(
+            sync_module, "_sync_c2m2_zip", mocker.AsyncMock()
+        )
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "4dn", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="encode"):
+            await _sync_dccs(task)
+
+        assert zip_sync.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_ensure_data_indexes_when_a_dcc_failed(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test a partial run still leaves what loaded queryable.
+
+        The index build sat after the loop, so the first failure skipped it
+        and left the DCCs that did load answering every query by collection
+        scan.
+
+        Given:
+            A two-DCC sync whose first DCC raises.
+        When:
+            _sync_dccs runs.
+        Then:
+            It should still ensure the data indexes once.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=RuntimeError("encode died")),
+        )
+        mocker.patch.object(sync_module, "_sync_c2m2_zip", mocker.AsyncMock())
+        ensure_mock = mocker.patch.object(
+            sync_module, "ensure_indexes", mocker.AsyncMock()
+        )
+        mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_dccs(task)
+
+        ensure_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_not_report_a_failed_dcc_as_synced(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test the per-DCC success reporting skips the DCC that failed.
+
+        Given:
+            A two-DCC sync whose first DCC raises.
+        When:
+            _sync_dccs runs.
+        Then:
+            Only the DCC that succeeded should be logged as synced and have
+            its accession coverage reported.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=RuntimeError("encode died")),
+        )
+        mocker.patch.object(sync_module, "_sync_c2m2_zip", mocker.AsyncMock())
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        coverage = mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_dccs(task)
+
+        assert [call.args[0] for call in coverage.await_args_list] == ["hubmap"]
+        assert task.progress == "Sync incomplete: 1 of 2 DCCs synced"
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_chain_the_first_dcc_failure_as_the_cause(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test the raised error keeps the first failure's traceback.
+
+        Given:
+            A two-DCC sync where both DCCs raise distinguishable errors.
+        When:
+            _sync_dccs runs.
+        Then:
+            The error's cause should be the first failure's exception.
+        """
+        # Arrange
+        first = RuntimeError("encode died")
+        second = RuntimeError("hubmap died")
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module, "_sync_encode", mocker.AsyncMock(side_effect=first)
+        )
+        mocker.patch.object(
+            sync_module, "_sync_c2m2_zip", mocker.AsyncMock(side_effect=second)
+        )
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError) as excinfo:
+            await _sync_dccs(task)
+
+        assert excinfo.value.__cause__ is first
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_propagate_a_cancellation(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test cancellation cancels the run rather than failing one DCC.
+
+        The per-DCC handler is deliberately broad, and a CancelledError
+        caught by it would be recorded as a DCC failure and followed by
+        every remaining DCC -- the opposite of cancelling.
+
+        Given:
+            A two-DCC sync whose first DCC raises CancelledError.
+        When:
+            _sync_dccs runs.
+        Then:
+            The CancelledError should propagate and the second DCC should
+            never run.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        zip_sync = mocker.patch.object(
+            sync_module, "_sync_c2m2_zip", mocker.AsyncMock()
+        )
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await _sync_dccs(task)
+
+        zip_sync.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # _prune_non_public_hubmap_raw_records
 # ---------------------------------------------------------------------------
