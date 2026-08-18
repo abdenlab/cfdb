@@ -8,10 +8,12 @@ import re
 import shutil
 import subprocess
 from collections import Counter
+from contextlib import aclosing
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -123,7 +125,16 @@ async def _run_sync(task: SyncTask) -> None:
 
 
 async def _sync_dccs(task: SyncTask) -> None:
-    """Core sync implementation for API."""
+    """Core sync implementation for API.
+
+    Each DCC is isolated the same way ``_sync_encode`` isolates its phases:
+    one that raises is logged and recorded, and the remaining DCCs still
+    run. Letting the first failure escape meant every DCC ordered after it
+    was skipped -- ``get_all_dcc_names`` sorts, so one failed ENCODE phase
+    cost the whole HuBMAP sync -- along with the data-collection indexes
+    built at the end. The run still fails once every DCC has been attempted,
+    naming the ones that broke.
+    """
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
@@ -132,15 +143,28 @@ async def _sync_dccs(task: SyncTask) -> None:
     downloads_path = data_path / "downloads"
     downloads_path.mkdir(exist_ok=True)
 
+    failures: list[tuple[str, Exception]] = []
+
     for dcc in task.dcc_names:
         task.current_dcc = dcc
         dcc_type = get_dcc_type(dcc)
 
-        # Branch on DCC type
-        if dcc_type == "rest_api" and dcc == "encode":
-            await _sync_encode(task)
-        else:
-            await _sync_c2m2_zip(task, data_path, downloads_path)
+        try:
+            # Branch on DCC type
+            if dcc_type == "rest_api" and dcc == "encode":
+                await _sync_encode(task)
+            else:
+                await _sync_c2m2_zip(task, data_path, downloads_path)
+        except Exception as exc:
+            # Narrower than BaseException on purpose, so a CancelledError
+            # still cancels the run rather than being recorded as one DCC's
+            # failure and followed by every remaining DCC.
+            logger.exception(
+                "%s sync failed; continuing with the remaining DCCs",
+                dcc.upper(),
+            )
+            failures.append((dcc, exc))
+            continue
 
         logger.info(f"{dcc.upper()} synced successfully")
         await _log_accession_coverage(dcc)
@@ -150,11 +174,25 @@ async def _sync_dccs(task: SyncTask) -> None:
     # (operational indexes only) so we never build these against an
     # empty database on a cold start; likewise skip when no DCC was
     # actually synced so an empty request doesn't build them either.
+    # Runs even when a DCC failed: whatever did load still has to be
+    # queryable without a full collection scan.
     if task.dcc_names:
         task.current_step = "indexing"
         task.progress = "Ensuring data indexes..."
         logger.info(task.progress)
         await ensure_indexes(api.db, data_index_specs())
+
+    if failures:
+        failed_names = ", ".join(dcc for dcc, _ in failures)
+        task.progress = (
+            f"Sync incomplete: {len(task.dcc_names) - len(failures)} of "
+            f"{len(task.dcc_names)} DCCs synced"
+        )
+        logger.info(task.progress)
+        raise RuntimeError(
+            f"Sync completed with {len(failures)} failed DCC(s) "
+            f"({failed_names})"
+        ) from failures[0][1]
 
     task.progress = "All DCCs synced successfully"
     logger.info(task.progress)
@@ -1000,16 +1038,195 @@ async def _enrich_hubmap_files(dataset_metadata: dict[str, dict]) -> None:
     )
 
 
+async def _ingest_encode_rows(
+    task: SyncTask,
+    label: str,
+    rows,
+    transform,
+    compression_counts: Counter[str | None],
+    annotation_type_counts: Counter[str],
+    counts_by_phase: dict[str, int],
+    stale_filter: dict,
+) -> None:
+    """Transform and batch-insert one ENCODE metadata stream.
+
+    Shared by the experiment and annotation phases so both use the same
+    batching, the same skip-on-None handling, and contribute to the same
+    corpus-wide tallies.
+
+    The row count is reported by mutating ``counts_by_phase`` rather than by
+    returning, and a partial batch left buffered by a dead stream is flushed
+    in a ``finally``. Both exist for the same reason: a stream can die
+    *mid-flight* -- an ``asyncio.TimeoutError`` against the metadata budget
+    is the known ENCODE failure mode -- and a return value is lost when it
+    does. Reporting by return meant a failed phase contributed nothing to
+    the caller's total even though its completed batches were already
+    committed, so the sync under-reported the corpus by up to everything
+    that phase had loaded, while the tallies below (mutated per row, not per
+    batch) over-reported it by the discarded partial batch. Three numbers in
+    one log block that disagreed with each other and with the database.
+
+    The *clean-path* flush is deliberately not in that ``finally``. A
+    ``finally`` runs whether or not an exception is in flight, so suppressing
+    the flush's failure there suppressed it on the success path too: a stream
+    that drained cleanly and then failed to commit its trailing rows returned
+    normally and the sync reported a clean load over a corpus short by up to
+    ``BATCH_SIZE - 1`` rows, against a DCC cleared before the load.
+
+    Args:
+        task: Sync task whose ``progress`` is updated per batch.
+        label: Names this stream in progress and log lines.
+        rows: Async iterable of TSV row dicts.
+        transform: Row -> document callable; None means skip the row.
+        compression_counts: Mutated with each document's compression term.
+        annotation_type_counts: Mutated with each document's annotation type.
+        counts_by_phase: Mutated with this phase's committed row count, on
+            the failure path as well as the success path.
+        stale_filter: Selects the slice of ``files`` this phase owns, deleted
+            once replacement rows are in hand. See ``clear_stale_once``.
+    """
+    batch: list[dict] = []
+    count = 0
+    stale_cleared = False
+
+    async def clear_stale_once() -> None:
+        """Delete the slice this phase owns, once, before its first write.
+
+        Deferred to the first batch rather than run before the stream opens.
+        The known ENCODE failures -- a 504 while the portal assembles the
+        response, an exhausted download budget -- strike before any row
+        arrives, and clearing up front would delete the slice and then have
+        nothing to put back, serving an empty one until the next successful
+        sync. Deferring means the previous rows keep being served instead.
+        A stream that dies *mid*-load still leaves a partial slice; only a
+        shadow-and-swap would fix that.
+        """
+        nonlocal stale_cleared
+        if stale_cleared:
+            return
+        stale_cleared = True
+        deleted = await api.db.files.delete_many(
+            {"submission": "encode", **stale_filter}
+        )
+        logger.info(
+            "ENCODE %s: cleared %d stale files", label, deleted.deleted_count
+        )
+
+    async def commit(pending: list[dict]) -> None:
+        """Send one batch, discounting it from the tally if it does not land."""
+        nonlocal count
+        await clear_stale_once()
+        try:
+            await api.db.files.insert_many(pending)
+        except Exception:
+            count -= len(pending)
+            raise
+
+    try:
+        # ``aclosing`` because the caller isolates phase failures with a
+        # broad ``except``, which abandons this generator mid-iteration.
+        # The stream owns an aiohttp session inside its own ``async with``,
+        # released only when the generator is finalized -- left to the
+        # garbage collector that is neither prompt nor guaranteed in a
+        # long-lived API process, and the annotation fan-out turned one
+        # stream per sync into N+1.
+        async with aclosing(rows):
+            async for row in rows:
+                doc = transform(row)
+                if doc is None:
+                    continue
+
+                compression_counts[doc.get("compression_format")] += 1
+                annotation_type = (
+                    doc.get("extra", {}).get("encode", {}).get("annotation_type")
+                )
+                if annotation_type:
+                    annotation_type_counts[annotation_type] += 1
+
+                batch.append(doc)
+                count += 1
+
+                # Insert in batches. The buffer is detached *before* the
+                # await rather than cleared after it, so an insert that
+                # raises leaves nothing behind for the flush below to submit
+                # a second time. Re-submitting is not harmless: the driver
+                # stamps ``_id`` in place on these dicts before sending, so
+                # a retry collides on the committed prefix and silently
+                # drops the batch's uncommitted suffix.
+                if len(batch) >= BATCH_SIZE:
+                    pending, batch = batch, []
+                    await commit(pending)
+                    task.progress = f"Inserted {count} ENCODE {label} files..."
+                    logger.info(task.progress)
+
+        # The stream drained without error, so its result is authoritative
+        # even when it is empty: clear here too, or a type ENCODE stopped
+        # publishing would keep serving last sync's rows indefinitely.
+        await clear_stale_once()
+
+        # The clean-path flush: inside the ``try``, so a sink failure with no
+        # exception in flight fails the phase rather than being swallowed.
+        if batch:
+            pending, batch = batch, []
+            await commit(pending)
+    except asyncio.CancelledError:
+        # Never write on the way out of a cancellation. The decision to stop
+        # has already been made, and the flush below could not protect the
+        # unwind anyway: its ``except Exception`` does not catch a
+        # re-delivered CancelledError, which would replace the original and
+        # skip the ``counts_by_phase`` record.
+        count -= len(batch)
+        batch.clear()
+        raise
+    finally:
+        # Only reachable with rows still buffered when the stream itself died
+        # mid-flight -- the detach above guarantees they were never
+        # submitted. They are already counted in the tallies, and the DCC was
+        # cleared before the load, so discarding them would lose data for no
+        # gain.
+        if batch:
+            try:
+                await commit(batch)
+            except Exception:
+                # Never let the flush replace the exception that caused it.
+                logger.exception(
+                    "ENCODE %s: failed to commit the final %d-row batch",
+                    label,
+                    len(batch),
+                )
+        counts_by_phase[label] = count
+        logger.info(f"ENCODE {label} ingest complete: {count} files")
+
+
 async def _sync_encode(task: SyncTask) -> None:
     """
     Sync ENCODE data from REST API.
 
     Unlike C2M2 ZIP sources, ENCODE data is fetched from the REST API
     and pre-materialized directly into the files collection.
+
+    Runs one phase for released experiments plus one per configured
+    ``annotation_type``. Each phase is isolated: a phase that raises is
+    logged and recorded, and the remaining phases still run, so a transient
+    failure on one stream does not cost the corpus the others. The task is
+    still failed at the end if any phase failed -- the alternative would
+    report a clean sync over a partially loaded collection.
+
+    Isolation covers the destructive half too. Each phase owns a slice of
+    ``files`` and deletes only that slice, and only once it has rows to put
+    back, so a phase that fails before delivering any -- the shape a portal
+    504 or an exhausted download budget takes -- leaves its previous rows
+    being served rather than emptying them. A phase that dies partway
+    through still leaves its own slice partially loaded; nothing short of
+    loading into a shadow collection and swapping would change that.
     """
     from cfdb.services.encode import (
+        annotation_types_from_env,
         build_encode_dcc_record,
+        fetch_encode_annotation_metadata,
         fetch_encode_metadata,
+        metadata_budget_seconds,
+        transform_annotation_to_c2m2,
         transform_to_c2m2,
     )
 
@@ -1021,8 +1238,28 @@ async def _sync_encode(task: SyncTask) -> None:
     task.progress = "Clearing existing ENCODE data..."
     logger.info(task.progress)
 
+    count = 0
+    counts_by_phase: dict[str, int] = {}
+    failures: list[tuple[str, Exception]] = []
+    # Tally the derived compression terms. The derivation depends on the
+    # shape of ENCODE's download URLs, which nobody here controls, so a
+    # corpus-wide flip (an upstream column rename, a redirect stub) would
+    # otherwise be invisible behind an unchanged row count.
+    compression_counts: Counter[str | None] = Counter()
+    # Same reasoning for annotation_type, and seeded from the configured
+    # allowlist below so a type that returns nothing is reported as zero
+    # rather than simply missing from the log.
+    annotation_type_counts: Counter[str] = Counter()
+
     async with locks.CutoverLock("encode"):
-        await _clear_dcc_data_async("encode")
+        # ``files`` is deliberately not cleared here. One corpus-wide delete
+        # before a fan-out designed to survive a phase failure means a failed
+        # phase serves an absent slice rather than a stale one -- the
+        # experiment phase is the ~295k-file bulk and the likeliest to time
+        # out, and losing it leaves the API serving the ~29k annotation
+        # documents as the whole corpus. Each phase clears only what it is
+        # about to reload, immediately before reloading it.
+        await _clear_dcc_data_async("encode", skip_collections={"files"})
 
         # Step 2: Upsert DCC record
         task.current_step = "dcc_record"
@@ -1036,49 +1273,111 @@ async def _sync_encode(task: SyncTask) -> None:
             upsert=True,
         )
 
-        # Step 3: Fetch and transform files from ENCODE API
+        # Step 3: Fetch and transform files from ENCODE API. The experiment
+        # stream first, then one per configured annotation type.
         task.current_step = "fetching"
         task.progress = "Fetching files from ENCODE API..."
         logger.info(task.progress)
 
-        batch = []
-        count = 0
-        # Tally the derived compression terms. The derivation depends on the
-        # shape of ENCODE's download URLs, which nobody here controls, so a
-        # corpus-wide flip (an upstream column rename, a redirect stub) would
-        # otherwise be invisible behind an unchanged row count.
-        compression_counts: Counter[str | None] = Counter()
+        # One deadline for the whole fan-out, resolved here rather than per
+        # stream. Every phase runs inside the cutover lock held above, which
+        # gates the read surface, so a per-stream budget would multiply the
+        # outage by the number of phases and carry the worst case past the
+        # sync lock's one-hour stale threshold -- admitting a second sync
+        # that clears the corpus while this one is still writing to it. A
+        # phase that spends what is left fails as an ordinary TimeoutError,
+        # so the isolation below still applies and its rows are still
+        # committed; the phases after it fail immediately rather than
+        # opening a request they have no time to finish.
+        deadline = asyncio.get_running_loop().time() + metadata_budget_seconds()
 
-        async for encode_file in fetch_encode_metadata():
-            # Transform to C2M2 format
-            doc = transform_to_c2m2(encode_file)
-            if doc is None:
+        # Streams are built by a factory rather than constructed up front, so
+        # a phase that is never reached never opens a request. Each phase
+        # carries the filter selecting the slice of ``files`` it owns, so it
+        # replaces exactly what it reloads. The experiment slice is defined
+        # by absence: an annotation row published with a blank ``Annotation
+        # type`` produces no such key, so the experiment phase sweeps it and
+        # its own phase reinserts it -- it is lost only if that phase also
+        # fails.
+        phases = [
+            (
+                "experiment",
+                partial(fetch_encode_metadata, deadline=deadline),
+                transform_to_c2m2,
+                {"extra.encode.annotation_type": {"$exists": False}},
+            )
+        ]
+        for annotation_type in annotation_types_from_env():
+            # Seeded at zero so a configured type that returns nothing logs
+            # ": 0" rather than vanishing from the distribution. An absent
+            # key is what nobody notices; a zero is what everybody does.
+            annotation_type_counts[annotation_type] = 0
+            phases.append(
+                (
+                    f"annotation[{annotation_type}]",
+                    partial(
+                        fetch_encode_annotation_metadata,
+                        annotation_type,
+                        deadline=deadline,
+                    ),
+                    transform_annotation_to_c2m2,
+                    {"extra.encode.annotation_type": annotation_type},
+                )
+            )
+
+        for label, open_stream, transform, stale_filter in phases:
+            try:
+                await _ingest_encode_rows(
+                    task,
+                    label,
+                    open_stream(),
+                    transform,
+                    compression_counts,
+                    annotation_type_counts,
+                    counts_by_phase,
+                    stale_filter,
+                )
+            except Exception as exc:
+                # Deliberately broad: the point is that no failure mode of
+                # one stream -- timeout, HTTP error, malformed TSV -- may
+                # stop the others from being attempted. Narrower than
+                # BaseException on purpose, so a CancelledError still
+                # cancels the sync rather than being logged as a phase
+                # failure and followed by N more phases.
+                logger.exception(
+                    "ENCODE %s ingest failed; continuing with the remaining "
+                    "phases",
+                    label,
+                )
+                failures.append((label, exc))
                 continue
 
-            compression_counts[doc.get("compression_format")] += 1
-            batch.append(doc)
-            count += 1
-
-            # Insert in batches
-            if len(batch) >= BATCH_SIZE:
-                await api.db.files.insert_many(batch)
-                task.progress = f"Inserted {count} ENCODE files..."
-                logger.info(task.progress)
-                batch.clear()
-
-        # Insert remaining batch
-        if batch:
-            await api.db.files.insert_many(batch)
-            logger.info(f"Inserted final batch, total: {count} ENCODE files")
+        # Summed from the accumulator rather than tracked alongside it, so
+        # a phase that failed after committing rows still contributes what
+        # it actually loaded.
+        count = sum(counts_by_phase.values())
 
     # ENCODE writes straight into the materialized collection and never runs
     # the materializer, which is the only other creator of files indexes. On
     # a database where ENCODE is the only DCC synced, that leaves files with
-    # no indexes at all and makes every accession lookup a full scan.
+    # no indexes at all and makes every accession lookup a full scan. Run
+    # unconditionally: whatever a partially failed sync did load still has to
+    # be servable without a full collection scan.
     await ensure_indexes(api.db, materialized_files_index_specs())
 
-    task.progress = f"ENCODE sync complete: {count} files"
+    if failures:
+        # counts_by_phase carries an entry for every phase that started,
+        # failed ones included -- they may have committed rows before
+        # dying -- so the succeeded tally comes from the phase list, not
+        # from the accumulator's length.
+        task.progress = (
+            f"ENCODE sync incomplete: {count} files from "
+            f"{len(phases) - len(failures)} of {len(phases)} phases"
+        )
+    else:
+        task.progress = f"ENCODE sync complete: {count} files"
     logger.info(task.progress)
+    logger.info("ENCODE files inserted per phase: %s", counts_by_phase)
     logger.info(
         "ENCODE compression_format distribution: %s",
         {
@@ -1086,6 +1385,17 @@ async def _sync_encode(task: SyncTask) -> None:
             for term, tally in compression_counts.most_common()
         },
     )
+    logger.info(
+        "ENCODE annotation_type distribution: %s", dict(annotation_type_counts)
+    )
+
+    if failures:
+        failed_labels = ", ".join(label for label, _ in failures)
+        raise RuntimeError(
+            f"ENCODE sync completed with {len(failures)} failed phase(s) "
+            f"({failed_labels}); {count} files were loaded from the phases "
+            "that succeeded"
+        ) from failures[0][1]
 
 
 async def _materialize_files(submission: str) -> None:
@@ -1119,14 +1429,26 @@ async def _materialize_files(submission: str) -> None:
         raise
 
 
-async def _clear_dcc_data_async(submission: str) -> None:
-    """Clear DCC data using async Motor client."""
+async def _clear_dcc_data_async(
+    submission: str, skip_collections: set[str] | None = None
+) -> None:
+    """Clear DCC data using async Motor client.
+
+    Args:
+        submission: DCC whose documents are removed.
+        skip_collections: Collections left untouched. The ENCODE sync passes
+            ``files`` here because it clears that collection one phase-slice
+            at a time instead; see :func:`_sync_encode`.
+    """
     if api.db is None:
         raise RuntimeError("Database not initialized")
 
     collection_names = await api.db.list_collection_names()
+    skip = skip_collections or set()
 
     for collection_name in collection_names:
+        if collection_name in skip:
+            continue
         try:
             result = await api.db[collection_name].delete_many(
                 {"submission": submission}

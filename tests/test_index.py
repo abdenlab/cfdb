@@ -10,10 +10,12 @@ from wool.runtime.routine.task import do_dispatch
 from cfdb import api
 from cfdb.api.routers.index import stream_index_file, stream_index_file_status
 from cfdb.services import drs, locks
+from cfdb.services.ontology_mappings import get_file_format
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.bam import BamIndexProcessor
 from cfdb.workflows.processors.registry import ProcessorRegistry, default_registry
+from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 from tests.test_workflows import FIXTURE_MD5
 
 
@@ -840,6 +842,65 @@ class TestStreamIndexFileWorkflowPaths:
         with pytest.raises(HTTPException) as exc_info:
             await stream_index_file("4dn", "4DNFIBED01", _make_request(), range=None)
         assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("format_name", ["bedpe", "bigInteract"])
+    async def test_stream_index_file_should_not_index_a_paired_interval_format(
+        self, mock_db, mocker, tmp_path, format_name
+    ):
+        """Test a paired-interval file is refused rather than mis-indexed.
+
+        Both formats pair two loci per record. While they were aliased to
+        BED and bigBed the tabix pipeline claimed them and indexed the
+        first locus alone, committing an artifact that looked successful
+        and was wrong. Now that each carries its own format name, the
+        wired registry should claim neither -- so the request fails
+        cleanly instead.
+
+        Given:
+            A file in a paired-interval format, no sidecar, and the
+            workflow subsystem wired with the processors the API
+            registers.
+        When:
+            stream_index_file is called.
+        Then:
+            It should raise HTTPException(404) rather than dispatching a
+            workflow.
+        """
+        # Arrange
+        from cfdb.workflows.cache import LocalFsCache
+
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        # The minted term is injected rather than produced: get_file_format
+        # has one consumer, the ENCODE transform, so the 4DN ingest cannot
+        # mint it and a real 4DN .bedpe still arrives declaring BED. This
+        # pins registry routing, which keys on the format name irrespective
+        # of DCC -- not that 4DN paired-interval files are safe today. See
+        # the paired-interval section of ENCODE-SUPPLEMENT.md.
+        doc = _make_file_doc(file_format=get_file_format(format_name))
+        doc.pop("extra", None)
+        mock_db.files.docs = []
+        mock_db.file.docs = [doc]
+        registry = default_registry()
+        registry.register(BamIndexProcessor())
+        registry.register(TabixIntervalProcessor())
+        mocker.patch.object(api, "cache", LocalFsCache(tmp_path / "cache"))
+        mocker.patch.object(api, "processor_registry", registry)
+        executor = WoolExecutor(
+            mock_db,
+            api.cache,
+            api.processor_registry,
+            workdir_root=tmp_path / "jobs",
+        )
+        mocker.patch.object(api, "executor", executor)
+        ensure = mocker.spy(executor, "ensure_workflow")
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file("4dn", "4DNFIBED01", _make_request(), range=None)
+
+        assert exc_info.value.status_code == 404
+        assert ensure.call_count == 0
 
     @pytest.mark.asyncio
     async def test_stream_index_file_should_return_503_when_subsystem_disabled(

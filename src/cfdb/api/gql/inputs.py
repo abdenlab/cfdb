@@ -70,6 +70,9 @@ class SubjectInput:
 @strawberry.input
 class EnrichedEncodeBiosampleInput:
     biosample_type: list[str] | None = None
+    life_stage: list[str] | None = None
+    age: list[str] | None = None
+    age_units: list[str] | None = None
     biosample_treatments: list[str] | None = None
     biosample_treatments_amount: list[str] | None = None
     biosample_treatments_duration: list[str] | None = None
@@ -134,6 +137,9 @@ class EnrichedEncodeCollectionInput:
     platform: list[str] | None = None
     dbxrefs: list[str] | None = None
     rbns_protein_concentration: list[str] | None = None
+    annotation_type: list[str] | None = None
+    software_used: list[str] | None = None
+    encyclopedia_version: list[str] | None = None
 
 
 @strawberry.input
@@ -216,6 +222,8 @@ class EnrichedFourdnFileInput:
 @strawberry.input
 class EnrichedEncodeFileInput:
     assembly: list[str] | None = None
+    annotation_type: list[str] | None = None
+    organism: list[str] | None = None
     file_format_type: list[str] | None = None
     output_type: list[str] | None = None
     genome_annotation: list[str] | None = None

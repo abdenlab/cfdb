@@ -12,8 +12,10 @@ from wool.runtime.routine.task import do_dispatch
 from cfdb import api
 from cfdb.api.routers.data import stream_file, stream_file_status
 from cfdb.services import drs, locks
+from cfdb.services.ontology_mappings import get_file_format
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.processors.bam import BamIndexProcessor
+from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 from tests.test_workflows import FIXTURE_MD5
 from cfdb.workflows.processors.registry import ProcessorRegistry, default_registry
 
@@ -590,6 +592,92 @@ class TestStreamFileWorkflowPath:
             "passthrough must reach the direct DRS streaming path, "
             "not the workflow dispatch path"
         )
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("format_name", ["bedpe", "bigInteract"])
+    async def test_stream_file_should_serve_a_paired_interval_format_unprocessed(
+        self, mock_db, mocker, format_name
+    ):
+        """Test a paired-interval file reaches the direct streaming path.
+
+        While these formats were aliased to BED and bigBed the tabix
+        pipeline claimed them and committed an index built from the first
+        locus of each record. Now that each carries its own format name no
+        processor claims it, so the request must fall through to the
+        upstream file rather than dispatch a workflow that would produce
+        the wrong artifact.
+
+        Given:
+            A file in a paired-interval format and a wired workflow
+            subsystem carrying the processors the API registers.
+        When:
+            stream_file is called.
+        Then:
+            It should reach the direct DRS streaming path rather than
+            returning a 202 workflow dispatch.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        registry = default_registry()
+        registry.register(BamIndexProcessor())
+        registry.register(TabixIntervalProcessor())
+        mocker.patch.object(api, "processor_registry", registry)
+
+        class _Cache:
+            async def head(self, _k):
+                raise AssertionError("an unclaimed format must not consult cache")
+
+            def get(self, *_a, **_kw):
+                raise AssertionError
+
+            async def put(self, *_a, **_kw):
+                raise AssertionError
+
+            async def delete(self, _k):
+                return False
+
+        mocker.patch.object(api, "cache", _Cache())
+        mocker.patch.object(api, "executor", object())
+
+        mock_db.dcc.docs = [
+            {
+                "dcc_abbreviation": "4DN_DCIC",
+                "project_id_namespace": "tag:4dn.org,2015:",
+            }
+        ]
+        # The minted term is injected rather than produced: get_file_format
+        # has one consumer, the ENCODE transform, so the 4DN ingest cannot
+        # mint it and a real 4DN .bedpe still arrives declaring BED. This
+        # pins registry routing, which keys on the format name irrespective
+        # of DCC -- not that 4DN paired-interval files are safe today. See
+        # the paired-interval section of ENCODE-SUPPLEMENT.md.
+        mock_db.file.docs = [
+            {
+                "submission": "4dn",
+                "id_namespace": "tag:4dn.org,2015:",
+                "local_id": "4DNFIPAIR01",
+                "filename": "x.bedpe.gz",
+                "md5": FIXTURE_MD5,
+                "access_url": "drs://4dn/abc",
+                "file_format": get_file_format(format_name),
+            }
+        ]
+
+        drs_calls: list = []
+
+        async def fake_drs(*args, **kwargs):
+            drs_calls.append((args, kwargs))
+            raise Exception("DRS unavailable")
+
+        mocker.patch.object(drs, "fetch_drs_object", side_effect=fake_drs)
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_file("4dn", "4DNFIPAIR01", _make_request(), range=None)
+
+        assert exc_info.value.status_code != 202
+        assert len(drs_calls) == 1
 
 
 class TestStreamFileStatus:

@@ -656,6 +656,37 @@ def test_materialized_files_index_specs_should_not_overlap_the_data_specs():
     assert {s.collection for s in materialized_files_index_specs()} == {"files"}
 
 
+def test_materialized_files_index_specs_should_declare_exactly_these_keys():
+    """Test the spec list stays a deliberate enumeration.
+
+    The per-concern tests below assert subsets, which reads well but lets an
+    unintended spec merge unnoticed -- and this list is applied with
+    ``createIndex`` against a public collection on every ENCODE sync, so an
+    accidental index is a build cost and a write cost that nothing else
+    would flag. ``test_all_index_specs_should_not_repeat_a_collection_and_name``
+    catches only duplicate names, not extra distinct ones.
+
+    Given:
+        The materialized files index specs.
+    When:
+        Their key tuples are collected.
+    Then:
+        They should be exactly the declared set, with no additions.
+    """
+    # Act
+    keys = {spec.keys for spec in materialized_files_index_specs()}
+
+    # Assert
+    assert keys == {
+        (("accession_id", 1),),
+        (("collections.accession_id", 1),),
+        (("extra.encode.annotation_type", 1),),
+        (("extra.encode.organism", 1),),
+        (("extra.encode.assembly", 1),),
+        (("genome_assembly", 1),),
+    }
+
+
 def test_materialized_files_index_specs_should_cover_both_accession_paths():
     """Test that both queryable accession paths are indexed.
 
@@ -674,7 +705,60 @@ def test_materialized_files_index_specs_should_cover_both_accession_paths():
     keys = {spec.keys for spec in materialized_files_index_specs()}
 
     # Assert
-    assert keys == {(("accession_id", 1),), (("collections.accession_id", 1),)}
+    assert {
+        (("accession_id", 1),),
+        (("collections.accession_id", 1),),
+    } <= keys
+
+
+def test_materialized_files_index_specs_should_cover_the_annotation_facets():
+    """Test that the ENCODE annotation filters are indexed.
+
+    ``annotation_type`` is the field the whole annotation corpus is meant
+    to be reached through, and ``files`` is written directly by the ENCODE
+    sync, so nothing else would create these. Unindexed, each is a full
+    scan of the collection on an unauthenticated endpoint.
+
+    Given:
+        The materialized files index specs.
+    When:
+        Their key tuples are collected.
+    Then:
+        They should cover the annotation type, organism and assembly paths
+        that ``to_query`` emits for an ``extra.encode`` filter.
+    """
+    # Act
+    keys = {spec.keys for spec in materialized_files_index_specs()}
+
+    # Assert
+    assert {
+        (("extra.encode.annotation_type", 1),),
+        (("extra.encode.organism", 1),),
+        (("extra.encode.assembly", 1),),
+    } <= keys
+
+
+def test_materialized_files_index_specs_should_cover_the_core_assembly_field():
+    """Test the documented assembly filter is indexed, not just its mirror.
+
+    ``genome_assembly`` is the field the schema publishes and the one a
+    client narrowing to GRCh38 filters on; ``extra.encode.assembly`` is the
+    DCC mirror. The materializer indexes the core field, but an ENCODE-only
+    database never runs the materializer, so without this the documented
+    filter is the one left scanning.
+
+    Given:
+        The materialized files index specs.
+    When:
+        Their key tuples are collected.
+    Then:
+        They should cover the core ``genome_assembly`` path.
+    """
+    # Act
+    keys = {spec.keys for spec in materialized_files_index_specs()}
+
+    # Assert
+    assert (("genome_assembly", 1),) in keys
 
 
 def test_all_index_specs_should_not_repeat_a_collection_and_name():

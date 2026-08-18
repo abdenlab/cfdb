@@ -185,6 +185,21 @@ def cache_key(
         row for the new key) but does NOT invalidate cached artifacts.
         To force fresh cache entries for a single processor's outputs,
         bump that processor's ``processor_version`` instead.
+
+    Warning:
+        The key identifies the processor only by ``processor_version``, not
+        by which processor it is. Two processors that claim the same
+        ``(file, artifact_kind)`` pair at equal ``processor_version`` derive
+        the *same* key and would read back each other's artifacts as cache
+        hits -- a wrong answer rather than a miss. This holds today only
+        because each pair is claimed by at most one processor, which is a
+        property of the current registry and not of this function. Fold a
+        processor identity (class name, or a registry-assigned id) into the
+        key before landing a second processor for any pair. The paired
+        interval formats make this concrete: ``.bedpe`` and ``bigInteract``
+        files carry ``index`` artifacts built by ``TabixIntervalProcessor``
+        before they were re-typed, so a future paired-interval processor is
+        exactly the case that would collide.
     """
     if processor_version < 0:
         raise ValueError("processor_version must be non-negative")

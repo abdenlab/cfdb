@@ -6,7 +6,10 @@ import asyncio
 import logging
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
+from cfdb import api
 from cfdb.services import encode as encode_module
 from cfdb.services import fourdn as fourdn_module
 from cfdb.services import sync as sync_module
@@ -24,6 +27,33 @@ from cfdb.services.sync import (
     _sync_encode,
 )
 from cfdb.indexes import data_index_specs
+from tests.conftest import FakeDB
+
+
+class _EncodeSyncTestBase:
+    """Base for the classes that drive ``_sync_encode``.
+
+    ``_sync_encode`` fans out over ``annotation_types_from_env()``, whose
+    default allowlist is non-empty, so a test that mocks only the experiment
+    fetch would reach the real ENCODE portal once per annotation type and
+    stream tens of thousands of live rows into its assertions. The autouse
+    fixture below turns the annotation phases off by default.
+
+    Scoped to these classes rather than the module: nothing in the 4DN or
+    HuBMAP tests reads the variable, and a module-wide autouse fixture that
+    silently governs a network boundary is worth keeping close to the tests
+    that depend on it.
+
+    To opt back in, either set ``ENCODE_ANNOTATION_TYPES`` to the types
+    under test or ``monkeypatch.delenv`` it to exercise the default
+    allowlist -- the fixture is function-scoped, so a test's own
+    monkeypatching wins.
+    """
+
+    @pytest.fixture(autouse=True)
+    def no_annotation_phases(self, monkeypatch):
+        """Turn the annotation phases off unless a test asks for them."""
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "")
 
 
 def _encode_metadata_row(accession: str, filename: str) -> dict:
@@ -37,10 +67,63 @@ def _encode_metadata_row(accession: str, filename: str) -> dict:
     }
 
 
+def _encode_annotation_row(accession: str, dataset: str, filename: str) -> dict:
+    """Return a minimal ENCODE annotation TSV row, using annotation column names."""
+    return {
+        "File accession": accession,
+        "File format": "bed",
+        "Dataset accession": dataset,
+        "Annotation type": "candidate Cis-Regulatory Elements",
+        "Assembly": "GRCh38",
+        "Organism": "Homo sapiens",
+        "File download URL": (
+            f"https://www.encodeproject.org/files/{accession}/@@download/{filename}"
+        ),
+    }
+
+
 async def _async_iter(rows):
     """Yield the given rows, standing in for the streaming metadata fetch."""
     for row in rows:
         yield row
+
+
+async def _async_raise(exc):
+    """Stand in for a metadata stream that fails before yielding anything."""
+    raise exc
+    yield  # pragma: no cover - unreachable, marks this an async generator
+
+
+async def _async_iter_then_raise(rows, exc):
+    """Stand in for a stream that dies partway through.
+
+    The production failure shape: the metadata fetch's timeout bounds the
+    whole streamed body, so it fires with rows already delivered and
+    inserted, not before the first one.
+    """
+    for row in rows:
+        yield row
+    raise exc
+
+
+def _fail_insert_on_call(collection, failing_call: int, exc: Exception) -> None:
+    """Make one of a fake collection's insert_many calls raise.
+
+    Fails the *sink* rather than the stream, which is the half of the ingest
+    the stream helpers above cannot reach. Keyed by call ordinal so a test can
+    choose a batch boundary without inspecting the rows.
+    """
+    real = collection.insert_many
+    calls = 0
+
+    async def insert_many(docs):
+        nonlocal calls
+        calls += 1
+        if calls == failing_call:
+            raise exc
+        return await real(docs)
+
+    collection.insert_many = insert_many
 
 
 class TestSyncDccsDataIndexing:
@@ -100,6 +183,199 @@ class TestSyncDccsDataIndexing:
 
         # Assert
         ensure_mock.assert_not_awaited()
+
+
+class TestSyncDccsFailureIsolation:
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_sync_the_remaining_dccs_when_one_fails(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test one DCC's failure does not cost the others their sync.
+
+        get_all_dcc_names sorts, so ENCODE is attempted before HuBMAP on a
+        whole-corpus sync. Letting the failure escape the loop meant one
+        failed ENCODE phase -- three network streams by default, against a
+        portal that 504s on slow requests -- skipped HuBMAP entirely.
+
+        Given:
+            A three-DCC sync whose first DCC raises.
+        When:
+            _sync_dccs runs.
+        Then:
+            It should still attempt both remaining DCCs before failing.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=RuntimeError("encode died")),
+        )
+        zip_sync = mocker.patch.object(
+            sync_module, "_sync_c2m2_zip", mocker.AsyncMock()
+        )
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "4dn", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="encode"):
+            await _sync_dccs(task)
+
+        assert zip_sync.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_ensure_data_indexes_when_a_dcc_failed(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test a partial run still leaves what loaded queryable.
+
+        The index build sat after the loop, so the first failure skipped it
+        and left the DCCs that did load answering every query by collection
+        scan.
+
+        Given:
+            A two-DCC sync whose first DCC raises.
+        When:
+            _sync_dccs runs.
+        Then:
+            It should still ensure the data indexes once.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=RuntimeError("encode died")),
+        )
+        mocker.patch.object(sync_module, "_sync_c2m2_zip", mocker.AsyncMock())
+        ensure_mock = mocker.patch.object(
+            sync_module, "ensure_indexes", mocker.AsyncMock()
+        )
+        mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_dccs(task)
+
+        ensure_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_not_report_a_failed_dcc_as_synced(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test the per-DCC success reporting skips the DCC that failed.
+
+        Given:
+            A two-DCC sync whose first DCC raises.
+        When:
+            _sync_dccs runs.
+        Then:
+            Only the DCC that succeeded should be logged as synced and have
+            its accession coverage reported.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=RuntimeError("encode died")),
+        )
+        mocker.patch.object(sync_module, "_sync_c2m2_zip", mocker.AsyncMock())
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        coverage = mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_dccs(task)
+
+        assert [call.args[0] for call in coverage.await_args_list] == ["hubmap"]
+        assert task.progress == "Sync incomplete: 1 of 2 DCCs synced"
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_chain_the_first_dcc_failure_as_the_cause(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test the raised error keeps the first failure's traceback.
+
+        Given:
+            A two-DCC sync where both DCCs raise distinguishable errors.
+        When:
+            _sync_dccs runs.
+        Then:
+            The error's cause should be the first failure's exception.
+        """
+        # Arrange
+        first = RuntimeError("encode died")
+        second = RuntimeError("hubmap died")
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module, "_sync_encode", mocker.AsyncMock(side_effect=first)
+        )
+        mocker.patch.object(
+            sync_module, "_sync_c2m2_zip", mocker.AsyncMock(side_effect=second)
+        )
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        mocker.patch.object(
+            sync_module, "_log_accession_coverage", mocker.AsyncMock()
+        )
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError) as excinfo:
+            await _sync_dccs(task)
+
+        assert excinfo.value.__cause__ is first
+
+    @pytest.mark.asyncio
+    async def test__sync_dccs_should_propagate_a_cancellation(
+        self, mocker, mock_db, tmp_path
+    ):
+        """Test cancellation cancels the run rather than failing one DCC.
+
+        The per-DCC handler is deliberately broad, and a CancelledError
+        caught by it would be recorded as a DCC failure and followed by
+        every remaining DCC -- the opposite of cancelling.
+
+        Given:
+            A two-DCC sync whose first DCC raises CancelledError.
+        When:
+            _sync_dccs runs.
+        Then:
+            The CancelledError should propagate and the second DCC should
+            never run.
+        """
+        # Arrange
+        mocker.patch.object(sync_module, "DATA_DIR", str(tmp_path))
+        mocker.patch.object(sync_module, "get_dcc_type", return_value="rest_api")
+        mocker.patch.object(
+            sync_module,
+            "_sync_encode",
+            mocker.AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        zip_sync = mocker.patch.object(
+            sync_module, "_sync_c2m2_zip", mocker.AsyncMock()
+        )
+        mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
+        task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await _sync_dccs(task)
+
+        zip_sync.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +668,7 @@ class TestLoadDatasetAsync:
 # ---------------------------------------------------------------------------
 
 
-class TestSyncEncode:
+class TestSyncEncode(_EncodeSyncTestBase):
     @pytest.mark.asyncio
     async def test__sync_encode_should_populate_accession_id_on_inserted_docs(
         self, mock_db, mocker
@@ -417,7 +693,7 @@ class TestSyncEncode:
         row["Experiment accession"] = "encsr918zsj"
         row["Biosample term name"] = "K562"
         mocker.patch.object(
-            encode_module, "fetch_encode_metadata", lambda: _async_iter([row])
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([row])
         )
 
         # Act
@@ -451,7 +727,7 @@ class TestSyncEncode:
             _encode_metadata_row("ENCFF003CCC", "ENCFF003CCC.bed.starch"),
         ]
         mocker.patch.object(
-            encode_module, "fetch_encode_metadata", lambda: _async_iter(rows)
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
         )
 
         # Act
@@ -491,7 +767,7 @@ class TestSyncEncode:
             _encode_metadata_row("ENCFF003CCC", "ENCFF003CCC.bed.starch"),
         ]
         mocker.patch.object(
-            encode_module, "fetch_encode_metadata", lambda: _async_iter(rows)
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
         )
 
         # Act
@@ -536,7 +812,7 @@ class TestSyncEncode:
         mocker.patch.object(
             encode_module,
             "fetch_encode_metadata",
-            lambda: _async_iter([_encode_metadata_row("ENCFF001AAA", "x.bed.gz")]),
+            lambda deadline=None: _async_iter([_encode_metadata_row("ENCFF001AAA", "x.bed.gz")]),
         )
 
         # Act
@@ -545,6 +821,1127 @@ class TestSyncEncode:
         # Assert
         survivors = [d for d in mock_db.files.docs if d["submission"] != "encode"]
         assert survivors == others
+
+
+class TestSyncEncodeAnnotationPhases(_EncodeSyncTestBase):
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_ingest_annotations_alongside_experiments(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test that both metadata streams reach the files collection.
+
+        Given:
+            One configured annotation type, plus an experiment stream and an
+            annotation stream each yielding one row.
+        When:
+            _sync_encode runs.
+        Then:
+            Both documents should be inserted, and the annotation one should
+            carry the annotation_type that makes it findable.
+        """
+        # Arrange
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES", "candidate Cis-Regulatory Elements"
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter([_encode_metadata_row("ENCFF001AAA", "x.bed.gz")]),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        by_id = {d["local_id"]: d for d in mock_db.files.docs}
+        assert set(by_id) == {"ENCFF001AAA", "ENCFF002BBB"}
+        annotation = by_id["ENCFF002BBB"]
+        assert (
+            annotation["extra"]["encode"]["annotation_type"]
+            == "candidate Cis-Regulatory Elements"
+        )
+        assert annotation["collections"][0]["accession_id"] == "ENCSR001AAA"
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_request_only_the_configured_types(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test that the allowlist bounds which annotation types are fetched.
+
+        Given:
+            Two annotation types configured out of the far larger space
+            ENCODE publishes.
+        When:
+            _sync_encode runs.
+        Then:
+            The annotation fetch should be called once per configured type
+            and with no other type.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "chromatin state, footprints")
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([])
+        )
+        fetch_annotations = mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter([]),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        requested = [call.args[0] for call in fetch_annotations.call_args_list]
+        assert requested == ["chromatin state", "footprints"]
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_ingest_annotations_when_experiments_fail(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test that a failed experiment stream does not cost the annotations.
+
+        Given:
+            An experiment stream that raises, and a healthy annotation
+            stream.
+        When:
+            _sync_encode runs.
+        Then:
+            The annotation document should still be inserted, and the sync
+            should fail afterwards naming the phase that broke.
+        """
+        # Arrange
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES", "candidate Cis-Regulatory Elements"
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_raise(RuntimeError("experiment stream died")),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="experiment"):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert [d["local_id"] for d in mock_db.files.docs] == ["ENCFF002BBB"]
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_ingest_experiments_when_an_annotation_fails(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test that one failed annotation type does not cost the others.
+
+        Given:
+            Two configured annotation types where the first stream raises,
+            alongside a healthy experiment stream.
+        When:
+            _sync_encode runs.
+        Then:
+            The experiment document and the surviving annotation type's
+            document should both be inserted.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "broken, healthy")
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter([_encode_metadata_row("ENCFF001AAA", "x.bed.gz")]),
+        )
+
+        def _annotation_stream(annotation_type, deadline=None):
+            if annotation_type == "broken":
+                return _async_raise(RuntimeError("annotation stream died"))
+            return _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            )
+
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=_annotation_stream,
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="annotation\\[broken\\]"):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert {d["local_id"] for d in mock_db.files.docs} == {
+            "ENCFF001AAA",
+            "ENCFF002BBB",
+        }
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_ensure_the_indexes_when_a_phase_failed(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test that a partial load is still left queryable.
+
+        Given:
+            An experiment stream that raises and a healthy annotation
+            stream, so the sync ends in failure with rows loaded.
+        When:
+            _sync_encode runs.
+        Then:
+            The accession indexes should still be ensured, so what did load
+            is not left behind a full collection scan.
+        """
+        # Arrange
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES", "candidate Cis-Regulatory Elements"
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_raise(RuntimeError("experiment stream died")),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+        ensure = mocker.patch.object(
+            sync_module, "ensure_indexes", mocker.AsyncMock(return_value=0)
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert ensure.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_report_the_rows_a_failed_phase_committed(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test the reported total matches what is actually in the database.
+
+        A stream bounded by a wall-clock budget fails mid-flight, with rows
+        already committed. Reporting a phase's contribution only on its
+        clean return dropped every one of those rows from the total while
+        leaving them in the collection, so the sync under-reported the
+        corpus it had just written.
+
+        Given:
+            A batch size of 2 and an experiment stream that yields 5 rows
+            and then dies, alongside a healthy annotation phase.
+        When:
+            _sync_encode runs.
+        Then:
+            The count in the final progress should equal the ENCODE
+            documents actually present.
+        """
+        # Arrange
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES", "candidate Cis-Regulatory Elements"
+        )
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", 2)
+        rows = [
+            _encode_metadata_row(f"ENCFF00{i}AAA", f"f{i}.bed.gz") for i in range(5)
+        ]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter_then_raise(rows, TimeoutError("budget exhausted")),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF999ZZZ", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(task)
+
+        inserted = [d for d in mock_db.files.docs if d["submission"] == "encode"]
+        # Anchored rather than a substring: "6 files" is contained in
+        # "16 files", so containment passes on an order-of-magnitude error.
+        assert task.progress.startswith(
+            f"ENCODE sync incomplete: {len(inserted)} files"
+        )
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_commit_the_partial_batch_of_a_failed_phase(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test rows transformed before a stream died are not thrown away.
+
+        The DCC is cleared before the load, so a row discarded here is a
+        row the corpus loses outright until the next full re-sync.
+
+        Given:
+            A batch size of 2 and a stream that yields 5 rows and then
+            dies, leaving one row in an uncommitted partial batch.
+        When:
+            _sync_encode runs.
+        Then:
+            All 5 rows should be committed, not just the two full batches.
+        """
+        # Arrange
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", 2)
+        rows = [
+            _encode_metadata_row(f"ENCFF00{i}AAA", f"f{i}.bed.gz") for i in range(5)
+        ]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter_then_raise(rows, TimeoutError("budget exhausted")),
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert len(mock_db.files.docs) == 5
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_fail_when_the_trailing_batch_fails_to_commit(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test a sink failure on a cleanly drained stream fails the sync.
+
+        The flush of the trailing partial batch used to sit in a ``finally``
+        that suppressed its own failure. A ``finally`` also runs when nothing
+        is propagating, so this reported a clean sync over a corpus short by
+        the trailing batch -- against a DCC cleared before the load.
+
+        Given:
+            A batch size of 2 and a stream of 3 rows that drains cleanly,
+            whose trailing one-row batch fails to insert.
+        When:
+            _sync_encode runs.
+        Then:
+            It should raise and report only the two rows that committed.
+        """
+        # Arrange
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", 2)
+        rows = [
+            _encode_metadata_row(f"ENCFF00{i}AAA", f"f{i}.bed.gz") for i in range(3)
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
+        )
+        _fail_insert_on_call(mock_db.files, 2, RuntimeError("mongo failover"))
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(task)
+
+        assert len(mock_db.files.docs) == 2
+        assert task.progress.startswith("ENCODE sync incomplete: 2 files")
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_not_resubmit_a_batch_the_sink_rejected(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test a batch that failed to insert is not sent a second time.
+
+        The buffer used to be cleared only after a successful insert, so a
+        failed one left the same list for the trailing flush to submit again.
+
+        Given:
+            A batch size of 2 and a stream of 4 rows whose first batch fails
+            to insert.
+        When:
+            _sync_encode runs.
+        Then:
+            The rejected batch should never reach the collection, and the
+            reported count should exclude it.
+        """
+        # Arrange
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", 2)
+        rows = [
+            _encode_metadata_row(f"ENCFF00{i}AAA", f"f{i}.bed.gz") for i in range(4)
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
+        )
+        _fail_insert_on_call(mock_db.files, 1, RuntimeError("mongo failover"))
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(task)
+
+        assert mock_db.files.docs == []
+        assert task.progress.startswith("ENCODE sync incomplete: 0 files")
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_give_every_phase_the_same_deadline(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test the download budget bounds the sync rather than each stream.
+
+        Every phase runs inside the one cutover lock that gates the read
+        surface, so a per-stream budget would multiply the outage by the
+        phase count and carry the worst case past the sync lock's one-hour
+        stale threshold -- at which point a second sync is admitted and
+        clears the corpus while this one is still writing to it.
+
+        Given:
+            Two configured annotation types, so three phases run.
+        When:
+            _sync_encode runs.
+        Then:
+            Every phase should be handed one and the same deadline.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "alpha,beta")
+        deadlines = []
+
+        def _experiment_stream(deadline=None):
+            deadlines.append(deadline)
+            return _async_iter([])
+
+        def _annotation_stream(annotation_type, deadline=None):
+            deadlines.append(deadline)
+            return _async_iter([])
+
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", _experiment_stream
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=_annotation_stream,
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        assert len(deadlines) == 3
+        assert None not in deadlines
+        assert len(set(deadlines)) == 1
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_ingest_a_repeated_type_only_once(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test a duplicated allowlist entry does not double-load its type.
+
+        ENCODE documents are written with insert_many into a collection
+        carrying no unique key, so a repeated token would insert every file
+        of that type twice with nothing to reject it.
+
+        Given:
+            ENCODE_ANNOTATION_TYPES naming the same type twice.
+        When:
+            _sync_encode runs.
+        Then:
+            The annotation fetch should run once and each document should
+            appear once.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "chromatin state,chromatin state")
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([])
+        )
+        fetch_annotations = mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        assert fetch_annotations.call_count == 1
+        assert [d["local_id"] for d in mock_db.files.docs] == ["ENCFF002BBB"]
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_report_a_configured_type_that_returned_nothing(
+        self, mock_db, mocker, monkeypatch, caplog
+    ):
+        """Test an empty annotation type is logged as zero, not omitted.
+
+        A type ENCODE stops publishing is the failure this tally exists to
+        surface. An absent key is what nobody notices when diffing logs; a
+        zero is what everybody does.
+
+        Given:
+            Two configured types, one returning rows and one returning
+            none.
+        When:
+            _sync_encode runs.
+        Then:
+            The annotation_type distribution should carry the empty type
+            with a count of zero.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "populated,vanished")
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([])
+        )
+
+        def _annotation_stream(annotation_type, deadline=None):
+            if annotation_type == "vanished":
+                return _async_iter([])
+            return _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            )
+
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=_annotation_stream,
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        distribution = next(
+            m for m in caplog.messages if "annotation_type distribution" in m
+        )
+        assert "'vanished': 0" in distribution
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_propagate_a_cancellation(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test cancellation cancels the sync rather than failing one phase.
+
+        The per-phase handler is deliberately broad, and a CancelledError
+        caught by it would be logged as a phase failure and followed by
+        every remaining phase -- the opposite of cancelling.
+
+        Given:
+            An experiment stream raising CancelledError and a configured
+            annotation type.
+        When:
+            _sync_encode runs.
+        Then:
+            The CancelledError should propagate and the annotation phase
+            should never run.
+        """
+        # Arrange
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES", "candidate Cis-Regulatory Elements"
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_raise(asyncio.CancelledError()),
+        )
+        fetch_annotations = mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter([]),
+        )
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        fetch_annotations.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_not_commit_buffered_rows_when_cancelled(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test a cancelled sync stops writing rather than flushing on its way out.
+
+        The trailing-batch flush runs from a ``finally``, which a cancellation
+        unwinds through as readily as a failure. Writing there would commit
+        rows after the decision to stop, and a cancellation re-delivered by
+        that await would replace the original and skip the phase's tally.
+
+        Given:
+            A batch size large enough to leave every row buffered, and a
+            stream that yields three rows and then raises CancelledError.
+        When:
+            _sync_encode runs.
+        Then:
+            The cancellation should propagate with the buffered rows never
+            committed.
+        """
+        # Arrange
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", 100)
+        rows = [
+            _encode_metadata_row(f"ENCFF00{i}AAA", f"f{i}.bed.gz") for i in range(3)
+        ]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter_then_raise(rows, asyncio.CancelledError()),
+        )
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert mock_db.files.docs == []
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_still_index_when_every_phase_fails(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test the total-failure path leaves a coherent, queryable state.
+
+        No phase delivered a row, so no phase replaced its slice: the corpus
+        is last sync's, in full, rather than empty. Emptying it would have
+        been the one outcome with nothing to recommend it -- the load failed,
+        so there is nothing to put in its place.
+
+        Given:
+            An experiment stream and both configured annotation streams
+            all raising, over a pre-seeded stale ENCODE document.
+        When:
+            _sync_encode runs.
+        Then:
+            The stale document should survive, the indexes should still be
+            ensured, and the error should name all three phases.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "alpha,beta")
+        mock_db.files.docs = [{"submission": "encode", "local_id": "STALE"}]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_raise(RuntimeError("experiment died")),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_raise(
+                RuntimeError(f"{annotation_type} died")
+            ),
+        )
+        ensure = mocker.patch.object(
+            sync_module, "ensure_indexes", mocker.AsyncMock(return_value=0)
+        )
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError) as excinfo:
+            await _sync_encode(task)
+
+        assert [d["local_id"] for d in mock_db.files.docs] == ["STALE"]
+        assert ensure.await_count == 1
+        for label in ("experiment", "annotation[alpha]", "annotation[beta]"):
+            assert label in str(excinfo.value)
+        assert "0 of 3 phases" in task.progress
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_chain_the_first_failure_as_the_cause(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test the raised error keeps the first failure's traceback.
+
+        Given:
+            Two failing phases raising distinguishable exceptions.
+        When:
+            _sync_encode runs.
+        Then:
+            The RuntimeError's __cause__ should be the first one, so the
+            traceback points at the failure that started the cascade.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "alpha")
+        first = RuntimeError("experiment died first")
+        second = RuntimeError("annotation died second")
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_raise(first)
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_raise(second),
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError) as excinfo:
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert excinfo.value.__cause__ is first
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_not_report_a_partial_load_as_complete(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test the task's own progress text admits a phase was lost.
+
+        Given:
+            An experiment stream that raises and a healthy annotation
+            stream.
+        When:
+            _sync_encode runs.
+        Then:
+            The task's final progress should say the sync was incomplete,
+            rather than reporting a clean sync over a partial corpus.
+        """
+        # Arrange
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES", "candidate Cis-Regulatory Elements"
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_raise(RuntimeError("experiment stream died")),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(task)
+
+        assert "incomplete" in task.progress
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "row_count, expected_inserts",
+        [(3, 1), (4, 2), (0, 0)],
+        ids=["exactly-one-batch", "one-batch-plus-remainder", "empty-stream"],
+    )
+    async def test__sync_encode_should_insert_one_batch_per_batch_size_rows(
+        self, mock_db, mocker, monkeypatch, row_count, expected_inserts
+    ):
+        """Test the batching boundary commits every row exactly once.
+
+        The three cases are the boundary itself, the remainder path, and
+        the empty stream that must not issue a trailing empty insert.
+
+        Given:
+            A batch size of 3 and a stream of 3, 4 or 0 rows.
+        When:
+            _sync_encode runs.
+        Then:
+            insert_many should be called the expected number of times and
+            every row should land exactly once.
+        """
+        # Arrange
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", 3)
+        rows = [
+            _encode_metadata_row(f"ENCFF00{i}AAA", f"f{i}.bed.gz")
+            for i in range(row_count)
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
+        )
+        # Spied, not asserted on by argument: _ingest_encode_rows clears the
+        # same list it hands to insert_many, so a recorded call reads back
+        # empty.
+        spy = mocker.spy(mock_db.files, "insert_many")
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        assert spy.call_count == expected_inserts
+        assert len(mock_db.files.docs) == row_count
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_not_count_a_row_it_skipped(
+        self, mock_db, mocker, caplog
+    ):
+        """Test an untransformable row is absent from the corpus and tallies.
+
+        Given:
+            Three experiment rows where the middle one has no File
+            accession and so transforms to None.
+        When:
+            _sync_encode runs.
+        Then:
+            Two documents should be inserted and the compression
+            distribution should account for two, not three.
+        """
+        # Arrange
+        rows = [
+            _encode_metadata_row("ENCFF001AAA", "a.bed.gz"),
+            {"File accession": "   ", "File format": "bed"},
+            _encode_metadata_row("ENCFF003CCC", "c.bed.gz"),
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
+        )
+        task = SyncTask(id="t1", dcc_names=["encode"])
+
+        # Act
+        with caplog.at_level(logging.INFO):
+            await _sync_encode(task)
+
+        # Assert
+        assert len(mock_db.files.docs) == 2
+        assert task.progress == "ENCODE sync complete: 2 files"
+        distribution = next(
+            m for m in caplog.messages if "compression_format distribution" in m
+        )
+        assert "'format:3989': 2" in distribution
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_not_let_a_phase_clear_another_phases_rows(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test each phase's clear reaches only the slice that phase reloads.
+
+        Every phase clears before loading, so a filter that selected more
+        than its own slice would delete the preceding phases' documents as
+        each new one started, leaving only the last phase's rows.
+
+        Given:
+            A stale ENCODE document and three healthy phases.
+        When:
+            _sync_encode runs.
+        Then:
+            The stale document should be gone and all three phases'
+            documents should survive together.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "alpha,beta")
+        mock_db.files.docs = [{"submission": "encode", "local_id": "STALE"}]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter([_encode_metadata_row("ENCFF001AAA", "a.bed.gz")]),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter(
+                [
+                    _encode_annotation_row(
+                        f"ENCFF_{annotation_type}", "ENCSR001AAA", "y.bed.gz"
+                    )
+                ]
+            ),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        assert {d["local_id"] for d in mock_db.files.docs} == {
+            "ENCFF001AAA",
+            "ENCFF_alpha",
+            "ENCFF_beta",
+        }
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_keep_a_failed_phases_rows_until_it_reloads_them(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test a failed phase serves stale data rather than none.
+
+        One corpus-wide clear before the fan-out destroyed every phase's data
+        before any failure was knowable, so a failed experiment phase left
+        the API serving the annotation documents as the whole corpus. The
+        experiment phase is the largest and slowest stream, so it is the
+        likeliest to be the one that fails.
+
+        Given:
+            A stale experiment document, an experiment phase that fails
+            before yielding, and a healthy annotation phase.
+        When:
+            _sync_encode runs.
+        Then:
+            The stale experiment document should survive alongside the
+            freshly loaded annotation document.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "alpha")
+        mock_db.files.docs = [{"submission": "encode", "local_id": "STALE_EXPERIMENT"}]
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_raise(RuntimeError("experiment died")),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter(
+                [_encode_annotation_row("ENCFF_alpha", "ENCSR001AAA", "y.bed.gz")]
+            ),
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError):
+            await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        assert {d["local_id"] for d in mock_db.files.docs} == {
+            "STALE_EXPERIMENT",
+            "ENCFF_alpha",
+        }
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_empty_a_slice_whose_stream_returned_nothing(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test a type that stopped being published stops being served.
+
+        The clear is deferred until a phase has rows to put back, so that a
+        phase failing before it delivers any leaves its previous rows alone.
+        A stream that drains cleanly with nothing in it is the other case
+        entirely: the empty result is the answer, and keeping last sync's
+        rows would serve documents ENCODE no longer publishes.
+
+        Given:
+            A stale document for a configured type whose stream then yields
+            no rows at all.
+        When:
+            _sync_encode runs.
+        Then:
+            The stale document should be gone.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "alpha")
+        mock_db.files.docs = [
+            {
+                "submission": "encode",
+                "local_id": "STALE_ALPHA",
+                "extra": {"encode": {"annotation_type": "alpha"}},
+            }
+        ]
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([])
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter([]),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        assert mock_db.files.docs == []
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_record_a_failed_phase_as_zero_in_the_per_phase_log(
+        self, mock_db, mocker, monkeypatch, caplog
+    ):
+        """Test the per-phase log distinguishes what loaded from what did not.
+
+        Given:
+            One healthy annotation phase and one that fails before
+            yielding.
+        When:
+            _sync_encode runs.
+        Then:
+            The per-phase counts should name the healthy phase and record
+            the failed one as having loaded nothing.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "healthy,broken")
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([])
+        )
+
+        def _annotation_stream(annotation_type, deadline=None):
+            if annotation_type == "broken":
+                return _async_raise(RuntimeError("died"))
+            return _async_iter(
+                [_encode_annotation_row("ENCFF002BBB", "ENCSR001AAA", "y.bed.gz")]
+            )
+
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=_annotation_stream,
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(RuntimeError):
+                await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        per_phase = next(m for m in caplog.messages if "inserted per phase" in m)
+        assert "'annotation[healthy]': 1" in per_phase
+        assert "'annotation[broken]': 0" in per_phase
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=40,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        # One (row count, fails) pair per annotation phase, plus one for the
+        # experiment phase, so the fan-out and the failure pattern both vary.
+        phase_specs=st.lists(
+            st.tuples(st.integers(min_value=0, max_value=6), st.booleans()),
+            min_size=1,
+            max_size=4,
+        ),
+        batch_size=st.integers(min_value=1, max_value=4),
+    )
+    async def test__sync_encode_should_report_exactly_what_it_loaded(
+        self, mocker, monkeypatch, phase_specs, batch_size
+    ):
+        """Test the reported total always equals the documents committed.
+
+        The invariant the mid-stream accounting defect broke, over
+        arbitrary fan-out and failure patterns rather than the handful of
+        shapes the example tests fix.
+
+        Given:
+            Any number of phases with any row counts, any subset of which
+            die after yielding all their rows, at any batch size.
+        When:
+            _sync_encode runs.
+        Then:
+            The count in the final progress should equal the ENCODE
+            documents in the collection.
+        """
+        # Arrange
+        # A fresh database per generated example rather than the function
+        # scoped ``mock_db`` fixture, which Hypothesis does not reset between
+        # examples -- documents would accumulate across them.
+        db = FakeDB()
+        monkeypatch.setattr(api, "db", db)
+        monkeypatch.setattr(sync_module, "BATCH_SIZE", batch_size)
+        experiment_spec, *annotation_specs = phase_specs
+        monkeypatch.setenv(
+            "ENCODE_ANNOTATION_TYPES",
+            ",".join(f"type{i}" for i in range(len(annotation_specs))),
+        )
+
+        def _stream(prefix, spec):
+            count, fails = spec
+            rows = [
+                _encode_metadata_row(f"ENCFF{prefix}{i:03d}", f"f{i}.bed.gz")
+                for i in range(count)
+            ]
+            if fails:
+                return _async_iter_then_raise(rows, RuntimeError("died"))
+            return _async_iter(rows)
+
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _stream("E", experiment_spec),
+        )
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _stream(
+                annotation_type[-1], annotation_specs[int(annotation_type[-1])]
+            ),
+        )
+        task = SyncTask(id="t1", dcc_names=["encode"])
+        any_failure = any(fails for _, fails in phase_specs)
+
+        # Act
+        if any_failure:
+            with pytest.raises(RuntimeError):
+                await _sync_encode(task)
+        else:
+            await _sync_encode(task)
+
+        # Assert
+        committed = len([d for d in db.files.docs if d["submission"] == "encode"])
+        # Anchored rather than a substring. The generated counts reach into
+        # the twenties, so "6 files" would be satisfied by a reported
+        # "16 files" -- and this assertion is the one standing guard over
+        # the reported half of the accounting invariant.
+        state = "incomplete" if any_failure else "complete"
+        assert task.progress.startswith(f"ENCODE sync {state}: {committed} files")
+        assert committed == sum(count for count, _ in phase_specs)
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_run_the_default_allowlist_when_unset(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test the default allowlist reaches the sync, not just the parser.
+
+        Every other test in this class pins the variable, so without this
+        one nothing joins ``annotation_types_from_env``'s default to the
+        phases actually run.
+
+        Given:
+            No ENCODE_ANNOTATION_TYPES in the environment.
+        When:
+            _sync_encode runs.
+        Then:
+            It should fetch exactly the two default annotation types.
+        """
+        # Arrange
+        monkeypatch.delenv("ENCODE_ANNOTATION_TYPES", raising=False)
+        mocker.patch.object(
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([])
+        )
+        fetch_annotations = mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter([]),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        assert [call.args[0] for call in fetch_annotations.call_args_list] == [
+            "candidate Cis-Regulatory Elements",
+            "element gene regulatory interaction predictions",
+        ]
+
+    @pytest.mark.asyncio
+    async def test__sync_encode_should_skip_annotations_when_the_allowlist_is_empty(
+        self, mock_db, mocker, monkeypatch
+    ):
+        """Test that an explicitly empty allowlist disables the fetch entirely.
+
+        Given:
+            ENCODE_ANNOTATION_TYPES set to an empty value.
+        When:
+            _sync_encode runs.
+        Then:
+            No annotation request should be made, and the experiment ingest
+            should complete normally.
+        """
+        # Arrange
+        monkeypatch.setenv("ENCODE_ANNOTATION_TYPES", "")
+        mocker.patch.object(
+            encode_module,
+            "fetch_encode_metadata",
+            lambda deadline=None: _async_iter([_encode_metadata_row("ENCFF001AAA", "x.bed.gz")]),
+        )
+        fetch_annotations = mocker.patch.object(
+            encode_module,
+            "fetch_encode_annotation_metadata",
+            side_effect=lambda annotation_type, deadline=None: _async_iter([]),
+        )
+
+        # Act
+        await _sync_encode(SyncTask(id="t1", dcc_names=["encode"]))
+
+        # Assert
+        fetch_annotations.assert_not_called()
+        assert [d["local_id"] for d in mock_db.files.docs] == ["ENCFF001AAA"]
 
 
 class TestStamp4dnFileAccessions:
@@ -1049,7 +2446,7 @@ class TestLogAccessionCoverage:
         # Assert
         assert "will return no matches" in caplog.text
 
-class TestSyncEncodeIndexes:
+class TestSyncEncodeIndexes(_EncodeSyncTestBase):
     @pytest.mark.asyncio
     async def test__sync_encode_should_ensure_the_accession_indexes(
         self, mocker, mock_db
@@ -1072,7 +2469,7 @@ class TestSyncEncodeIndexes:
         # Arrange
         row = _encode_metadata_row("encff001aaa", "encff001aaa.bed.gz")
         mocker.patch.object(
-            encode_module, "fetch_encode_metadata", lambda: _async_iter([row])
+            encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter([row])
         )
 
         # Act
