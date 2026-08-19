@@ -8,6 +8,22 @@ from cfdb.workflows.processors.passthrough import PassthroughProcessor
 
 
 class TestPassthroughProcessor:
+    def test_processor_id_should_be_the_pinned_literal(self):
+        """Test that the shipped identity is exactly "passthrough".
+
+        Given:
+            The shipped PassthroughProcessor class.
+        When:
+            processor_id is read off it.
+        Then:
+            It should be exactly "passthrough". The literal is asserted
+            rather than derived because it is a wire constant — every
+            cached artifact is keyed under it, so changing the string
+            silently invalidates the processor's whole cached corpus.
+        """
+        # Act & assert
+        assert PassthroughProcessor.processor_id == "passthrough"
+
     def test_needs_processing_should_return_false_for_csv(self):
         """Test that PassthroughProcessor reports no work for CSV inputs.
 

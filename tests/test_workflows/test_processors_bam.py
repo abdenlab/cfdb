@@ -138,6 +138,22 @@ async def _async_false() -> bool:
 
 
 class TestBamIndexProcessor:
+    def test_processor_id_should_be_the_pinned_literal(self):
+        """Test that the shipped identity is exactly "bam-index".
+
+        Given:
+            The shipped BamIndexProcessor class.
+        When:
+            processor_id is read off it.
+        Then:
+            It should be exactly "bam-index". The literal is asserted
+            rather than derived because it is a wire constant — every
+            cached BAI is keyed under it, so changing the string silently
+            invalidates the processor's whole cached corpus.
+        """
+        # Act & assert
+        assert BamIndexProcessor.processor_id == "bam-index"
+
     def test_needs_processing_should_accept_bam(self):
         """Test that the processor claims BAM inputs.
 
@@ -352,6 +368,7 @@ class TestBamIndexProcessor:
             local_id="ENCFF123",
             artifact_kind=ArtifactKind.INDEX,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         cache = LocalFsCache(cache_root)
@@ -463,6 +480,7 @@ class TestBamIndexProcessor:
             local_id="ENCFF123",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         cache = LocalFsCache(cache_root)
