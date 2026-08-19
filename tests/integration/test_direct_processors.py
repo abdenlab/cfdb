@@ -183,16 +183,14 @@ class TestBamIndexProcessorDirectCall:
         # processor's ``cache.head(data_key)`` short-circuits the
         # convert+sort pipeline.
         cache = LocalFsCache(cache_root)
-        from cfdb.workflows import keys as key_utils
         from cfdb.workflows.models import ArtifactKind
 
-        data_key = key_utils.cache_key(
-            dcc="encode",
-            local_id="int-warm-sam",
-            artifact_kind=ArtifactKind.DATA,
-            md5="098f6bcd4621d373cade4e832627b4f6",
-            processor_version=BamIndexProcessor.processor_version,
-        )
+        # Seed through the processor's own derivation. Restating the
+        # formula here would make the test pass whatever key the
+        # processor actually probes, which is exactly the agreement the
+        # warm-cache short-circuit depends on.
+        processor = BamIndexProcessor()
+        data_key = processor.cache_key_for(file_meta, ArtifactKind.DATA)
         await cache.put(data_key, prebuilt_bam)
 
         # Act
@@ -213,13 +211,7 @@ class TestBamIndexProcessorDirectCall:
             f"cache is warm; got invocations: {shell_invocations!r}"
         )
         index_entry = await cache.head(
-            key_utils.cache_key(
-                dcc="encode",
-                local_id="int-warm-sam",
-                artifact_kind=ArtifactKind.INDEX,
-                md5="098f6bcd4621d373cade4e832627b4f6",
-                processor_version=BamIndexProcessor.processor_version,
-            )
+            processor.cache_key_for(file_meta, ArtifactKind.INDEX)
         )
         assert index_entry is not None and index_entry.size > 0
 

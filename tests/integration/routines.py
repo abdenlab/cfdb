@@ -78,9 +78,14 @@ class StubProcessor(Processor):
         sleep_between_yields: float = 0.0,
         unpicklable_field: Any | None = None,
     ) -> None:
+        # Derived rather than written as literals so the keys this stub
+        # emits — and which reach real JobRecord.artifact_cache_keys in
+        # integration runs — carry the production key shape, including
+        # the processor-identity segment. Hard-coded four-segment keys
+        # would be retired-scheme strings the purge sweep claims.
         self.artifacts = artifacts or {
-            ArtifactKind.DATA.value: f"encode/x/data/{STUB_MD5}-v0",
-            ArtifactKind.INDEX.value: f"encode/x/index/{STUB_MD5}-v0",
+            kind.value: self.cache_key_for(stub_file_meta(), kind)
+            for kind in (ArtifactKind.DATA, ArtifactKind.INDEX)
         }
         self.raise_during_stage = raise_during_stage
         self.sleep_seconds = sleep_seconds

@@ -40,11 +40,13 @@ from cfdb.workflows.processors.registry import ProcessorRegistry
 from cfdb.workflows.provisioner import EcsProvisioner, RetryableProvisionerError
 from tests.test_workflows import FIXTURE_MD5
 
-#: Canonical artifact keys the stubs emit. Built from FIXTURE_MD5 so the
-#: shape matches what ``cache_key`` would produce in production for the
-#: ``_file_meta`` identity below.
-_DATA_KEY = f"encode/ENCFF123/data/{FIXTURE_MD5}-v0"
-_INDEX_KEY = f"encode/ENCFF123/index/{FIXTURE_MD5}-v0"
+#: Identity the stub processors are dispatched for. Kept beside the key
+#: constants below so the two cannot drift.
+_STUB_IDENTITY = {
+    "dcc": {"dcc_abbreviation": "ENCODE"},
+    "local_id": "ENCFF123",
+    "md5": FIXTURE_MD5,
+}
 
 
 class _StubProcessor(Processor):
@@ -78,6 +80,27 @@ class _StubProcessor(Processor):
         for kind, key in self.artifacts.items():
             yield StageComplete(kind=ArtifactKind(kind), key=key)
         yield Complete(artifacts=dict(self.artifacts))
+
+
+def _stub_key(artifact_kind: ArtifactKind) -> str:
+    """Return the key ``_StubProcessor`` writes ``artifact_kind`` under."""
+    return key_utils.cache_key(
+        dcc=_STUB_IDENTITY["dcc"]["dcc_abbreviation"],
+        local_id=_STUB_IDENTITY["local_id"],
+        artifact_kind=artifact_kind,
+        md5=_STUB_IDENTITY["md5"],
+        processor_id=_StubProcessor.processor_id,
+        processor_version=_StubProcessor.processor_version,
+    )
+
+
+#: Canonical artifact keys the stubs emit. Derived rather than written as
+#: literals so they carry the production key shape — including the
+#: processor-identity segment. The previous literals were retired-scheme
+#: four-segment strings, which the purge sweep would have claimed.
+#: Defined after the class because they read its class attributes.
+_DATA_KEY = _stub_key(ArtifactKind.DATA)
+_INDEX_KEY = _stub_key(ArtifactKind.INDEX)
 
 
 class _FailingProcessor(Processor):
@@ -357,6 +380,15 @@ class TestWoolExecutorEnsureWorkflow:
         assert final.status == JobStatus.COMPLETED
         assert final.artifact_cache_keys["data"] == _DATA_KEY
         assert final.artifact_cache_keys["index"] == _INDEX_KEY
+        # The persisted keys must be the ones the processor itself
+        # derives, so the producer, the job record, and the router's
+        # later probe agree by construction rather than coincidence.
+        assert final.artifact_cache_keys["data"] == processor.cache_key_for(
+            _file_meta(), ArtifactKind.DATA
+        )
+        assert final.artifact_cache_keys["index"] == processor.cache_key_for(
+            _file_meta(), ArtifactKind.INDEX
+        )
 
     @pytest.mark.asyncio
     async def test_ensure_workflow_should_attach_to_existing_job(

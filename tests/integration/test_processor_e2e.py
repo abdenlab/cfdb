@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 from allpairspy import AllPairs
 
+from cfdb.workflows.keys import is_legacy_cache_key
 from cfdb.workflows.lock import get_job
 from cfdb.workflows.models import JobStatus
 
@@ -44,6 +45,24 @@ from tests.integration.conftest import (
 
 
 pytestmark = pytest.mark.integration
+
+
+def _assert_production_key_shape(record, executor) -> None:
+    """Assert every persisted artifact key carries a processor identity.
+
+    The e2e assertions elsewhere in this file join a cached path from
+    ``artifact_cache_keys`` and check the bytes, which stays true under
+    any key scheme. This is the one place a real processor, driven
+    through a real worker, is made to prove it wrote under the current
+    five-segment shape — and that the sweep would not claim what it
+    just produced.
+    """
+    processor = executor._registry.lookup_for(record.file_meta_snapshot)
+    for key in record.artifact_cache_keys.values():
+        segments = key.split("/")
+        assert len(segments) == 5, key
+        assert segments[3] == processor.processor_id, key
+        assert is_legacy_cache_key(key) is False, key
 
 
 def _stage_for_tabix(cached_bgz: Path, cached_tbi: Path, stage_dir: Path) -> Path:
@@ -167,6 +186,7 @@ class TestProcessorE2E:
             assert final.status == JobStatus.COMPLETED
             assert final.stages_done == ["index"]
             assert "data" not in final.artifact_cache_keys
+            _assert_production_key_shape(final, integration_executor)
 
             cache_root = integration_executor._cache.root
             cached_bai = cache_root / final.artifact_cache_keys["index"]
@@ -274,6 +294,7 @@ class TestProcessorE2E:
             # Assert
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
+            _assert_production_key_shape(final, integration_executor)
 
             cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
@@ -356,6 +377,7 @@ class TestProcessorE2E:
             # Assert
             final = await get_job(install_jobs_index, record.job_id)
             assert final is not None and final.status == JobStatus.COMPLETED
+            _assert_production_key_shape(final, integration_executor)
 
             cache_root = integration_executor._cache.root
             cached_bgz = cache_root / final.artifact_cache_keys["data"]
