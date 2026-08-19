@@ -167,6 +167,7 @@ class TabixIntervalProcessor(Processor):
     # ever be committed, so re-key all tabix artifacts — a poisoned v1
     # ``data`` entry (committed before the guard existed) becomes a cache
     # miss, re-enters _stage_prepare, and is rejected instead of served.
+    processor_id = "tabix-interval"
     processor_version = 2
     supported_formats = frozenset(_TABIX_PRESET.keys())
     artifact_kinds = (ArtifactKind.DATA, ArtifactKind.INDEX)

@@ -43,6 +43,22 @@ class Processor(ABC):
     across the Wool boundary.
     """
 
+    #: Stable identity of this processor, baked into its cache keys so two
+    #: processors claiming the same ``(file, artifact_kind)`` pair can never
+    #: read back each other's artifacts (issue #109). Subclasses that do
+    #: NOT declare one inherit their own class name via
+    #: ``__init_subclass__`` — distinct by default, so forgetting is safe.
+    #: Declare an explicit value when the identity should survive a class
+    #: rename: changing this string invalidates every artifact the
+    #: processor has cached.
+    #:
+    #: The declaration MUST sit in the processor's own class body. The
+    #: default is applied from ``cls.__dict__``, not the MRO, so a value
+    #: supplied by a mixin or a base class is discarded in favour of the
+    #: class name — factoring a pinned identity out into a mixin would
+    #: silently cold-cache every artifact keyed under it.
+    processor_id: str = ""
+
     #: Class-level version. Bump when the processor's output-producing
     #: logic changes in any way that affects the artifact bytes. This is
     #: baked into cache keys so bumps naturally trigger reprocessing.
@@ -54,6 +70,31 @@ class Processor(ABC):
     #: Artifact kinds this processor produces, in the order it produces
     #: them. For most pipelines this is ``[DATA, INDEX]``.
     artifact_kinds: tuple[ArtifactKind, ...] = ()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Default ``processor_id`` to the subclass's own class name.
+
+        Only a value declared in the subclass's **own body** counts — an
+        inherited one is replaced. A subclass of a shipped processor
+        produces potentially different bytes under the same
+        ``processor_version``, so inheriting the parent's identity would
+        recreate exactly the aliasing the identity exists to prevent. A
+        declared-but-falsy value (``processor_id = ""``) is treated as no
+        declaration at all and takes the class-name default, because an
+        empty identity is the same failure as a missing one.
+
+        A declared value is validated here rather than at first use, so a
+        malformed identity (``"   "``, ``".."``, one colliding with an
+        artifact kind) raises when the module is imported instead of
+        surfacing per-request inside a worker, long after the class that
+        caused it was written.
+        """
+        super().__init_subclass__(**kwargs)
+        declared = cls.__dict__.get("processor_id")
+        if not declared:
+            cls.processor_id = cls.__name__
+        else:
+            cls.processor_id = key_utils.normalize_processor_id(declared)
 
     def artifact_kinds_produced(
         self, file_meta: dict[str, Any] | None = None
@@ -80,9 +121,11 @@ class Processor(ABC):
         the cache with this key, the processor ``put``s under it, and the
         :class:`~cfdb.workflows.events.StageComplete` event carries it — so
         all three agree by construction rather than by three independent
-        re-derivations that must be kept in sync. ``processor_version`` is
-        baked in, so bumping it invalidates this processor's cached
-        artifacts without disturbing other processors'.
+        re-derivations that must be kept in sync. Both ``processor_id`` and
+        ``processor_version`` are baked in: the identity keeps this
+        processor's artifacts disjoint from every other processor's even at
+        an equal version, and bumping the version invalidates this
+        processor's own cached artifacts without disturbing anyone else's.
 
         Raises ``ValueError`` (via :func:`extract_identity`) when
         ``file_meta`` is missing dcc / local_id / md5.
@@ -93,6 +136,7 @@ class Processor(ABC):
             local_id=local_id,
             artifact_kind=artifact_kind,
             md5=md5,
+            processor_id=self.processor_id,
             processor_version=self.processor_version,
         )
 
