@@ -30,7 +30,24 @@ class ProcessorRegistry:
         returns the first processor whose ``supported_formats`` covers
         the file's format name, so callers should register more
         specific processors before more general ones.
+
+        Raises:
+            ValueError: Another registered processor already claims this
+                one's ``processor_id``. Cache keys are scoped by that
+                identity (issue #109), so two processors sharing it would
+                read back each other's artifacts as cache hits — a wrong
+                answer rather than a miss. Rejecting at wiring time turns
+                the property into an enforced invariant instead of a
+                convention each new processor has to remember.
         """
+        for registered in self._processors:
+            if registered.processor_id == processor.processor_id:
+                raise ValueError(
+                    f"processor_id {processor.processor_id!r} is already "
+                    f"registered by {type(registered).__name__}; cache keys "
+                    f"are scoped by this identity, so "
+                    f"{type(processor).__name__} would alias its artifacts"
+                )
         self._processors.append(processor)
 
     def lookup_for(self, file_meta: dict[str, Any]) -> Processor | None:
