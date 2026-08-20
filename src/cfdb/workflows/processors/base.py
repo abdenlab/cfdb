@@ -83,18 +83,47 @@ class Processor(ABC):
         declaration at all and takes the class-name default, because an
         empty identity is the same failure as a missing one.
 
-        A declared value is validated here rather than at first use, so a
-        malformed identity (``"   "``, ``".."``, one colliding with an
-        artifact kind) raises when the module is imported instead of
-        surfacing per-request inside a worker, long after the class that
-        caused it was written.
+        The identity is validated here rather than at first use, so a
+        malformed one (``"   "``, ``".."``, one colliding with an artifact
+        kind) raises when the module is imported instead of surfacing
+        per-request inside a worker, long after the class that caused it
+        was written. The class-name default goes through the same
+        normalizer as a declared value: ``is_legacy_cache_key``'s safety
+        argument rests on no identity ever equalling an artifact kind, and
+        a guarantee that held only for declared identities would leave
+        ``class index(Processor)`` failing at derivation instead.
+
+        A ``processor_id`` supplied by a **mixin** — a base that is not
+        itself a ``Processor`` — raises rather than being silently
+        discarded. Replacing it would be a lie the reader cannot see: the
+        mixin's source shows a pinned identity and the runtime uses the
+        class name, so factoring a pinned identity into a mixin would cold-
+        cache everything keyed under it with no signal. Inheriting from
+        another ``Processor`` is a different case and stays legal, because
+        every level of such a chain correctly takes its own class name.
         """
         super().__init_subclass__(**kwargs)
         declared = cls.__dict__.get("processor_id")
         if not declared:
-            cls.processor_id = cls.__name__
-        else:
-            cls.processor_id = key_utils.normalize_processor_id(declared)
+            cls._reject_mixin_supplied_identity()
+        cls.processor_id = key_utils.normalize_processor_id(
+            declared or cls.__name__
+        )
+
+    @classmethod
+    def _reject_mixin_supplied_identity(cls) -> None:
+        """Raise when a non-``Processor`` base declares ``processor_id``."""
+        for base in cls.__mro__[1:]:
+            if issubclass(base, Processor):
+                continue
+            supplied = base.__dict__.get("processor_id")
+            if supplied:
+                raise ValueError(
+                    f"{cls.__name__} inherits processor_id {supplied!r} from "
+                    f"mixin {base.__name__}, which would be silently discarded "
+                    f"in favour of the class name. Declare processor_id in "
+                    f"{cls.__name__}'s own body instead."
+                )
 
     def artifact_kinds_produced(
         self, file_meta: dict[str, Any] | None = None
