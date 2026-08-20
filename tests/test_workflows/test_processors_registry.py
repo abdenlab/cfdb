@@ -108,6 +108,30 @@ class _TabixOnly(Processor):
         return {}
 
 
+#: Identities differing only in case. ``normalize_processor_id`` accepts
+#: both -- the registry is what refuses the pair, because the identity
+#: segment becomes a directory name and case-insensitive filesystems fold
+#: the two together.
+class _CasePinned(Processor):
+    processor_id = "BedProcessor"
+    processor_version = 0
+    supported_formats = frozenset({"BED"})
+    artifact_kinds = (ArtifactKind.INDEX,)
+
+    async def run(self, file_meta, workdir, cache_root):
+        return {}
+
+
+class _CaseVariant(Processor):
+    processor_id = "BEDProcessor"
+    processor_version = 0
+    supported_formats = frozenset({"BED"})
+    artifact_kinds = (ArtifactKind.INDEX,)
+
+    async def run(self, file_meta, workdir, cache_root):
+        return {}
+
+
 class TestProcessorRegistry:
     def test_lookup_for_should_return_matching_processor(self):
         """Test that lookup_for picks the processor claiming the file format.
@@ -367,3 +391,28 @@ class TestDefaultRegistry:
         assert isinstance(
             second.lookup_for({"file_format": {"name": "BAM"}}), BamIndexProcessor
         )
+
+
+class TestIdentityFolding:
+    def test_register_should_raise_when_two_identities_differ_only_in_case(self):
+        """Test that case-variant identities are refused as a collision.
+
+        Given:
+            A registry holding a processor, and one whose identity
+            differs from it only in case.
+        When:
+            register is called for the second.
+        Then:
+            It should raise ValueError. cache_key preserves case, so the
+            two derive distinct keys — but the identity segment is a
+            directory name, and a case-insensitive filesystem (APFS by
+            default) folds them onto one directory, so the second
+            processor reads back the first's artifacts as cache hits.
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_CasePinned())
+
+        # Act & assert
+        with pytest.raises(ValueError, match="folded"):
+            registry.register(_CaseVariant())

@@ -237,6 +237,29 @@ class TestProcessor:
                 async def run(self, file_meta, workdir, cache):
                     yield Complete(artifacts={})
 
+    def test_processor_id_should_raise_when_the_class_name_collides_with_a_kind(self):
+        """Test that the class-name default is validated too, not just declared ids.
+
+        Given:
+            A Processor subclass declaring no identity whose class name
+            is itself an ArtifactKind value.
+        When:
+            The class is declared.
+        Then:
+            It should raise ValueError at definition. Validating only a
+            declared identity would leave is_legacy_cache_key's
+            over-stripped-prefix safety argument — which rests on no
+            identity ever equalling an artifact kind — conditional on
+            class-naming convention, and the failure would surface from
+            cache_key_for on every request inside a worker instead.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="artifact kind"):
+
+            class index(Processor):
+                async def run(self, file_meta, workdir, cache):
+                    yield Complete(artifacts={})
+
     def test_processor_id_should_be_distinct_at_every_level_of_a_hierarchy(self):
         """Test that no two levels of an inheritance chain share an identity.
 
@@ -267,19 +290,45 @@ class TestProcessor:
         # Assert
         assert ids == {"_Level1", "_Level2", "_Level3"}
 
-    def test_processor_id_should_ignore_a_value_supplied_by_a_mixin(self):
-        """Test that only the class's own body can declare an identity.
+    def test_processor_id_should_raise_when_supplied_by_a_mixin(self):
+        """Test that a mixin cannot supply an identity silently.
 
         Given:
             A plain mixin declaring ``processor_id``, and a Processor
-            subclass inheriting from that mixin.
+            subclass that inherits from it without declaring its own.
+        When:
+            The subclass is declared.
+        Then:
+            It should raise ValueError naming both classes. The default
+            is read from the class's own ``__dict__`` rather than the
+            MRO, so the mixin's value would otherwise be discarded in
+            favour of the class name — a lie the reader cannot see, and
+            one that would cold-cache everything keyed under it.
+        """
+
+        # Arrange
+        class _IdentityMixin:
+            processor_id = "from-mixin"
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"from-mixin.*_IdentityMixin"):
+
+            class _Mixed(_IdentityMixin, Processor):
+                async def run(self, file_meta, workdir, cache):
+                    yield Complete(artifacts={})
+
+    def test_processor_id_should_use_its_own_declaration_over_a_mixins(self):
+        """Test that a class declaring its own identity may still use a mixin.
+
+        Given:
+            A plain mixin declaring ``processor_id``, and a Processor
+            subclass inheriting from it that declares its own.
         When:
             The subclass's attribute is read.
         Then:
-            It should be the subclass's class name, not the mixin's
-            value — the default is applied from the class's own
-            ``__dict__`` rather than the MRO, so factoring a pinned
-            identity into a mixin silently loses it.
+            It should be the subclass's own declared value. Only an
+            identity the class would silently lose is rejected, so a
+            mixin remains usable for everything other than the identity.
         """
 
         # Arrange
@@ -287,11 +336,13 @@ class TestProcessor:
             processor_id = "from-mixin"
 
         class _Mixed(_IdentityMixin, Processor):
+            processor_id = "own-identity"
+
             async def run(self, file_meta, workdir, cache):
                 yield Complete(artifacts={})
 
         # Act & assert
-        assert _Mixed.processor_id == "_Mixed"
+        assert _Mixed.processor_id == "own-identity"
 
     def test_processor_id_should_not_be_inherited_by_a_subclass(self):
         """Test that subclassing a pinned processor mints a fresh identity.

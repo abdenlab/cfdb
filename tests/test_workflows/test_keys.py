@@ -16,6 +16,9 @@ from cfdb.workflows.keys import (
     workflow_key,
 )
 from cfdb.workflows.models import ArtifactKind
+from cfdb.workflows.processors.bam import BamIndexProcessor
+from cfdb.workflows.processors.passthrough import PassthroughProcessor
+from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 from tests.test_workflows import FIXTURE_MD5
 
 #: Mixed-case variant used to exercise normalization round-trips.
@@ -35,18 +38,18 @@ _MD5_STRATEGY = st.text(alphabet="abcdef0123456789", min_size=32, max_size=32)
 _ARTIFACT_KIND_STRATEGY = st.sampled_from(list(ArtifactKind))
 _VERSION_STRATEGY = st.integers(min_value=0, max_value=9_999)
 
-#: Processor identities drawn from the vocabulary the shipped ids use
-#: (letters, digits, and the ``-``/``_``/``.`` joiners), excluding the
-#: values ``normalize_processor_id`` reserves.
+#: Processor identities drawn from exactly the alphabet
+#: ``normalize_processor_id`` admits — ASCII letters, digits, and the
+#: ``-``/``_``/``.`` joiners — excluding the values it reserves. Drawing
+#: from the Unicode letter category instead would generate identities the
+#: normalizer rejects (``"ª"``), turning a property about key *content*
+#: into one about key *validity*.
 _PROCESSOR_ID_STRATEGY = st.text(
-    alphabet=st.characters(
-        whitelist_categories=("L", "N"), whitelist_characters="-_."
-    ),
+    alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.",
     min_size=1,
     max_size=24,
 ).filter(
-    lambda value: value.strip() == value
-    and value not in (".", "..")
+    lambda value: value not in (".", "..")
     and value not in {kind.value for kind in ArtifactKind}
 )
 
@@ -66,6 +69,25 @@ def test_normalize_dcc_should_strip_whitespace_and_lowercase():
     # Act & assert
     assert normalize_dcc("  ENCODE  ") == "encode"
     assert normalize_dcc("4DN_DCIC") == "4dn_dcic"
+
+
+@pytest.mark.parametrize("dcc", [".", ".."])
+def test_normalize_dcc_should_raise_when_path_traversal(dcc):
+    """Test that a traversal dcc is rejected at derivation.
+
+    Given:
+        A dcc of ``.`` or ``..``.
+    When:
+        normalize_dcc is called.
+    Then:
+        It should raise ValueError, for the same reason
+        normalize_local_id does — the value becomes the leading segment
+        of every key derived for that source, and the local backend
+        silently collapses ``.`` out of the resulting path.
+    """
+    # Act & assert
+    with pytest.raises(ValueError, match="traversal"):
+        normalize_dcc(dcc)
 
 
 def test_normalize_md5_should_strip_whitespace_and_lowercase():
@@ -193,6 +215,25 @@ class TestNormalizeLocalId:
         with pytest.raises(ValueError, match="local_id"):
             normalize_local_id("")
 
+    @pytest.mark.parametrize("local_id", [".", ".."])
+    def test_normalize_local_id_should_raise_when_path_traversal(self, local_id):
+        """Test that a traversal local_id is rejected at derivation.
+
+        Given:
+            A local_id of ``.`` or ``..``.
+        When:
+            normalize_local_id is called.
+        Then:
+            It should raise ValueError. This is the one key component
+            that comes from third-party DCC metadata, and the cache
+            backend catches only ``..`` — ``.`` is silently collapsed by
+            path resolution, landing one logical key at five segments on
+            S3 and four on disk.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="traversal"):
+            normalize_local_id(local_id)
+
 
 class TestNormalizeProcessorId:
     def test_normalize_processor_id_should_strip_whitespace_and_preserve_case(self):
@@ -243,7 +284,7 @@ class TestNormalizeProcessorId:
             cannot escape into cache paths.
         """
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="forbidden chars"):
             normalize_processor_id("tabix\\interval")
 
     def test_normalize_processor_id_should_raise_when_processor_id_contains_null_byte(
@@ -260,8 +301,67 @@ class TestNormalizeProcessorId:
             cache path or a shell pipeline argument.
         """
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="forbidden chars"):
             normalize_processor_id("tabix\x00interval")
+
+    @pytest.mark.parametrize(
+        "processor_id",
+        [
+            pytest.param("tabix\ninterval", id="newline"),
+            pytest.param("tabix\x01interval", id="control-char"),
+            pytest.param("tabix​interval", id="zero-width-space"),
+            pytest.param("tabix‮interval", id="rtl-override"),
+            pytest.param("tabix／interval", id="fullwidth-solidus"),
+            pytest.param("tabix∕interval", id="division-slash"),
+            pytest.param("tabix%2Finterval", id="percent-encoded-slash"),
+            pytest.param("tabix interval", id="inner-space"),
+        ],
+    )
+    def test_normalize_processor_id_should_raise_when_outside_the_allowlist(
+        self, processor_id
+    ):
+        """Test that only the documented alphabet reaches a cache key.
+
+        Given:
+            An identity carrying a character outside ``[A-Za-z0-9._-]``.
+        When:
+            normalize_processor_id is called.
+        Then:
+            It should raise ValueError. A denylist of the separators
+            would admit every one of these, and each is invisible in
+            review while addressing a different cache entry — a
+            zero-width space renders identically to the id beside it.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="forbidden chars"):
+            normalize_processor_id(processor_id)
+
+    @pytest.mark.parametrize(
+        "processor_id",
+        [
+            pytest.param(7, id="int"),
+            pytest.param(b"tabix-interval", id="bytes"),
+            pytest.param(["tabix-interval"], id="list"),
+        ],
+    )
+    def test_normalize_processor_id_should_raise_when_not_a_string(self, processor_id):
+        """Test that a non-string identity raises ValueError, not AttributeError.
+
+        Given:
+            An identity that is not a ``str`` — the shape a ``__slots__``
+            member descriptor or a copy-pasted ``processor_version``
+            takes.
+        When:
+            normalize_processor_id is called.
+        Then:
+            It should raise ValueError naming the type. Both request-path
+            callers catch ValueError to fall through to direct upstream
+            streaming, so an AttributeError escaping ``.strip()`` would
+            surface as a 500 instead of that fall-through.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="must be a str"):
+            normalize_processor_id(processor_id)
 
     def test_normalize_processor_id_should_raise_when_empty(self):
         """Test that an empty processor id is rejected.
@@ -873,6 +973,31 @@ class TestIsLegacyCacheKey:
         # Act & assert
         assert is_legacy_cache_key(key) is False
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            pytest.param(f"encode/./data/{FIXTURE_MD5}-v2", id="dot-segment"),
+            pytest.param(f"encode/../data/{FIXTURE_MD5}-v2", id="dotdot-segment"),
+            pytest.param(f"./ENCFF1/data/{FIXTURE_MD5}-v2", id="leading-dot"),
+        ],
+    )
+    def test_is_legacy_cache_key_should_reject_a_traversal_segment(self, key):
+        """Test that a shape the producer could never mint is not claimed.
+
+        Given:
+            A four-segment key carrying a ``.`` or ``..`` segment.
+        When:
+            is_legacy_cache_key is called.
+        Then:
+            It should return False. The cache backend refused ``..`` at
+            put time, so the retired scheme provably never wrote such a
+            key — and purge_s3 deletes through delete_objects directly,
+            bypassing that validation, so the predicate is the only thing
+            standing between a foreign object and an irreversible delete.
+        """
+        # Act & assert
+        assert is_legacy_cache_key(key) is False
+
     def test_is_legacy_cache_key_should_return_false_for_an_over_stripped_current_key(
         self,
     ):
@@ -990,3 +1115,30 @@ class TestIsLegacyCacheKey:
 
         # Act & assert
         assert is_legacy_cache_key(retired) is True
+
+
+class TestShippedProcessorIdentities:
+    def test_shipped_processor_ids_should_be_disjoint_from_artifact_kinds(self):
+        """Test that no shipped identity collides with an artifact kind.
+
+        Given:
+            The three processors the API wires at startup.
+        When:
+            Their identities are compared against every ArtifactKind
+            value.
+        Then:
+            The two sets should be disjoint. normalize_processor_id
+            rejects the collision at class-definition time, so adding a
+            member to ArtifactKind that matches a shipped identity would
+            crash-loop the API on import — this pins the constraint in CI
+            instead, where the enum is edited.
+        """
+        # Arrange
+        shipped = {
+            BamIndexProcessor.processor_id,
+            PassthroughProcessor.processor_id,
+            TabixIntervalProcessor.processor_id,
+        }
+
+        # Act & assert
+        assert shipped.isdisjoint({kind.value for kind in ArtifactKind})
