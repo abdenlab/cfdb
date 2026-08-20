@@ -59,9 +59,13 @@ def cache_root(tmp_path):
     return tmp_path
 
 
-def _invoke(*args):
-    """Run ``cfdb purge-legacy-cache`` with ``args`` and return the result."""
-    return CliRunner().invoke(cli, ["purge-legacy-cache", *args])
+def _invoke(*args, input: str | None = None):
+    """Run ``cfdb purge-legacy-cache`` with ``args`` and return the result.
+
+    Tests exercising a sweep pass ``--yes`` to skip the ``--apply``
+    confirmation; the prompt itself is covered by its own tests.
+    """
+    return CliRunner().invoke(cli, ["purge-legacy-cache", *args], input=input)
 
 
 class TestPurgeLegacyCacheCommand:
@@ -103,7 +107,7 @@ class TestPurgeLegacyCacheCommand:
             legacy entry.
         """
         # Act
-        result = _invoke("--local-root", str(cache_root), "--apply")
+        result = _invoke("--local-root", str(cache_root), "--apply", "--yes")
 
         # Assert
         assert result.exit_code == 0
@@ -133,7 +137,7 @@ class TestPurgeLegacyCacheCommand:
         remote = mocker.patch.object(purge_module, "purge_s3")
 
         # Act
-        result = _invoke("--local-root", str(cache_root), "--apply")
+        result = _invoke("--local-root", str(cache_root), "--apply", "--yes")
 
         # Assert
         assert result.exit_code != 0
@@ -165,7 +169,7 @@ class TestPurgeLegacyCacheCommand:
         local.assert_not_called()
 
     def test_purge_legacy_cache_should_fall_back_to_the_sync_data_dir(
-        self, cache_root, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path
     ):
         """Test that SYNC_DATA_DIR resolves the documented default root.
 
@@ -187,7 +191,7 @@ class TestPurgeLegacyCacheCommand:
         monkeypatch.setenv("SYNC_DATA_DIR", str(data_dir))
 
         # Act
-        result = _invoke("--apply")
+        result = _invoke("--apply", "--yes")
 
         # Assert
         assert result.exit_code == 0
@@ -273,7 +277,7 @@ class TestPurgeLegacyCacheCommand:
             mocker.patch.object(purge_module, "build_s3_client", return_value=client)
 
             # Act
-            result = _invoke("--s3-bucket", _BUCKET, "--s3-prefix", "dev", "--apply")
+            result = _invoke("--s3-bucket", _BUCKET, "--s3-prefix", "dev", "--apply", "--yes")
 
             # Assert
             assert result.exit_code == 0
@@ -335,7 +339,7 @@ class TestPurgeLegacyCacheCommand:
         )
 
         # Act
-        result = _invoke("--apply")
+        result = _invoke("--apply", "--yes")
 
         # Assert
         assert result.exit_code == 0
@@ -374,3 +378,163 @@ class TestPurgeLegacyCacheCommand:
         # Assert
         assert "Scanned: 9" in result.output
         assert "Legacy entries: 4 (1,234,567,890 bytes, 1.15 GiB)" in result.output
+
+    def test_purge_legacy_cache_should_refuse_when_both_stores_resolve_from_the_environment(
+        self, monkeypatch, mocker, tmp_path
+    ):
+        """Test that the ambiguity guard covers the environment-only pairing.
+
+        Given:
+            WORKFLOW_S3_BUCKET and SYNC_DATA_DIR both exported and no
+            flags at all — the shape a deployed container has, since
+            backend.yml sets both on one task.
+        When:
+            The command is invoked with --apply.
+        Then:
+            It should exit non-zero and sweep neither store. Resolving the
+            local root only when no bucket is configured would let the
+            bucket win silently here, deleting from production for an
+            operator who meant their local cache.
+        """
+        # Arrange
+        monkeypatch.setenv("WORKFLOW_S3_BUCKET", "prod-bucket")
+        monkeypatch.setenv("SYNC_DATA_DIR", str(tmp_path))
+        local = mocker.patch.object(purge_module, "purge_local")
+        remote = mocker.patch.object(purge_module, "purge_s3")
+
+        # Act
+        result = _invoke("--apply", "--yes")
+
+        # Assert
+        assert result.exit_code != 0
+        assert "Both an S3 bucket and a local cache root" in result.output
+        local.assert_not_called()
+        remote.assert_not_called()
+
+    def test_purge_legacy_cache_should_name_the_target_before_sweeping(
+        self, cache_root, mocker
+    ):
+        """Test that the target is printed even when the sweep raises.
+
+        Given:
+            A sweep that raises part-way, as a partial S3 delete failure
+            does.
+        When:
+            The command is invoked.
+        Then:
+            The target should already be in the output. The store is
+            chosen partly from ambient environment, so an operator must
+            be able to see which one was picked without waiting for a
+            sweep that may never return.
+        """
+        # Arrange
+        mocker.patch.object(
+            purge_module, "purge_local", side_effect=RuntimeError("boom")
+        )
+
+        # Act
+        result = _invoke("--local-root", str(cache_root))
+
+        # Assert
+        assert result.exit_code != 0
+        assert f"Target: {cache_root}" in result.output
+
+    def test_purge_legacy_cache_should_abort_when_the_confirmation_is_declined(
+        self, cache_root
+    ):
+        """Test that --apply asks before deleting anything.
+
+        Given:
+            A local cache root holding a legacy entry.
+        When:
+            The command is invoked with --apply and the prompt is
+            answered "n".
+        Then:
+            It should exit non-zero and leave the entry in place. The
+            flag is one word away from an irreversible mass delete, so it
+            gates on an explicit answer rather than on the flag alone.
+        """
+        # Act
+        result = _invoke("--local-root", str(cache_root), "--apply", input="n\n")
+
+        # Assert
+        assert result.exit_code != 0
+        assert (cache_root / _LEGACY_KEY).exists()
+
+    def test_purge_legacy_cache_should_warn_when_it_matched_nothing(
+        self, cache_root, mocker
+    ):
+        """Test that a mis-targeted sweep is distinguishable from a clean one.
+
+        Given:
+            A sweep that scanned entries but matched none — the shape an
+            under-specified --s3-prefix produces.
+        When:
+            The command is invoked.
+        Then:
+            It should warn about the prefix. Reporting only "Legacy
+            entries: 0" would let an operator tick an environment off the
+            migration runbook on the strength of a typo.
+        """
+        # Arrange
+        mocker.patch.object(purge_module, "build_s3_client", return_value=object())
+        mocker.patch.object(
+            purge_module, "purge_s3", return_value=PurgeReport(scanned=12, matched=0)
+        )
+
+        # Act
+        result = _invoke("--s3-bucket", _BUCKET)
+
+        # Assert
+        assert "matched none" in result.output
+        assert "WORKFLOW_S3_PREFIX" in result.output
+
+    def test_purge_legacy_cache_should_warn_when_the_target_held_nothing(
+        self, cache_root, mocker
+    ):
+        """Test that an empty target is called out rather than reported clean.
+
+        Given:
+            A sweep that scanned nothing at all — the shape a typo'd
+            bucket or an unwritten cache root produces.
+        When:
+            The command is invoked.
+        Then:
+            It should warn that the target held nothing.
+        """
+        # Arrange
+        mocker.patch.object(purge_module, "build_s3_client", return_value=object())
+        mocker.patch.object(
+            purge_module, "purge_s3", return_value=PurgeReport(scanned=0, matched=0)
+        )
+
+        # Act
+        result = _invoke("--s3-bucket", _BUCKET)
+
+        # Assert
+        assert "held nothing" in result.output
+
+    def test_purge_legacy_cache_should_reject_a_local_root_that_does_not_exist(
+        self, tmp_path, mocker
+    ):
+        """Test that a mistyped --local-root is a usage error.
+
+        Given:
+            An explicit --local-root naming a directory that is not there.
+        When:
+            The command is invoked.
+        Then:
+            It should exit non-zero without sweeping. A typo would
+            otherwise produce a zeroed report indistinguishable from an
+            already-swept cache.
+        """
+        # Arrange
+        local = mocker.patch.object(purge_module, "purge_local")
+
+        # Act
+        result = _invoke("--local-root", str(tmp_path / "absent"))
+
+        # Assert
+        assert result.exit_code != 0
+        assert "does not exist" in result.output
+        local.assert_not_called()

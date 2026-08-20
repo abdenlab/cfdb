@@ -983,3 +983,35 @@ class TestPurgeLocal:
         assert report.deleted == 1
         assert not retired_path.exists()
         assert current_path.exists()
+
+    def test_purge_local_should_not_delete_through_a_symlinked_directory(
+        self, tmp_path
+    ):
+        """Test that the sweep cannot reach outside its own cache root.
+
+        Given:
+            A cache root containing a symlink to a directory outside it,
+            which itself holds a legacy-shaped entry.
+        When:
+            purge_local runs applied.
+        Then:
+            It should match nothing and leave the outside file intact.
+            Containment rests entirely on ``Path.rglob`` not descending
+            symlinked directories — an implicit default that, if it ever
+            changed, would turn an irreversible delete loose on arbitrary
+            paths. Pinned here rather than inherited.
+        """
+        # Arrange
+        root = tmp_path / "cache"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        _seed_local(outside, _LEGACY_KEY)
+        (root / "encode").symlink_to(outside / "encode", target_is_directory=True)
+
+        # Act
+        report = purge_local(root, apply=True)
+
+        # Assert
+        assert report.matched == 0
+        assert report.deleted == 0
+        assert (outside / _LEGACY_KEY).exists()
