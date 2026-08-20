@@ -877,9 +877,19 @@ The preprocessed artifact is the default response. Clients that want the raw ups
 | GTF | GTF→GFF3 + sort + bgzip + tabix | bgzipped GFF3 + TBI |
 | bigBed | bigBedToBed + sort + bgzip + tabix | bgzipped BED + TBI |
 
-Cache keys have the shape `{dcc}/{local_id}/{artifact_kind}/{processor_id}/{md5}-v{processor_version}` — for example `encode/ENCFF732YBO/index/tabix-interval/6fccbb438a046075cb438f84d0defe8d-v2`. They are content-addressed using each file's upstream `md5`, so a byte change upstream (with the sync pipeline refreshing `md5`) invalidates the cache automatically, and they carry the producing processor's identity (`Processor.processor_id`) so two processors claiming the same file and artifact kind can never read back each other's output. Without that segment a version number was the only thing separating processors — and `TabixIntervalProcessor` and `BamIndexProcessor` both sit at version 2, staying apart only because their `supported_formats` happen to be disjoint. A processor that declares no `processor_id` inherits its own class name; declare one explicitly when the identity should survive a class rename, since changing the string invalidates every artifact keyed under it. The declaration must sit in the processor's own class body — a value supplied by a base class or mixin is discarded in favour of the class name, so factoring a pinned identity into a mixin would silently cold-cache everything keyed under it. An identity may not be blank, contain a path separator, be `.` or `..`, or equal an artifact kind (`data`, `index`); each is rejected when the class is declared, and the last of those keeps a mis-specified purge prefix from reducing a live key to something shaped like a retired one.
+Cache keys have the shape `{dcc}/{local_id}/{artifact_kind}/{processor_id}/{md5}-v{processor_version}` — for example `encode/ENCFF732YBO/index/tabix-interval/6fccbb438a046075cb438f84d0defe8d-v2`. They are content-addressed using each file's upstream `md5`, so a byte change upstream (with the sync pipeline refreshing `md5`) invalidates the cache automatically, and they carry the producing processor's identity (`Processor.processor_id`) so two processors claiming the same file and artifact kind can never read back each other's output. Without that segment a version number was the only thing separating processors — and `TabixIntervalProcessor` and `BamIndexProcessor` both sit at version 2, staying apart only because their `supported_formats` happen to be disjoint. A processor that declares no `processor_id` takes its own class name; declare one explicitly when the identity should survive a class rename, since changing the string invalidates every artifact keyed under it. The declaration must sit in the processor's own class body. Omitting it entirely — or writing `processor_id = ""` — takes the class-name default, which is safe because every class name is distinct. Supplying one from a base class or mixin instead raises at class definition: the value would be discarded in favour of the class name, so a mixin's pinned identity would read as authoritative in source while silently cold-caching everything keyed under it. Subclassing another processor stays legal, and each level of the chain takes its own class name.
 
-**Purging the retired key scheme.** Keys minted before the processor-identity segment existed are unreachable by construction — the API derives the current shape and never probes the old one. Sweep them with `cfdb purge-legacy-cache` (dry run by default; pass `--apply` to delete). The same sweep clears the orphaned `.bedpe` / `bigInteract` index artifacts stranded when those formats were re-typed. Note that the deploy shipping the key change starts against a **fully cold cache**: every `/data` and `/index` request for a processable file dispatches a fresh workflow until the fleet catches up.
+Whatever the identity ends up being — declared or defaulted — it must match `[A-Za-z0-9._-]`, and may not be `.`, `..`, or an artifact kind (`data`, `index`). Each is rejected when the class is declared, so a malformed identity fails on import rather than per-request inside a worker. The alphabet is an allowlist because a denylist of the separators still admits a newline, a zero-width space, or a fullwidth solidus — each invisible in review while addressing a different cache entry. The artifact-kind rule is what keeps a mis-specified purge prefix from reducing a live key to something shaped like a retired one. Note that case is preserved in the key but *not* relied on to keep two identities apart on disk: a case-insensitive filesystem folds `BedProcessor` and `BEDProcessor` onto one directory, so `ProcessorRegistry.register` refuses the pair.
+
+**Deploying the key change.** The cache key is derived independently in two separately-deployed processes: the API derives it to probe the cache, and the worker derives it to write the artifact. `processor_id` travels as a class attribute, so each resolves it from *its own* image. **Deploy the worker task definition at or before the API.** Workers are standalone `RunTask` tasks rather than an ECS service, so a stack update does not stop the ones already running — they exit only on `CFDB_WORKER_MAX_LIFETIME_SECONDS` (default 5 hours), and worker discovery gates on the wool protocol version, not the cfdb image. A new API dispatching to an old worker gets a job that completes having written a key the API will never probe, so the next request misses and dispatches again, indefinitely and silently. The same applies in reverse to an old API and a new worker.
+
+The deploy also starts against a **fully cold cache**: every `/data` and `/index` request for a processable file dispatches a fresh workflow until the cache refills. Re-keying the existing artifacts in place (`CopyObject` on S3, `rename` locally) was considered and rejected — it needs each artifact's producing processor resolved from file metadata, which is more moving parts than a cold start costs.
+
+**Rolling back past this change.** Reverting puts the system through a *second* cold start, since the API returns to deriving four-segment keys against a cache from which exactly those were swept. Every five-segment key written between deploy and revert becomes unreachable, and `cfdb purge-legacy-cache` will not clear it — the sweep only recognises the retired four-segment shape. On S3 the bucket lifecycle rule reclaims that residue within `CacheArtifactExpirationDays`; on a local cache root nothing does.
+
+**Purging the retired key scheme.** Keys minted before the processor-identity segment existed are unreachable by construction — the API derives the current shape and never probes the old one. Sweep them with `cfdb purge-legacy-cache` (dry run by default; pass `--apply` to delete). The same sweep clears the orphaned `.bedpe` / `bigInteract` index artifacts stranded when those formats were re-typed.
+
+Two things to know before running it against S3. First, the sweep needs `s3:ListBucket` on the bucket and `s3:DeleteObject` on `<bucket>/*` — **neither the API nor the worker task role carries a delete grant**, deliberately, so run it under an operator or CI principal rather than from inside a deployed container. Second, the cache bucket already carries an `expire-cached-artifacts` lifecycle rule (`CacheArtifactExpirationDays`, default 30), and its rationale is exactly this case: keys are content-addressed, so a missing artifact is simply re-materialized. The retired population therefore self-reclaims within a month on its own. Sweeping S3 *accelerates* that reclaim; it is not required for correctness, and waiting is a legitimate choice. A local cache root has no equivalent expiry, so there the sweep is the only thing that reclaims. Run the local sweep with the API stopped — it prunes directories as it empties them, which can race a concurrent cache write.
 
 **Bounded concurrency, durable queuing, and admission control.** Dispatch is bounded on three cooperating layers so an unauthenticated burst on `/data` and `/index` can't oversubscribe the worker fleet or queue unbounded work:
 
@@ -1000,7 +1010,7 @@ Poll the status of a dispatched workflow:
   "job_id": "abc-123",
   "status": "running",
   "stages_done": ["data"],
-  "artifacts": {"data": "encode/ENCFF123/data/abc-v1"},
+  "artifacts": {"data": "encode/ENCFF123/data/tabix-interval/6fccbb438a046075cb438f84d0defe8d-v2"},
   "progress": null,
   "error": null,
   "superseded_by": null
@@ -1070,6 +1080,8 @@ Check the status of a sync task. The `task_id` is returned when starting a sync.
 
 ### CLI
 
+#### `cfdb sync`
+
 ```bash
 # Sync all DCCs
 cfdb sync
@@ -1082,6 +1094,8 @@ cfdb sync 4dn hubmap
 - `--api-url` - cfdb API base URL (default: `http://localhost:8000`, env: `CFDB_API_URL`)
 - `--api-key` - API key for sync endpoint (env: `SYNC_API_KEY`)
 - `--debug` / `-d` - Enable debugpy debugging
+
+#### `cfdb purge-legacy-cache`
 
 ```bash
 # Report what the retired cache-key scheme is still holding (dry run)
@@ -1097,9 +1111,12 @@ cfdb purge-legacy-cache --s3-bucket cfdb-cache --s3-prefix dev --apply
 - `--s3-prefix` - key prefix the S3 cache backend writes under (env: `WORKFLOW_S3_PREFIX`)
 - `--endpoint-url` - boto3 endpoint override for LocalStack-backed dev (env: `AWS_ENDPOINT_URL`)
 - `--region` - AWS region for the boto3 client (env: `AWS_REGION`)
-- `--local-root` - local cache root (default: `$SYNC_DATA_DIR/cache`)
+- `--local-root` - local cache root, which must exist (default: `$SYNC_DATA_DIR/cache`)
 - `--apply` - actually delete; without it the sweep only reports
+- `--yes` - skip the `--apply` confirmation prompt, for scripted runs
 
-Exactly one store is purged per run. When both an S3 bucket and a local root resolve — `WORKFLOW_S3_BUCKET` set in the environment alongside an explicit `--local-root`, say — the command refuses rather than guessing which cache you meant.
+Exactly one store is purged per run. When both an S3 bucket and a local root resolve — including the environment-only pairing of `WORKFLOW_S3_BUCKET` and `SYNC_DATA_DIR`, which a deployed API task has — the command refuses rather than guessing which cache you meant. The target is printed before the sweep begins, and `--apply` prompts for confirmation, because the store is chosen partly from ambient environment and the deletion cannot be undone.
+
+Pass `--s3-prefix` exactly as `WORKFLOW_S3_PREFIX` is set for the environment. A prefix carrying extra segments is rejected by the artifact-kind check rather than acted on, and one that is too short matches nothing — the command warns when it scanned entries and matched none, so a prefix typo does not read as an already-swept environment.
 
 `--s3-prefix` must be exactly the prefix the cache backend writes under (`WORKFLOW_S3_PREFIX`). A prefix carrying extra segments is stripped from every key before the retired-shape test, so an over-specified one would otherwise reduce live five-segment keys to four-segment ones; the sweep rejects those because the processor identity lands where an artifact kind must be, but the safest habit is still to pass the same value the API runs with. A prefix that is too short simply matches nothing.

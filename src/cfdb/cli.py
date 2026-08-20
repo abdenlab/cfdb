@@ -117,36 +117,46 @@ def sync(dcc_names: tuple[str, ...], api_url: str, api_key: str):
     "--s3-bucket",
     default=None,
     envvar="WORKFLOW_S3_BUCKET",
+    show_envvar=True,
     help="Bucket holding the workflow cache (S3 profile).",
 )
 @click.option(
     "--s3-prefix",
     default="",
     envvar="WORKFLOW_S3_PREFIX",
+    show_envvar=True,
     help="Key prefix the S3 cache backend writes under.",
 )
 @click.option(
     "--endpoint-url",
     default=None,
     envvar="AWS_ENDPOINT_URL",
+    show_envvar=True,
     help="boto3 endpoint override (LocalStack-backed dev).",
 )
 @click.option(
     "--region",
     default=None,
     envvar="AWS_REGION",
+    show_envvar=True,
     help="AWS region for the boto3 client.",
 )
 @click.option(
     "--local-root",
     default=None,
     help="Local cache root. Defaults to $SYNC_DATA_DIR/cache.",
-    type=click.Path(file_okay=False, path_type=Path),
+    type=click.Path(file_okay=False, exists=True, path_type=Path),
 )
 @click.option(
     "--apply",
     default=False,
     help="Delete the matched entries. Without it the sweep is a dry run.",
+    is_flag=True,
+)
+@click.option(
+    "--yes",
+    default=False,
+    help="Skip the --apply confirmation prompt (for scripted runs).",
     is_flag=True,
 )
 def purge_legacy_cache(
@@ -156,6 +166,7 @@ def purge_legacy_cache(
     region: str | None,
     local_root: Path | None,
     apply: bool,
+    yes: bool,
 ):
     """
     Sweep workflow cache entries minted under the retired key scheme.
@@ -166,8 +177,14 @@ def purge_legacy_cache(
     entries, including the orphaned .bedpe / bigInteract index artifacts
     left behind when PR #108 re-typed those formats.
 
-    Runs as a DRY RUN unless --apply is passed. The target is the S3
-    bucket when one is configured, otherwise the local cache root.
+    WARNING: --apply deletes objects irreversibly. Runs as a DRY RUN
+    unless it is passed.
+
+    Exactly one store is swept per run. Resolving both an S3 bucket and a
+    local cache root is a usage error rather than a precedence rule --
+    purging the wrong store cannot be undone, so the command refuses to
+    guess. $SYNC_DATA_DIR is consulted for the local root only when no
+    bucket is configured.
 
     Examples:
 
@@ -179,18 +196,21 @@ def purge_legacy_cache(
     """
     from cfdb.workflows.purge import build_s3_client, purge_local, purge_s3
 
-    if local_root is None and not s3_bucket:
-        sync_data_dir = os.getenv("SYNC_DATA_DIR")
-        if sync_data_dir:
-            local_root = Path(sync_data_dir) / "cache"
+    sync_data_dir = os.getenv("SYNC_DATA_DIR")
+    env_local_root = Path(sync_data_dir) / "cache" if sync_data_dir else None
+    if local_root is None:
+        local_root = env_local_root
 
     if s3_bucket and local_root is not None:
-        # Both stores resolved — refuse rather than guess. WORKFLOW_S3_BUCKET
-        # in the environment is enough to trigger this alongside an explicit
-        # --local-root, and purging the wrong store is not recoverable.
+        # Both stores resolved — refuse rather than guess. This fires on the
+        # environment-only pairing too: a container that sets both
+        # WORKFLOW_S3_BUCKET and SYNC_DATA_DIR (backend.yml does) would
+        # otherwise silently sweep S3 for an operator who meant the local
+        # cache, and purging the wrong store is not recoverable.
+        source = "--local-root" if env_local_root != local_root else "$SYNC_DATA_DIR"
         raise click.UsageError(
-            "Both an S3 bucket and a local cache root resolved; pass only "
-            "one (unset WORKFLOW_S3_BUCKET to target --local-root)"
+            f"Both an S3 bucket and a local cache root ({source}) resolved; "
+            f"pass only one (unset WORKFLOW_S3_BUCKET to target the local root)"
         )
     if not s3_bucket and local_root is None:
         raise click.UsageError(
@@ -198,8 +218,23 @@ def purge_legacy_cache(
             "WORKFLOW_S3_BUCKET / SYNC_DATA_DIR"
         )
 
+    target = (
+        f"s3://{s3_bucket}/{s3_prefix.strip('/')}".rstrip("/")
+        if s3_bucket
+        else str(local_root)
+    )
+
+    # Name the target BEFORE sweeping. The store is chosen partly from
+    # ambient environment, so an operator must be able to see which one was
+    # picked while the run is still stoppable — not after the deletes.
+    click.echo(f"Target: {target}")
+    if apply and not yes:
+        click.confirm(
+            f"Irreversibly delete legacy cache entries from {target}?",
+            abort=True,
+        )
+
     if s3_bucket:
-        target = f"s3://{s3_bucket}/{s3_prefix.strip('/')}".rstrip("/")
         report = purge_s3(
             build_s3_client(endpoint_url=endpoint_url, region_name=region),
             s3_bucket,
@@ -207,10 +242,8 @@ def purge_legacy_cache(
             apply=apply,
         )
     else:
-        target = str(local_root)
         report = purge_local(local_root, apply=apply)
 
-    click.echo(f"Target: {target}")
     click.echo(f"Scanned: {report.scanned}")
     click.echo(
         f"Legacy entries: {report.matched} "
@@ -220,6 +253,23 @@ def purge_legacy_cache(
         click.echo(f"Deleted: {report.deleted}")
     else:
         click.echo("Dry run — nothing deleted. Re-run with --apply.")
+
+    # A clean sweep and a mis-targeted one both report zero. Distinguish
+    # them, so an operator working through the migration runbook cannot tick
+    # an environment off on the strength of a prefix typo.
+    if report.scanned == 0:
+        click.echo(
+            f"WARNING: {target} held nothing — check the bucket, prefix, or "
+            f"path before treating this environment as swept.",
+            err=True,
+        )
+    elif report.matched == 0:
+        click.echo(
+            f"WARNING: scanned {report.scanned} entries and matched none. If "
+            f"this environment was not already swept, check --s3-prefix "
+            f"against the deployment's WORKFLOW_S3_PREFIX.",
+            err=True,
+        )
 
 
 if __name__ == "__main__":

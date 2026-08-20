@@ -5,7 +5,21 @@ Every key derived under the old shape
 (``{dcc}/{local_id}/{artifact_kind}/{md5}-v{processor_version}``) is
 therefore unreachable by construction: the router derives the new
 five-segment form and probes that, so the old entries are never read
-again and never overwritten. They are pure storage cost until swept.
+again and never overwritten.
+
+How much that costs depends on the backend, and the two differ:
+
+- ``LocalFsCache`` has no expiry of any kind, so a retired entry is a
+  permanent cost. This sweep is the only thing that reclaims it.
+- The deployed S3 cache bucket already carries an ``expire-cached-artifacts``
+  lifecycle rule (``cloudformation/workers.yml``) with
+  ``CacheArtifactExpirationDays``, default 30 — and its own rationale is
+  this one: keys are content-addressed, so expiry is safe because a missing
+  artifact is simply re-materialized. The retired population therefore
+  self-reclaims within a month with no operator action. Sweeping S3
+  *accelerates* that reclaim; it is not required for correctness, and an
+  operator weighing an irreversible mass-delete against waiting should know
+  waiting is supported.
 
 The sweep also clears the orphaned paired-interval artifacts left by PR
 #108 — the incorrect ``.tbi`` files built for ``.bedpe`` / ``bigInteract``
@@ -17,6 +31,15 @@ other: ``S3Cache`` in the ECS profile, ``LocalFsCache`` everywhere else.
 The single description of the retired shape lives in
 :func:`cfdb.workflows.keys.is_legacy_cache_key`; nothing here re-derives
 it.
+
+**This module is temporary.** It exists to carry one migration across one
+deploy of every environment. Once each environment has been swept, this
+module, the ``cfdb purge-legacy-cache`` command,
+:func:`~cfdb.workflows.keys.is_legacy_cache_key`, and the retired-scheme
+constants beside it should all be deleted — along with the artifact-kind
+rejection in :func:`~cfdb.workflows.keys.normalize_processor_id`, which
+exists only to keep an over-stripped prefix from looking like a retired
+key and has no bearing on the key itself.
 """
 
 from __future__ import annotations
@@ -101,8 +124,15 @@ def purge_s3(
                 continue
             report.matched += 1
             report.bytes_matched += obj.get("Size", 0)
+            # Only the applied path consumes ``batch``. Accumulating on a
+            # dry run would hold one string per matched object for the whole
+            # sweep and then discard them — and the dry run is both the
+            # default and the one an operator points at the largest,
+            # least-swept cache first.
+            if not apply:
+                continue
             batch.append(key)
-            if apply and len(batch) >= _S3_DELETE_BATCH:
+            if len(batch) >= _S3_DELETE_BATCH:
                 report.deleted += _delete_s3_batch(client, bucket, batch)
                 batch = []
 
@@ -159,13 +189,26 @@ def purge_local(root: Path, *, apply: bool = False) -> PurgeReport:
         A :class:`PurgeReport` for the run. Directories the deletions
         emptied are pruned so the tree does not retain the shape of the
         retired scheme.
+
+    Run this with the API stopped. The pruning below removes a directory
+    the moment its last entry goes, which can land between a concurrent
+    ``LocalFsCache.put``'s ``mkdir(parents=True)`` and its ``os.replace``
+    and fail that workflow. The window is narrow and the sweep is a
+    one-off migration step, so quiescing is cheaper than coordinating.
     """
     report = PurgeReport()
     if not root.is_dir():
         return report
 
     emptied: list[Path] = []
-    for path in sorted(root.rglob("*")):
+    # ``rglob`` does not descend symlinked directories, which is what keeps
+    # the sweep inside ``root``: a symlinked cache subdirectory would
+    # otherwise let an irreversible delete reach arbitrary paths. Pinned by
+    # ``test_purge_local_should_not_delete_through_a_symlinked_directory``.
+    # Iterated lazily — the result is order-independent (matching is
+    # per-path and pruning is deferred to ``emptied``), so sorting would
+    # only force the whole tree into memory first.
+    for path in root.rglob("*"):
         if not path.is_file():
             continue
         report.scanned += 1
@@ -191,6 +234,13 @@ def _prune_empty_ancestors(directory: Path, root: Path) -> None:
     ``$SYNC_DATA_DIR/cache`` is operator-supplied, so an unrelated empty
     directory under it is not the sweep's to reclaim. Stops at the first
     ancestor that still holds something, and never removes ``root``.
+
+    The ``root in current.parents`` half of the loop condition is
+    unreachable for every caller: ``directory`` is always ``path.parent``
+    for a ``path`` yielded by ``root.rglob``, so the walk is inside ``root``
+    by construction and ``current != root`` alone terminates it. It is kept
+    as a containment assertion for an irreversible delete — do not write a
+    test for the state it guards, because no caller can reach it.
     """
     current = directory
     while current != root and root in current.parents:
