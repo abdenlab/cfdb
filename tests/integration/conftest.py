@@ -368,7 +368,13 @@ KNOWN_BUGS: tuple[_KnownBug, ...] = (
                 Format.SAM,
             }
         ),
-        raises=(RuntimeError, AssertionError),
+        # Scoped to the SIGPIPE signature alone. Listing ``AssertionError``
+        # here would absorb every assertion failure in nine of the eleven
+        # formats, on every platform, and report it as this known bug — so
+        # a real regression would surface as an xfail and exit 0. That is
+        # the type every assertion in the suite raises; a known-bug entry
+        # must name the failure it actually knows about.
+        raises=(RuntimeError,),
         reason=(
             "macOS dev hosts intermittently SIGPIPE the tabix/samtools "
             "subprocess from inside a wool worker — grpc poll FDs "
@@ -378,10 +384,8 @@ KNOWN_BUGS: tuple[_KnownBug, ...] = (
         ),
         retries=3,
         retryable=lambda exc: (
-            isinstance(exc, RuntimeError)
-            and "exited -13" in str(exc)
-        )
-        or isinstance(exc, AssertionError),
+            isinstance(exc, RuntimeError) and "exited -13" in str(exc)
+        ),
     ),
 )
 
