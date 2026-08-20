@@ -567,10 +567,16 @@ def integration_workdir_root(tmp_path) -> Path:
     return root
 
 
-@pytest.fixture()
-def install_jobs_index(mock_db):
-    """Seed the partial-unique mutex index on the FakeDB jobs collection."""
-    mock_db.jobs.create_index(
+@pytest_asyncio.fixture()
+async def install_jobs_index(mock_db):
+    """Seed the partial-unique mutex index on the FakeDB jobs collection.
+
+    ``FakeCollection.create_index`` is a coroutine, matching Motor. This
+    fixture used to call it without awaiting, so the index was never
+    actually installed and every concurrent-dedup assertion below was
+    passing or failing for unrelated reasons.
+    """
+    await mock_db.jobs.create_index(
         {"workflow_key": 1},
         unique=True,
         partialFilterExpression={"active": True},
