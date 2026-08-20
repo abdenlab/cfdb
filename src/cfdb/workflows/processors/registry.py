@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
-from cfdb.workflows.processors.tools import format_name
 from cfdb.workflows.processors.base import Processor
 from cfdb.workflows.processors.passthrough import PassthroughProcessor
+from cfdb.workflows.processors.tools import format_name
+
+
+def _identity_fold(processor_id: str) -> str:
+    """Fold an identity to the form two cache entries would collide under.
+
+    ``cache_key`` preserves an identity's case and Unicode spelling, but a
+    cache backend need not: the identity segment becomes a directory name
+    under ``LocalFsCache``, and a case-insensitive filesystem (APFS by
+    default) or a normalizing one folds two spellings onto one directory.
+    Comparing on the folded form is what makes the registry's uniqueness
+    guard match the guarantee ``cache_key`` is relied on to provide.
+    """
+    return unicodedata.normalize("NFC", processor_id).casefold()
 
 
 class ProcessorRegistry:
@@ -31,6 +45,20 @@ class ProcessorRegistry:
         the file's format name, so callers should register more
         specific processors before more general ones.
 
+        The guard's scope is **this registry instance**, not the process:
+        uniqueness is a property of one wired deployment, and the single
+        wiring site is ``cfdb.api.main``'s lifespan. A deployment that
+        wires a second registry (a worker-side one, a batch tool) has to
+        re-establish the invariant itself — it travels with the registry,
+        not with the processor class.
+
+        Identities are compared case- and Unicode-folded rather than by
+        exact string equality. ``cache_key`` preserves the raw spelling,
+        but a cache backend need not keep two spellings apart: on a
+        case-insensitive filesystem ``BedProcessor`` and ``BEDProcessor``
+        derive distinct keys that resolve to one directory, which is the
+        aliasing this guard exists to prevent.
+
         Raises:
             ValueError: Another registered processor already claims this
                 one's ``processor_id``. Cache keys are scoped by that
@@ -40,14 +68,22 @@ class ProcessorRegistry:
                 the property into an enforced invariant instead of a
                 convention each new processor has to remember.
         """
+        folded = _identity_fold(processor.processor_id)
         for registered in self._processors:
-            if registered.processor_id == processor.processor_id:
-                raise ValueError(
-                    f"processor_id {processor.processor_id!r} is already "
-                    f"registered by {type(registered).__name__}; cache keys "
-                    f"are scoped by this identity, so "
-                    f"{type(processor).__name__} would alias its artifacts"
-                )
+            if _identity_fold(registered.processor_id) != folded:
+                continue
+            collision = (
+                "is already registered by"
+                if registered.processor_id == processor.processor_id
+                else "collides once case- and Unicode-folded with the one "
+                "registered by"
+            )
+            raise ValueError(
+                f"processor_id {processor.processor_id!r} {collision} "
+                f"{type(registered).__name__} ({registered.processor_id!r}); "
+                f"cache keys are scoped by this identity, so "
+                f"{type(processor).__name__} would alias its artifacts"
+            )
         self._processors.append(processor)
 
     def lookup_for(self, file_meta: dict[str, Any]) -> Processor | None:
