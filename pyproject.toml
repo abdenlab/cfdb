@@ -22,7 +22,14 @@ dependencies = [
     "requests",
     "strawberry-graphql",
     "uvicorn",
-    "wool~=0.13.0",
+    # Compatible-release on 0.14 now that the final has shipped: patch
+    # releases are picked up, 0.15 is not, since a minor bump may move
+    # the wire protocol the dispatch channel depends on. Note that even
+    # a patch move is a fleet-rejection event — wool admits a worker
+    # only when the proxy's version is at most the worker's — so
+    # refreshing the lock deliberately, and drain the fleet when it
+    # moves (see README's version-bump deploy caveat).
+    "wool~=0.14.0",
 ]
 description = "A Python utility for parsing and normalizing various DCC datapackages."
 dynamic = ["version"]

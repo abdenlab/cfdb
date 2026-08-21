@@ -325,6 +325,129 @@ def test_worker_container_should_declare_aws_region():
     assert plain_env.get("AWS_REGION") == {"Ref": "AWS::Region"}
 
 
+def test_worker_idle_timeout_should_be_wired_and_agree_with_the_application_default():
+    """Test that the idle-timeout knob reaches the worker and matches the code.
+
+    Given:
+        The workers template's WorkerIdleTimeoutSeconds parameter and
+        container definition. The worker's primary reaper is its idle
+        timeout; a template that failed to wire the env var would
+        silently leave every deployed worker on the code default, and a
+        drifted template default would make the deployed fleet disagree
+        with what the code documents.
+    When:
+        The container's Environment entries and the parameter default
+        are read.
+    Then:
+        ``CFDB_WORKER_IDLE_TIMEOUT_SECONDS`` should reference the
+        parameter, and the parameter default should equal
+        ``worker_main.DEFAULT_IDLE_TIMEOUT_SECONDS``.
+    """
+    # Arrange
+    from cfdb.workflows.worker_main import DEFAULT_IDLE_TIMEOUT_SECONDS
+
+    template = _load_template("workers.yml")
+    container = template["Resources"]["WorkerTaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    plain_env = {
+        entry["Name"]: entry.get("Value")
+        for entry in container["Environment"]
+        if isinstance(entry, dict) and "Name" in entry
+    }
+    default = template["Parameters"]["WorkerIdleTimeoutSeconds"]["Default"]
+
+    # Assert
+    assert plain_env.get("CFDB_WORKER_IDLE_TIMEOUT_SECONDS") == {
+        "Ref": "WorkerIdleTimeoutSeconds"
+    }
+    assert float(default) == DEFAULT_IDLE_TIMEOUT_SECONDS
+
+
+def test_worker_max_lifetime_should_be_wired_and_agree_with_the_application_default():
+    """Test that the max-lifetime knob reaches the worker and matches the code.
+
+    Given:
+        The workers template's WorkerMaxLifetimeSeconds parameter and
+        container definition. The ceiling is the backstop behind idle
+        shutdown; a template that failed to wire the env var would
+        silently leave every deployed worker on the code default, and a
+        drifted template default would make the deployed fleet disagree
+        with what the code documents.
+    When:
+        The container's Environment entries and the parameter default
+        are read.
+    Then:
+        ``CFDB_WORKER_MAX_LIFETIME_SECONDS`` should reference the
+        parameter, and the parameter default should equal
+        ``worker_main.DEFAULT_MAX_LIFETIME_SECONDS``.
+    """
+    # Arrange
+    from cfdb.workflows.worker_main import DEFAULT_MAX_LIFETIME_SECONDS
+
+    template = _load_template("workers.yml")
+    container = template["Resources"]["WorkerTaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    plain_env = {
+        entry["Name"]: entry.get("Value")
+        for entry in container["Environment"]
+        if isinstance(entry, dict) and "Name" in entry
+    }
+    default = template["Parameters"]["WorkerMaxLifetimeSeconds"]["Default"]
+
+    # Assert
+    assert plain_env.get("CFDB_WORKER_MAX_LIFETIME_SECONDS") == {
+        "Ref": "WorkerMaxLifetimeSeconds"
+    }
+    assert float(default) == DEFAULT_MAX_LIFETIME_SECONDS
+
+
+def test_worker_max_lifetime_grace_should_be_wired_and_agree_with_the_application_default():
+    """Test that the self-termination grace reaches the worker and matches the code.
+
+    Given:
+        The workers template's WorkerMaxLifetimeGraceSeconds parameter
+        and container definition. The grace is what makes the idle and
+        max-lifetime exits drain in-flight work instead of cancelling
+        it; a template that failed to wire the env var or drifted from
+        the code default would silently change how much drain a deployed
+        worker actually grants.
+    When:
+        The container's Environment entries and the parameter default
+        are read.
+    Then:
+        ``CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS`` should reference the
+        parameter, and the parameter default should equal
+        ``worker_main.DEFAULT_MAX_LIFETIME_GRACE_SECONDS``.
+    """
+    # Arrange
+    from cfdb.workflows.worker_main import DEFAULT_MAX_LIFETIME_GRACE_SECONDS
+
+    template = _load_template("workers.yml")
+    container = template["Resources"]["WorkerTaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    plain_env = {
+        entry["Name"]: entry.get("Value")
+        for entry in container["Environment"]
+        if isinstance(entry, dict) and "Name" in entry
+    }
+    default = template["Parameters"]["WorkerMaxLifetimeGraceSeconds"]["Default"]
+
+    # Assert
+    assert plain_env.get("CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS") == {
+        "Ref": "WorkerMaxLifetimeGraceSeconds"
+    }
+    assert float(default) == DEFAULT_MAX_LIFETIME_GRACE_SECONDS
+
+
 def test_worker_tls_identity_should_only_render_when_mtls_is_enabled():
     """Test that the worker identity env var is gated on mTLS.
 

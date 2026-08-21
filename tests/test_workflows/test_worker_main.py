@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 from unittest.mock import patch
 
+import grpc
 import pytest
 import pytest_asyncio
+import wool
 from botocore.exceptions import ClientError
 from click.testing import CliRunner
 
@@ -51,7 +53,11 @@ class TestMainCli:
         for var in (
             "CFDB_WORKER_GRPC_PORT",
             "CFDB_WORKER_HEALTH_PORT",
+            "CFDB_WORKER_IDLE_TIMEOUT_SECONDS",
+            "CFDB_WORKER_IDLE_POLL_INTERVAL_SECONDS",
+            "CFDB_WORKER_IDLE_POLL_FAILURE_LIMIT",
             "CFDB_WORKER_MAX_LIFETIME_SECONDS",
+            "CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS",
             "CFDB_WORKER_DRAIN_GRACE_SECONDS",
             "CFDB_WORKER_TLS_CA",
             "CFDB_WORKER_TLS_CERT",
@@ -66,7 +72,20 @@ class TestMainCli:
         assert exit_code == 0
         assert captured["worker_port"] == worker_main.DEFAULT_WORKER_PORT
         assert captured["health_port"] == worker_main.DEFAULT_HEALTH_PORT
+        assert captured["idle_timeout_seconds"] == worker_main.DEFAULT_IDLE_TIMEOUT_SECONDS
+        assert (
+            captured["idle_poll_interval_seconds"]
+            == worker_main.DEFAULT_IDLE_POLL_INTERVAL_SECONDS
+        )
+        assert (
+            captured["idle_poll_failure_limit"]
+            == worker_main.DEFAULT_IDLE_POLL_FAILURE_LIMIT
+        )
         assert captured["max_lifetime_seconds"] == worker_main.DEFAULT_MAX_LIFETIME_SECONDS
+        assert (
+            captured["max_lifetime_grace_seconds"]
+            == worker_main.DEFAULT_MAX_LIFETIME_GRACE_SECONDS
+        )
         assert captured["drain_grace_seconds"] == worker_main.DEFAULT_DRAIN_GRACE_SECONDS
         assert captured["tls_ca"] is None
         assert captured["tls_cert"] is None
@@ -85,7 +104,11 @@ class TestMainCli:
         # Arrange
         monkeypatch.setenv("CFDB_WORKER_GRPC_PORT", "60001")
         monkeypatch.setenv("CFDB_WORKER_HEALTH_PORT", "9001")
+        monkeypatch.setenv("CFDB_WORKER_IDLE_TIMEOUT_SECONDS", "60")
+        monkeypatch.setenv("CFDB_WORKER_IDLE_POLL_INTERVAL_SECONDS", "5")
+        monkeypatch.setenv("CFDB_WORKER_IDLE_POLL_FAILURE_LIMIT", "7")
         monkeypatch.setenv("CFDB_WORKER_MAX_LIFETIME_SECONDS", "1800")
+        monkeypatch.setenv("CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS", "900")
         monkeypatch.setenv("CFDB_WORKER_DRAIN_GRACE_SECONDS", "10")
 
         # Act
@@ -95,7 +118,11 @@ class TestMainCli:
         assert exit_code == 0
         assert captured["worker_port"] == 60001
         assert captured["health_port"] == 9001
+        assert captured["idle_timeout_seconds"] == 60.0
+        assert captured["idle_poll_interval_seconds"] == 5.0
+        assert captured["idle_poll_failure_limit"] == 7
         assert captured["max_lifetime_seconds"] == 1800.0
+        assert captured["max_lifetime_grace_seconds"] == 900.0
         assert captured["drain_grace_seconds"] == 10.0
 
     def test_main_cli_flags_override_env_vars(self, monkeypatch):
@@ -111,13 +138,26 @@ class TestMainCli:
         """
         # Arrange
         monkeypatch.setenv("CFDB_WORKER_GRPC_PORT", "60001")
+        monkeypatch.setenv("CFDB_WORKER_IDLE_TIMEOUT_SECONDS", "60")
+        monkeypatch.setenv("CFDB_WORKER_MAX_LIFETIME_GRACE_SECONDS", "7200")
 
         # Act
-        exit_code, captured = _invoke(["--worker-port", "55555"])
+        exit_code, captured = _invoke(
+            [
+                "--worker-port",
+                "55555",
+                "--idle-timeout-seconds",
+                "30",
+                "--max-lifetime-grace-seconds",
+                "3600",
+            ]
+        )
 
         # Assert
         assert exit_code == 0
         assert captured["worker_port"] == 55555
+        assert captured["idle_timeout_seconds"] == 30.0
+        assert captured["max_lifetime_grace_seconds"] == 3600.0
 
     def test_main_rejects_out_of_range_worker_port(self, monkeypatch):
         """Test that a port outside [1, 65535] is rejected at parse time.
@@ -269,6 +309,456 @@ class TestServeBackpressureWiring:
 
         # Assert
         assert local_worker.call_args.kwargs["backpressure"] is None
+
+
+def _arrange_idle_serve(mocker, monkeypatch, *, idle_effect):
+    """Patch ``serve``'s collaborators for a full run-loop pass.
+
+    Unlike ``_arrange_serve`` the fake worker starts cleanly, so ``serve``
+    enters its run loop and exercises the idle-poll path for real; the
+    health server is left unpatched — tests pass ``health_port=0`` so it
+    binds an ephemeral port for the run's duration. ``idle_effect``
+    becomes the fake connection's ``idle`` side effect. Returns
+    ``(worker, connection_cls, connection)``.
+    """
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    mocker.patch.object(worker_main, "build_worker_credentials", return_value=None)
+    worker_instance = mocker.Mock()
+    worker_instance.start = mocker.AsyncMock()
+    worker_instance.stop = mocker.AsyncMock()
+    mocker.patch.object(
+        worker_main.wool, "LocalWorker", return_value=worker_instance
+    )
+    connection = mocker.Mock()
+    connection.idle = mocker.AsyncMock(side_effect=idle_effect)
+    connection.close = mocker.AsyncMock()
+    connection_cls = mocker.patch.object(
+        worker_main.wool, "WorkerConnection", return_value=connection
+    )
+    return worker_instance, connection_cls, connection
+
+
+class TestServeIdleShutdown:
+    @pytest.mark.asyncio
+    async def test_serve_should_exit_when_idle_exceeds_timeout(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that crossing the idle threshold shuts the worker down.
+
+        Given:
+            A worker whose idle RPC reports more continuous idle time
+            than the configured idle timeout.
+        When:
+            ``serve`` is run.
+        Then:
+            It should exit through the idle path on the first poll —
+            with a bounded per-poll RPC deadline, and stopping the
+            worker with the drain grace so a dispatch racing the
+            teardown completes instead of being cancelled.
+        """
+        # Arrange
+        worker, _, connection = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=[10.0]
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            result = await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                max_lifetime_seconds=60.0,
+                max_lifetime_grace_seconds=7.5,
+            )
+
+        # Assert
+        assert result == 0
+        assert any("Idle for" in record.message for record in caplog.records)
+        assert connection.idle.await_count == 1
+        poll_timeout = connection.idle.await_args.kwargs["timeout"]
+        assert 0 < poll_timeout < float("inf")
+        worker.stop.assert_awaited_once_with(grace=7.5)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_keep_serving_when_worker_busy(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that a busy worker is never reaped by the idle path.
+
+        Given:
+            A worker whose idle RPC always reports zero (work in
+            flight) and a short max lifetime.
+        When:
+            ``serve`` is run.
+        Then:
+            It should poll idle at least once without exiting on it and
+            terminate via the max-lifetime backstop instead — stopping
+            the worker with the drain grace so the in-flight job the
+            expiry interrupted completes rather than being cancelled.
+        """
+        # Arrange
+        worker, _, connection = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=lambda **_: 0.0
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            result = await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                max_lifetime_seconds=0.5,
+                max_lifetime_grace_seconds=7.5,
+            )
+
+        # Assert
+        assert result == 0
+        assert connection.idle.await_count >= 1
+        assert any("Max lifetime" in record.message for record in caplog.records)
+        worker.stop.assert_awaited_once_with(grace=7.5)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_not_dial_idle_connection_when_timeout_zero(
+        self, mocker, monkeypatch
+    ):
+        """Test that the disable sentinel skips the idle connection.
+
+        Given:
+            ``idle_timeout_seconds`` set to 0 and a short max lifetime.
+        When:
+            ``serve`` is run.
+        Then:
+            It should never construct a ``WorkerConnection``, restoring
+            the pure max-lifetime behavior.
+        """
+        # Arrange
+        _, connection_cls, _ = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=[0.0]
+        )
+
+        # Act
+        result = await worker_main.serve(
+            worker_port=0,
+            health_port=0,
+            idle_timeout_seconds=0.0,
+            max_lifetime_seconds=1e-6,
+        )
+
+        # Assert
+        assert result == 0
+        connection_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_serve_should_fall_back_to_max_lifetime_when_idle_rpc_unimplemented(
+        self, mocker, monkeypatch
+    ):
+        """Test that a worker without the idle RPC disables idle polling.
+
+        Given:
+            A worker whose idle RPC raises ``IdleUnavailable`` and a
+            short max lifetime.
+        When:
+            ``serve`` is run.
+        Then:
+            It should poll exactly once, keep serving, and exit via the
+            max-lifetime backstop — a version-skew scenario must not
+            crash-loop the poll.
+        """
+        # Arrange
+        _, _, connection = _arrange_idle_serve(
+            mocker,
+            monkeypatch,
+            idle_effect=wool.IdleUnavailable("no idle rpc"),
+        )
+
+        # Act
+        result = await worker_main.serve(
+            worker_port=0,
+            health_port=0,
+            idle_timeout_seconds=5.0,
+            idle_poll_interval_seconds=0.01,
+            max_lifetime_seconds=0.5,
+        )
+
+        # Assert
+        assert result == 0
+        assert connection.idle.await_count == 1
+        connection.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_serve_should_keep_polling_when_idle_poll_fails_transiently(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that a flaky idle poll is retried rather than fatal.
+
+        Given:
+            A worker whose idle RPC fails transiently once and then
+            reports idle time beyond the threshold.
+        When:
+            ``serve`` is run.
+        Then:
+            It should survive the failed poll and exit via the idle
+            path on the next cadence, so a flaky poll never kills a
+            worker.
+        """
+        # Arrange
+        _, _, connection = _arrange_idle_serve(
+            mocker,
+            monkeypatch,
+            idle_effect=[
+                wool.TransientRpcError(grpc.StatusCode.UNAVAILABLE, "poll failed"),
+                10.0,
+            ],
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            result = await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                max_lifetime_seconds=60.0,
+            )
+
+        # Assert
+        assert result == 0
+        assert connection.idle.await_count == 2
+        assert any("Idle for" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_dial_loopback_with_the_worker_credentials(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that the idle connection targets the worker's own port.
+
+        Given:
+            A credentials builder returning a sentinel object and a
+            non-default worker port.
+        When:
+            ``serve`` is run until the idle path exits it.
+        Then:
+            It should construct the ``WorkerConnection`` against
+            loopback at the worker port with those same credentials, so
+            the idle poll verifies mTLS the same way wool's own
+            drain channel does.
+        """
+        # Arrange
+        credentials = object()
+        _, connection_cls, _ = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=[10.0]
+        )
+        mocker.patch.object(
+            worker_main, "build_worker_credentials", return_value=credentials
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            await worker_main.serve(
+                worker_port=50055,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                max_lifetime_seconds=60.0,
+            )
+
+        # Assert
+        connection_cls.assert_called_once_with(
+            "127.0.0.1:50055", credentials=credentials
+        )
+        assert any("Idle for" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_close_idle_connection_on_shutdown(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that shutdown releases the idle connection's resources.
+
+        Given:
+            A worker that exits via the idle path.
+        When:
+            ``serve`` returns.
+        Then:
+            It should close the ``WorkerConnection`` so pooled channels
+            are released alongside the worker's own teardown.
+        """
+        # Arrange
+        _, _, connection = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=[10.0]
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                max_lifetime_seconds=60.0,
+            )
+
+        # Assert
+        connection.close.assert_awaited_once()
+        assert any("Idle for" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_disable_idle_polling_when_poll_fails_persistently(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that sustained poll failure escalates once and stops polling.
+
+        Given:
+            A worker whose idle RPC fails on every poll and a failure
+            limit of two.
+        When:
+            ``serve`` is run.
+        Then:
+            It should emit exactly one ERROR naming the max-lifetime
+            bound, poll no further, and exit via the backstop — one
+            actionable signal instead of hours of identical warnings.
+        """
+        # Arrange
+        _, _, connection = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=RuntimeError("subprocess dead")
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            result = await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                idle_poll_failure_limit=2,
+                max_lifetime_seconds=2.5,
+            )
+
+        # Assert
+        assert result == 0
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "disabling idle shutdown" in errors[0].getMessage()
+        assert "max-lifetime backstop" in errors[0].getMessage()
+        assert connection.idle.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_serve_should_keep_polling_when_idle_poll_fails_nontransiently(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that isolated failures below the limit never escalate.
+
+        Given:
+            A worker whose idle RPC fails non-transiently, succeeds
+            (resetting the consecutive-failure count), fails again, and
+            then reports idle beyond the threshold — with a failure
+            limit of two.
+        When:
+            ``serve`` is run.
+        Then:
+            It should retry through both isolated failures without
+            escalating to ERROR and exit via the idle path, so only
+            *consecutive* failures count toward the limit.
+        """
+        # Arrange
+        _, _, connection = _arrange_idle_serve(
+            mocker,
+            monkeypatch,
+            idle_effect=[
+                RuntimeError("blip"),
+                0.0,
+                RuntimeError("blip"),
+                10.0,
+            ],
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            result = await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                idle_poll_failure_limit=2,
+                max_lifetime_seconds=60.0,
+            )
+
+        # Assert
+        assert result == 0
+        assert connection.idle.await_count == 4
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("Idle for" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_keep_serving_when_idle_below_threshold(
+        self, mocker, monkeypatch, caplog
+    ):
+        """Test that partial idle accumulation does not trigger the exit.
+
+        Given:
+            A worker whose idle RPC reports idle time strictly between
+            zero and the threshold, and a short max lifetime.
+        When:
+            ``serve`` is run.
+        Then:
+            It should keep serving through those polls and exit via the
+            max-lifetime backstop, so a worker inside an ordinary
+            dispatch gap is not reaped early.
+        """
+        # Arrange
+        _, _, connection = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=lambda **_: 3.0
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            result = await worker_main.serve(
+                worker_port=0,
+                health_port=0,
+                idle_timeout_seconds=5.0,
+                idle_poll_interval_seconds=0.01,
+                max_lifetime_seconds=0.5,
+            )
+
+        # Assert
+        assert result == 0
+        assert connection.idle.await_count >= 1
+        assert any("Max lifetime" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_serve_should_stop_worker_when_idle_connection_close_fails(
+        self, mocker, monkeypatch
+    ):
+        """Test that a close failure does not skip the worker teardown.
+
+        Given:
+            A worker exiting via the idle path whose ``WorkerConnection``
+            raises on ``close``.
+        When:
+            ``serve`` runs to completion.
+        Then:
+            It should still return 0 and stop the worker, so a teardown
+            hiccup on the poll channel never leaks the worker itself.
+        """
+        # Arrange
+        worker, _, connection = _arrange_idle_serve(
+            mocker, monkeypatch, idle_effect=[10.0]
+        )
+        connection.close = mocker.AsyncMock(side_effect=RuntimeError("close failed"))
+
+        # Act
+        result = await worker_main.serve(
+            worker_port=0,
+            health_port=0,
+            idle_timeout_seconds=5.0,
+            idle_poll_interval_seconds=0.01,
+            max_lifetime_seconds=60.0,
+        )
+
+        # Assert
+        assert result == 0
+        worker.stop.assert_awaited_once()
 
 
 #: Task ARN the fake ECS metadata endpoint reports.
