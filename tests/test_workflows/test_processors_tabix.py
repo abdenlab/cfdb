@@ -15,6 +15,7 @@ from cfdb.workflows.cache import LocalFsCache
 from cfdb.workflows.events import Complete
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors import tabix as tabix_module
+from cfdb.workflows.processors.bam import BamIndexProcessor
 from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 from tests.test_workflows import FIXTURE_MD5
 
@@ -264,6 +265,52 @@ def test__source_looks_processable_should_reject_any_starch_prefixed_payload(pay
 
 
 class TestTabixIntervalProcessor:
+    def test_processor_id_should_be_the_pinned_literal(self):
+        """Test that the shipped identity is exactly "tabix-interval".
+
+        Given:
+            The shipped TabixIntervalProcessor class.
+        When:
+            processor_id is read off it.
+        Then:
+            It should be exactly "tabix-interval". The literal is
+            asserted rather than derived because it is a wire constant —
+            the README documents it inside an example key, and changing
+            the string silently invalidates every cached tabix artifact.
+        """
+        # Act & assert
+        assert TabixIntervalProcessor.processor_id == "tabix-interval"
+
+    def test_cache_key_for_should_differ_from_the_bam_processor_at_equal_version(self):
+        """Test that the two shipped processors cannot alias.
+
+        Given:
+            TabixIntervalProcessor and BamIndexProcessor, which both
+            declare processor_version 2, and one file identity.
+        When:
+            cache_key_for is called on each for the INDEX artifact.
+        Then:
+            It should return distinct keys. This is the exact pair the
+            issue names as staying apart only by the accident of disjoint
+            supported_formats; the identity segment now separates them
+            whatever their formats or versions.
+        """
+        # Arrange
+        meta = {
+            "dcc": {"dcc_abbreviation": "ENCODE"},
+            "local_id": "ENCFF1",
+            "md5": FIXTURE_MD5,
+        }
+
+        # Act
+        tabix = TabixIntervalProcessor().cache_key_for(meta, ArtifactKind.INDEX)
+        bam = BamIndexProcessor().cache_key_for(meta, ArtifactKind.INDEX)
+
+        # Assert
+        assert TabixIntervalProcessor.processor_version == 2
+        assert BamIndexProcessor.processor_version == 2
+        assert tabix != bam
+
     @pytest.mark.parametrize(
         "fmt",
         ["VCF", "GFF", "GFF3", "GTF", "BED", "BroadPeak", "NarrowPeak", "bigBed"],
@@ -490,6 +537,7 @@ class TestTabixIntervalProcessor:
             local_id="ENCFF-VCF",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         cache = LocalFsCache(cache_root)
@@ -637,6 +685,7 @@ class TestTabixIntervalProcessorPipelines:
             local_id="ENCFF-BED",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=TabixIntervalProcessor.processor_id,
             processor_version=TabixIntervalProcessor().processor_version,
         )
         assert await cache.head(data_key) is None
@@ -693,6 +742,7 @@ class TestTabixIntervalProcessorPipelines:
             local_id=f"ENCFF-{fmt}",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=TabixIntervalProcessor.processor_id,
             processor_version=TabixIntervalProcessor().processor_version,
         )
         assert await cache.head(data_key) is None
@@ -785,6 +835,7 @@ class TestTabixIntervalProcessorPipelines:
             local_id="ENCFF-bigBed",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=TabixIntervalProcessor.processor_id,
             processor_version=TabixIntervalProcessor().processor_version,
         )
         assert await cache.head(data_key) is None
@@ -818,6 +869,7 @@ class TestTabixIntervalProcessorPipelines:
             local_id="ENCFF-BED",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=TabixIntervalProcessor.processor_id,
             processor_version=1,
         )
         await cache.put(v1_key, seed)
@@ -844,6 +896,7 @@ class TestTabixIntervalProcessorPipelines:
             local_id="ENCFF-BED",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=TabixIntervalProcessor.processor_id,
             processor_version=TabixIntervalProcessor().processor_version,
         )
         assert current_key != v1_key

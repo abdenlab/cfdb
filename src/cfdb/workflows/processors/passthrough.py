@@ -20,6 +20,7 @@ class PassthroughProcessor(Processor):
     returns False and ``run`` is never invoked.
     """
 
+    processor_id = "passthrough"
     processor_version = 0
     supported_formats = frozenset({"CSV", "TSV", "bigWig"})
     artifact_kinds = ()

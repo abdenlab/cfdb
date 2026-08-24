@@ -29,8 +29,11 @@ from pathlib import Path
 import pytest
 from allpairspy import AllPairs
 
+from cfdb.workflows.keys import is_legacy_cache_key
 from cfdb.workflows.lock import get_job
 from cfdb.workflows.models import JobStatus
+from cfdb.workflows.processors.bam import BamIndexProcessor
+from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 
 from tests.integration.conftest import (
     CacheState,
@@ -44,6 +47,30 @@ from tests.integration.conftest import (
 
 
 pytestmark = pytest.mark.integration
+
+
+def _assert_production_key_shape(record, expected_processor_id: str) -> None:
+    """Assert every persisted artifact key carries a processor identity.
+
+    The e2e assertions elsewhere in this file join a cached path from
+    ``artifact_cache_keys`` and check the bytes, which stays true under
+    any key scheme. This is the one place a real processor, driven
+    through a real worker, is made to prove it wrote under the current
+    five-segment shape — and that the sweep would not claim what it
+    just produced.
+
+    MUST be called OUTSIDE the ``xfail_known_bugs`` body. That fixture
+    converts a matching exception into ``pytest.xfail``, so an
+    ``AssertionError`` raised inside the body cannot fail the run — this
+    assertion would silently become decorative. The identity is passed in
+    rather than looked up from the executor so the check pins which
+    processor ran, instead of agreeing with whatever the executor reports.
+    """
+    for key in record.artifact_cache_keys.values():
+        segments = key.split("/")
+        assert len(segments) == 5, key
+        assert segments[3] == expected_processor_id, key
+        assert is_legacy_cache_key(key) is False, key
 
 
 def _stage_for_tabix(cached_bgz: Path, cached_tbi: Path, stage_dir: Path) -> Path:
@@ -186,8 +213,10 @@ class TestProcessorE2E:
                     check=True,
                     capture_output=True,
                 )
+            return final
 
-        await xfail_known_bugs(scenario, _body)
+        final = await xfail_known_bugs(scenario, _body)
+        _assert_production_key_shape(final, BamIndexProcessor.processor_id)
 
     @pytest.mark.asyncio
     async def test_ensure_workflow_should_convert_and_index_sam_input(
@@ -303,8 +332,10 @@ class TestProcessorE2E:
                     text=True,
                 )
                 assert query.stdout.count("\n") > 0
+            return final
 
-        await xfail_known_bugs(scenario, _body)
+        final = await xfail_known_bugs(scenario, _body)
+        _assert_production_key_shape(final, TabixIntervalProcessor.processor_id)
 
     @pytest.mark.parametrize("scenario", _BED_LIKE_SCENARIOS, ids=str)
     @pytest.mark.asyncio
@@ -372,8 +403,10 @@ class TestProcessorE2E:
                     text=True,
                 )
                 assert query.stdout.count("\n") > 0
+            return final
 
-        await xfail_known_bugs(scenario, _body)
+        final = await xfail_known_bugs(scenario, _body)
+        _assert_production_key_shape(final, TabixIntervalProcessor.processor_id)
 
     @pytest.mark.asyncio
     async def test_ensure_workflow_should_convert_gtf_to_gff3_and_index(
