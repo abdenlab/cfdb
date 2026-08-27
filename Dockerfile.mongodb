@@ -1,8 +1,25 @@
 FROM mongo:latest
 
-# Copy database dump and scripts
-COPY database/ /data/database/
 COPY scripts/create-indexes.js /scripts/create-indexes.js
+
+# The sample dump is NOT baked into the image. It used to be — `COPY
+# database/ /data/database/` — but `database/` is gitignored (the 4DN
+# backup was removed from the repo in 2fc98f8), so on a clean checkout
+# the directory does not exist at all and the COPY failed the build
+# outright with `"/database": not found`. The build only appeared to
+# work on machines where a stray file such as `.DS_Store` happened to
+# keep the directory alive.
+#
+# Mounting the dump at run time instead (see the `mongodb` target in the
+# Makefile) fixes that and is the better shape regardless: the image no
+# longer varies with whatever a developer happens to have on disk, and
+# obtaining a dump later is a container restart rather than a rebuild.
+# The directory is created here so `mongorestore` always has a valid
+# target — it exits 1 on a path that does not exist, which under
+# `set -e` below would take the container down — and so running the
+# image with no mount at all degrades to "empty database" rather than
+# to a crash.
+RUN mkdir -p /data/database
 
 # Create startup script (development mode only)
 COPY <<'EOF' /startup.sh
@@ -22,9 +39,19 @@ until mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
 done
 echo "MongoDB started."
 
-# Restore database
-echo "Restoring database..."
-mongorestore --gzip /data/database
+# Restore the dump, if one was mounted. `set -e` is deliberately kept:
+# a failed restore of a dump that IS present should stop the container
+# rather than leave a half-loaded database looking healthy. The empty
+# case is not a failure though, so it is reported as such instead of
+# being left to mongorestore's "0 document(s) restored" trace, which
+# reads like something went wrong.
+if [ -n "$(ls -A /data/database 2>/dev/null)" ]; then
+    echo "Restoring database from /data/database..."
+    mongorestore --gzip /data/database
+else
+    echo "No dump at /data/database — starting with an empty database."
+    echo "Populate it with 'curl -X POST http://localhost:8000/sync'."
+fi
 
 # Create indexes
 echo "Creating indexes..."

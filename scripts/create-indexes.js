@@ -17,7 +17,37 @@ function ensureIndex(coll, keys, opts) {
         throw new Error("ensureIndex requires opts.name");
     }
     var name = opts.name;
-    var existing = coll.getIndexes();
+    // ``getIndexes`` raises NamespaceNotFound (code 26, "ns does not
+    // exist") when the collection has never been written to. On a
+    // database with no dump restored — the normal state of a clean
+    // checkout, since the sample dump is gitignored and no longer
+    // shipped — that is every collection this script touches. The bare
+    // ``createIndex`` calls elsewhere in this file are immune because
+    // ``createIndex`` creates the namespace implicitly; this helper is
+    // the only code path that reads the existing indexes first, which
+    // is why ``jobs`` was the single collection that aborted the run
+    // (and, under ``set -e`` in Dockerfile.mongodb's startup script,
+    // took the whole container down with it on exit 1).
+    //
+    // A namespace that does not exist trivially holds no index that
+    // could conflict, so treat it as the empty list and fall through to
+    // ``createIndex``, which creates the collection along with the
+    // index. This preserves the drop-and-recreate contract exactly: a
+    // collection with no indexes cannot produce a name match, so the
+    // IndexOptionsConflict path below is unreachable in this case and
+    // stays untouched for the case it was written for. Only
+    // NamespaceNotFound is swallowed — any other server error still
+    // propagates, so a genuine failure is not masked into a silently
+    // half-indexed database.
+    var existing;
+    try {
+        existing = coll.getIndexes();
+    } catch (e) {
+        if (e.codeName !== "NamespaceNotFound" && e.code !== 26) {
+            throw e;
+        }
+        existing = [];
+    }
     var match = null;
     for (var i = 0; i < existing.length; i++) {
         if (existing[i].name === name) {
