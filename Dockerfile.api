@@ -41,7 +41,7 @@ WORKDIR /app
 # UCSC ships a new build the layer rebuilds with the new hash after
 # maintainers re-verify out-of-band. Updating: download the binary,
 # run ``sha256sum``, paste here.
-ARG UCSC_BIGBEDTOBED_SHA256=9d1ea2158f5aa958fd8820fb7a2e5fb0947a9da7b183b8f9237429b8fbacd386
+ARG UCSC_BIGBEDTOBED_SHA256=f69501853a8966afce2d473ae2185e682173ba43c252eb754a564f962eba5afb
 
 # sha256 of the AWS RDS combined CA bundle this image embeds. AWS
 # rotates ``global-bundle.pem`` periodically (next-public rotations are
