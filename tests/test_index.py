@@ -765,6 +765,7 @@ class TestStreamIndexFileWorkflowPaths:
             local_id="4DNFIBAM01",
             artifact_kind=ArtifactKind.INDEX,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         await cache.put(index_key, src)
@@ -1335,6 +1336,7 @@ class TestStreamIndexFileStatus:
             local_id="4DNFIBAM01",
             artifact_kind=ArtifactKind.INDEX,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         await cache.put(index_key, src)

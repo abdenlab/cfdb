@@ -206,6 +206,32 @@ class _StubProcessor(Processor):
         yield {"event": "complete", "artifacts": {}}
 
 
+#: The key the retired scheme minted for ``_file_doc``'s identity. An
+#: artifact sitting here must be unreachable through every serving path,
+#: which is what makes the ``purge-legacy-cache`` sweep safe to run.
+_LEGACY_CACHE_KEY = f"encode/ENCFF123/data/{FIXTURE_MD5}-v0"
+
+
+def _foreign_processor_key(processor: Processor) -> str:
+    """Return the key a *different* processor derives for the same file.
+
+    Identical in every component the two processors share — file, artifact
+    kind, md5, and processor version — differing only in the identity
+    segment. That is precisely the artifact the pre-#109 scheme would have
+    served as a cache hit.
+    """
+    from cfdb.workflows import keys as key_utils
+
+    return key_utils.cache_key(
+        dcc="encode",
+        local_id="ENCFF123",
+        artifact_kind=ArtifactKind.DATA,
+        md5=FIXTURE_MD5,
+        processor_id="some-other-processor",
+        processor_version=processor.processor_version,
+    )
+
+
 def _file_doc(**overrides) -> dict[str, Any]:
     """Return a minimal file_doc accepted by extract_identity."""
     doc = {
@@ -393,21 +419,17 @@ class TestServeWorkflowArtifactOrDispatch:
             the cached bytes.
         """
         # Arrange
-        from cfdb.workflows import keys as key_utils
-
         processor = _StubProcessor()
         registry = ProcessorRegistry()
         registry.register(processor)
         cache = LocalFsCache(tmp_path / "cache")
         src = tmp_path / "src"
         src.write_bytes(b"cached-data")
-        key = key_utils.cache_key(
-            dcc="encode",
-            local_id="ENCFF123",
-            artifact_kind=ArtifactKind.DATA,
-            md5=FIXTURE_MD5,
-            processor_version=processor.processor_version,
-        )
+        # Seed through the processor's own derivation rather than
+        # restating the formula: this test is about the router probing
+        # the key the processor writes under, so re-deriving it here
+        # would pass even if the two stopped agreeing.
+        key = processor.cache_key_for(_file_doc(), ArtifactKind.DATA)
         await cache.put(key, src)
         mocker.patch.object(api, "processor_registry", registry)
         mocker.patch.object(api, "cache", cache)
@@ -458,6 +480,135 @@ class TestServeWorkflowArtifactOrDispatch:
         assert exc_info.value.status_code == 404
         assert "head-detail-marker" in (exc_info.value.detail or "")
         assert executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_should_dispatch_when_only_another_processors_artifact_is_cached(
+        self, mocker, tmp_path
+    ):
+        """Test that one processor never serves another's artifact.
+
+        Given:
+            A cache holding an artifact for the same file, artifact kind,
+            md5, and processor version, but written under a *different*
+            processor's identity — and a GET.
+        When:
+            The helper is awaited.
+        Then:
+            It should treat the cache as a miss and dispatch a fresh
+            workflow. This is the defect the issue exists to close, made
+            observable where it would actually serve a wrong answer
+            rather than only at key derivation.
+        """
+        # Arrange
+        processor = _StubProcessor()
+        registry = ProcessorRegistry()
+        registry.register(processor)
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"other-processors-artifact")
+        await cache.put(_foreign_processor_key(processor), src)
+        executor = _RecordingExecutor(result=(_make_record(), True))
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "executor", executor)
+
+        # Act
+        resp = await serve_workflow_artifact_or_dispatch(
+            _file_doc(),
+            ArtifactKind.DATA,
+            _Request(),
+            None,
+            head_404_detail="missing",
+        )
+
+        # Assert
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 202
+        assert len(executor.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_should_raise_404_on_head_when_only_another_processors_artifact_is_cached(
+        self, mocker, tmp_path
+    ):
+        """Test that the cross-processor miss holds on the probe path too.
+
+        Given:
+            The same cache seeded under a different processor's identity,
+            and a HEAD request.
+        When:
+            The helper is awaited.
+        Then:
+            It should raise ``HTTPException(404)`` and dispatch nothing,
+            so the side-effect-free path agrees that another processor's
+            artifact is not this one's.
+        """
+        # Arrange
+        processor = _StubProcessor()
+        registry = ProcessorRegistry()
+        registry.register(processor)
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"other-processors-artifact")
+        await cache.put(_foreign_processor_key(processor), src)
+        executor = _RecordingExecutor()
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "executor", executor)
+
+        # Act & assert
+        with pytest.raises(HTTPException) as exc_info:
+            await serve_workflow_artifact_or_dispatch(
+                _file_doc(),
+                ArtifactKind.DATA,
+                _Request("HEAD"),
+                None,
+                head_404_detail="missing",
+            )
+        assert exc_info.value.status_code == 404
+        assert executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_should_dispatch_when_only_a_legacy_key_artifact_is_cached(
+        self, mocker, tmp_path
+    ):
+        """Test that a retired-scheme artifact is unreachable.
+
+        Given:
+            A cache holding an artifact for this file under the retired
+            four-segment key, and a GET.
+        When:
+            The helper is awaited.
+        Then:
+            It should dispatch a fresh workflow rather than serve it.
+            This is what makes the purge safe: nothing reads a legacy
+            key, so deleting one cannot take a servable artifact with it,
+            and the deploy shipping this change starts fully cold.
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"stale-artifact")
+        await cache.put(_LEGACY_CACHE_KEY, src)
+        executor = _RecordingExecutor(result=(_make_record(), True))
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "executor", executor)
+
+        # Act
+        resp = await serve_workflow_artifact_or_dispatch(
+            _file_doc(),
+            ArtifactKind.DATA,
+            _Request(),
+            None,
+            head_404_detail="missing",
+        )
+
+        # Assert
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 202
+        assert len(executor.calls) == 1
 
     @pytest.mark.asyncio
     async def test_should_raise_503_when_executor_is_draining(
@@ -745,21 +896,15 @@ class TestProbeWorkflowReadiness:
             called.
         """
         # Arrange
-        from cfdb.workflows import keys as key_utils
-
         processor = _StubProcessor()
         registry = ProcessorRegistry()
         registry.register(processor)
         cache = LocalFsCache(tmp_path / "cache")
         src = tmp_path / "src"
         src.write_bytes(b"cached-data")
-        key = key_utils.cache_key(
-            dcc="encode",
-            local_id="ENCFF123",
-            artifact_kind=ArtifactKind.DATA,
-            md5=FIXTURE_MD5,
-            processor_version=processor.processor_version,
-        )
+        # Seeded through the processor's own derivation — see the
+        # equivalent note on the dispatch-path cache-hit test.
+        key = processor.cache_key_for(_file_doc(), ArtifactKind.DATA)
         await cache.put(key, src)
         executor = _RecordingExecutor()
         mocker.patch.object(api, "processor_registry", registry)
@@ -771,6 +916,76 @@ class TestProbeWorkflowReadiness:
 
         # Assert
         assert result is True
+        assert executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_false_for_a_foreign_key(
+        self, mocker, tmp_path
+    ):
+        """Test that the probe agrees another processor's artifact is a miss.
+
+        Given:
+            A cache seeded only under a different processor's identity
+            for this file and artifact kind.
+        When:
+            The probe is awaited.
+        Then:
+            It should return False, matching what a GET would actually
+            do — the readiness probe and the dispatch path must not
+            disagree across the identity seam.
+        """
+        # Arrange
+        processor = _StubProcessor()
+        registry = ProcessorRegistry()
+        registry.register(processor)
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"other-processors-artifact")
+        await cache.put(_foreign_processor_key(processor), src)
+        executor = _RecordingExecutor()
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "executor", executor)
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is False
+        assert executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_probe_workflow_readiness_should_return_false_for_a_legacy_key(
+        self, mocker, tmp_path
+    ):
+        """Test that the probe reports a retired-scheme artifact as absent.
+
+        Given:
+            A cache seeded only under the retired four-segment key for
+            this file.
+        When:
+            The probe is awaited.
+        Then:
+            It should return False, so ``/status`` tells the truth about
+            a cache the migration has made cold.
+        """
+        # Arrange
+        registry = ProcessorRegistry()
+        registry.register(_StubProcessor())
+        cache = LocalFsCache(tmp_path / "cache")
+        src = tmp_path / "src"
+        src.write_bytes(b"stale-artifact")
+        await cache.put(_LEGACY_CACHE_KEY, src)
+        executor = _RecordingExecutor()
+        mocker.patch.object(api, "processor_registry", registry)
+        mocker.patch.object(api, "cache", cache)
+        mocker.patch.object(api, "executor", executor)
+
+        # Act
+        result = await probe_workflow_readiness(_file_doc(), ArtifactKind.DATA)
+
+        # Assert
+        assert result is False
         assert executor.calls == []
 
     @pytest.mark.asyncio

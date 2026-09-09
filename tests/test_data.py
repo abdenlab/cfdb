@@ -443,6 +443,7 @@ class TestStreamFileWorkflowPath:
             local_id="4DNFISAM01",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         await cache.put(data_key, src)
@@ -810,6 +811,7 @@ class TestStreamFileStatus:
             local_id="4DNFISAM01",
             artifact_kind=ArtifactKind.DATA,
             md5=FIXTURE_MD5,
+            processor_id=processor.processor_id,
             processor_version=processor.processor_version,
         )
         await cache.put(data_key, src)

@@ -133,6 +133,7 @@ class BamIndexProcessor(Processor):
       ``ArtifactKind.INDEX``.
     """
 
+    processor_id = "bam-index"
     processor_version = 2
     supported_formats = frozenset({"BAM", "SAM"})
     #: Class-level default. Real per-file advertisement comes from

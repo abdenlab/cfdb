@@ -163,6 +163,8 @@ _SELF_VALIDATING_FORMATS = frozenset({"bigBed"})
 class TabixIntervalProcessor(Processor):
     """Handle plain-text genomic interval formats and produce a tabix index."""
 
+    processor_id = "tabix-interval"
+
     # v2: the source-encoding guard (issue #69) changed which sources will
     # ever be committed, so re-key all tabix artifacts — a poisoned v1
     # ``data`` entry (committed before the guard existed) becomes a cache

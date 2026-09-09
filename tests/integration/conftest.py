@@ -368,7 +368,13 @@ KNOWN_BUGS: tuple[_KnownBug, ...] = (
                 Format.SAM,
             }
         ),
-        raises=(RuntimeError, AssertionError),
+        # Scoped to the SIGPIPE signature alone. Listing ``AssertionError``
+        # here would absorb every assertion failure in nine of the eleven
+        # formats, on every platform, and report it as this known bug — so
+        # a real regression would surface as an xfail and exit 0. That is
+        # the type every assertion in the suite raises; a known-bug entry
+        # must name the failure it actually knows about.
+        raises=(RuntimeError,),
         reason=(
             "macOS dev hosts intermittently SIGPIPE the tabix/samtools "
             "subprocess from inside a wool worker — grpc poll FDs "
@@ -378,10 +384,8 @@ KNOWN_BUGS: tuple[_KnownBug, ...] = (
         ),
         retries=3,
         retryable=lambda exc: (
-            isinstance(exc, RuntimeError)
-            and "exited -13" in str(exc)
-        )
-        or isinstance(exc, AssertionError),
+            isinstance(exc, RuntimeError) and "exited -13" in str(exc)
+        ),
     ),
 )
 
@@ -567,10 +571,16 @@ def integration_workdir_root(tmp_path) -> Path:
     return root
 
 
-@pytest.fixture()
-def install_jobs_index(mock_db):
-    """Seed the partial-unique mutex index on the FakeDB jobs collection."""
-    mock_db.jobs.create_index(
+@pytest_asyncio.fixture()
+async def install_jobs_index(mock_db):
+    """Seed the partial-unique mutex index on the FakeDB jobs collection.
+
+    ``FakeCollection.create_index`` is a coroutine, matching Motor. This
+    fixture used to call it without awaiting, so the index was never
+    actually installed and every concurrent-dedup assertion below was
+    passing or failing for unrelated reasons.
+    """
+    await mock_db.jobs.create_index(
         {"workflow_key": 1},
         unique=True,
         partialFilterExpression={"active": True},
