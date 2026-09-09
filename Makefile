@@ -13,8 +13,13 @@ mongodb:
 	@docker rm mongodb 2>/dev/null || true
 	@echo "Building MongoDB image..."
 	docker build -t cfdb-mongodb -f Dockerfile.mongodb .
+	@# database/ is gitignored and empty on a clean checkout. It is a
+	@# drop-in point for an optional mongodump, mounted read-only rather
+	@# than baked into the image (see Dockerfile.mongodb). Created here so
+	@# the mount source always exists and so the drop-in point is visible.
+	@mkdir -p database
 	@echo "Starting MongoDB container..."
-	docker run -d --name mongodb --network cvh-backend-network --network-alias cvh-backend -p 27017:27017 cfdb-mongodb
+	docker run -d --name mongodb --network cvh-backend-network --network-alias cvh-backend -p 27017:27017 -v "$(CURDIR)/database:/data/database:ro" cfdb-mongodb
 	@echo "MongoDB container starting on port 27017. Check logs with: docker logs -f mongodb"
 
 build-materialize:
