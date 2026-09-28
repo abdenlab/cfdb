@@ -12,6 +12,14 @@ pip install git+https://github.com/abdenlab/cfdb.git
 
 Requires Python 3.11 or later.
 
+Matrix tile serving for Hi-C contact maps is an optional extra, because the [`abdenlab/clodius`](https://github.com/abdenlab/clodius) fork it depends on requires Python 3.12 while cfdb still supports 3.11. The dependency is pinned to a commit sha of the public fork, so enabling it needs nothing beyond the extra:
+
+```bash
+uv sync --extra tiles
+```
+
+Without it the API runs unchanged and the tile endpoints answer `501`. See [Matrix tile serving](#matrix-tile-serving-hi-c-contact-maps).
+
 ### Environment Variables
 
 | Variable | Description | Default |
@@ -25,6 +33,12 @@ Requires Python 3.11 or later.
 | `CFDB_WORKER_TLS_CERT` | Path to this process's PEM certificate on the worker gRPC channel — the worker leaf cert on a worker (`worker_main`/`worker_lan`), the API client cert on the API. Must be signed by `CFDB_WORKER_TLS_CA`. | - |
 | `CFDB_WORKER_TLS_KEY` | Path to this process's PEM private key paired with `CFDB_WORKER_TLS_CERT`. | - |
 | `CFDB_WORKER_TLS_IDENTITY` | Logical name the **API** verifies worker certificates against, in place of the address it dialed. Workers answer on addresses assigned at launch — an awsvpc IP on Fargate, a bridge IP in local containers — that no certificate minted ahead of time can name, so without this the handshake cannot succeed. The worker leaf must carry this value as a SAN; `certs/generate-worker-certs.sh` mints the default. Set to the empty string to verify against the dialed address instead. Read by every process that dials: the API on the dispatch channel, and each worker on the graceful-stop channel wool opens back to its own subprocess — so the API and the workers MUST agree on this value, or drain fails its name check and in-flight work is lost with no TLS error anywhere. Ignored while mTLS is off. See [Worker mTLS](#worker-mtls). | `cfdb-worker` |
+| `CFDB_TILESET_DISK_CACHE_BYTES` | Byte budget for the API task's local copies of contact-map artifacts. h5py opens a file rather than consuming a byte stream, so under the S3 profile an mcool must be pulled onto local disk before any tile can be read from it. Least-recently-used copies are evicted to stay inside the budget, and a copy currently being read is never removed. Keep this comfortably below the task's ephemeral storage, which it shares with `SYNC_DATA_DIR` and the container image — `cloudformation/backend.yml` sizes that disk with `ApiEphemeralStorageGiB` and passes this value with `TilesetDiskCacheBytes`, so the two move together. | `8589934592` (8 GiB) |
+| `CFDB_TILESET_OPEN_MAX` | How many tilesets may be held open at once. Each is an open h5py handle over a potentially multi-GB file, so this is a file-descriptor bound rather than a memory one. A handle evicted while a request is still reading it is closed only once that reader finishes. | `8` |
+| `CFDB_TILE_CACHE_BYTES` | Byte budget for the in-process tile cache. Bounded by bytes rather than entry count because a 256×256 float32 tile is roughly 350 KiB base64-encoded, so a plausible-sounding 20,000-entry cap would be several GB on a 2 GiB task. | `268435456` (256 MiB) |
+| `CFDB_TILE_THREADS` | Threads used to run tile reads off the event loop. **This bounds concurrency; it does not buy read parallelism** — h5py serializes on a global lock unless linked against a thread-safe HDF5 build, which the published wheels are not, so matrix tile throughput is effectively serial per API process however high this is set. What it does buy is that a multi-second tile read cannot stall `/data` and `/metadata`. The real throughput levers are the tile cache and horizontal scaling. | `2` |
+| `CFDB_TILESET_HYDRATE_TIMEOUT_S` | Seconds to wait for a cached artifact to be pulled onto local disk before answering `503 Retry-After`. This cost lands on the first `/tileset_info` for a dataset, not on any tile. | `60` |
+| `CFDB_TILESET_MAX_SOURCE_BYTES` | Refuse to materialize a contact map larger than this, checked before a byte is downloaded. `0` disables the guard. Set on the **worker**. The artifact for an `.mcool` is a copy of the upstream file, so an oversized — or mislabelled — source would otherwise fill the worker's disk and fail somewhere far less legible than at admission. | `21474836480` (20 GiB) |
 | `CFDB_API_URL` | Base URL for the cfdb API | `http://localhost:8000` |
 | `DATABASE_URL` | MongoDB connection string | `mongodb://127.0.0.1:27017` |
 | `DATABASE_NAME` | Name of the MongoDB database to use | `cfdb` |
@@ -86,6 +100,8 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 |--------|-------------|
 | `make mongodb` | Build and start MongoDB with sample data and indexes |
 | `make api` | Build and start the API container |
+| `make api-tiles` | Build and start the API container **with matrix tile serving enabled**, on a cache volume shared with the worker (local dev; see [Serving tiles locally](#serving-tiles-locally)) |
+| `make worker-tiles` | Start a containerized LAN worker pool on that same cache volume |
 | `make materialize-files` | Manually materialize all file metadata (usually done via sync) |
 | `make materialize-dcc DCC=hubmap` | Materialize a single DCC |
 | `make schema` | Regenerate the checked-in `schema.graphql` from the Strawberry schema |
@@ -866,11 +882,137 @@ curl http://localhost:8000/index/encode/ENCFF123ABC/status
 # {"ready": false}
 ```
 
+### Matrix tile serving (Hi-C contact maps)
+
+Gosling's `MatrixData` compiles to HiGlass's **native `heatmap` track**, not to `gosling-track`, because HiGlass is better optimized for matrix rendering. The consequence is that `MatrixData.url` must point at a live HiGlass tile API rather than at a file: a heatmap issues thousands of small tile requests and cannot be handed a job id to poll. Neither `/data` nor `/index` can satisfy that, so cfdb serves contact maps through a dedicated pair of endpoints that speak the HiGlass wire protocol directly. `higlass-server` itself is deliberately not deployed — it is a Django application with its own database and tileset registry, which would duplicate what the `files` collection already is.
+
+No pre-aggregation is required. Both `.mcool` and `.hic` are already multi-resolution pyramids built at creation time (a 4DN mcool typically carries 13 resolutions from 1 kb to 10 Mb; an ENCODE hic carries 17 from 10 bp to 2.5 Mb), so the only preparation is getting the bytes into a shape the tile reader can open.
+
+**Two channels, deliberately separate.** The HiGlass endpoints are pure readers that **never dispatch a workflow**; a contact map whose artifact has not been built is a `404`. Building it belongs to a separate preparation channel, which a UI drives before it mounts the Gosling spec.
+
+| Endpoint | Purpose | Dispatches? |
+|---|---|---|
+| `GET /tileset_info/?d=<uid>` | HiGlass tileset metadata | Never |
+| `GET /tiles/?d=<uid>.<z>.<x>.<y>` | Tile data | Never |
+| `GET /tilesets/{dcc}/{local_id}/status` | Side-effect-free readiness probe | Never |
+| `POST /tilesets/{dcc}/{local_id}` | Build the artifact | Yes |
+
+The tileset **uid is `{dcc}/{local_id}`** — for example `4dn/12a5bc67-e358-42ab-96e1-7893c556ded4`. Both halves must be free of `.`, because a tile id is parsed by splitting on `.` and taking the first field as the uid; no accession in the corpus contains one (4DN uses UUIDs, ENCODE uses `ENCFF…`), and a uid that does is rejected with `400`.
+
+Per format:
+
+| Extension | Count | DCC | Handling |
+|---|---|---|---|
+| `.mcool` | 773 | 4DN | Fetched into the cache as a `tileset` artifact, then read locally |
+| `.cool` | 10 | 4DN | Coarsened with `cooler zoomify` first — a flat cooler has no `resolutions` group and cannot be tiled as-is |
+| `.hic` | 3,903 | ENCODE | **Not served.** Recognized and refused with `501` — see the limitation below |
+
+Only 4DN contact maps are servable today. `.hic` is recognized as a contact map — so it is refused with a specific `501` rather than the `404` an unrecognized format gets — but no endpoint serves it. The reasoning is in the limitations below.
+
+#### Serving tiles
+
+```bash
+curl 'http://localhost:8000/tileset_info/?d=4dn/<local_id>'
+# {"4dn/<local_id>": {"resolutions": [1000, 2000, ...], "chromsizes": [["chr1", 248956422], ...],
+#                     "max_pos": [3088269832, 3088269832], "tile_size": 256,
+#                     "datatype": "matrix", "name": "4DNFI3EWJW3N.mcool",
+#                     "uuid": "4dn/<local_id>", "coordSystem": "GRCh38"}}
+
+curl 'http://localhost:8000/tiles/?d=4dn/<local_id>.0.0.0&d=4dn/<local_id>.0.1.0'
+# {"4dn/<local_id>.0.0.0": {"dense": "<base64>", "dtype": "float32", "min_value": 0.0, "max_value": 12.0, "size": 1}, ...}
+```
+
+Both endpoints accept repeatable `d` parameters, capped at 64 per request. The response carries exactly one entry per requested id — a response may safely be built by zipping request against result. A tile position the resolution ladder does not hold, and a tile id that fails to parse, both get an `{"error": ...}` object in their slot instead of tile data, so one bad id cannot blank the whole track. Tile payloads carry no `shape` field — the side length is `sqrt(len(dense))`, which is 256.
+
+| Code | Description |
+|------|-------------|
+| 200 | Tileset info or tile data returned |
+| 400 | Malformed uid, no `d` parameter, more than 64 `d` parameters, or an unknown DCC |
+| 403 | File requires consortium/protected access (HuBMAP) |
+| 404 | File not found, not a contact map, or its tileset artifact has not been built yet |
+| 501 | This build carries no tile backend (see the `tiles` extra below), or the file is a `.hic` |
+| 503 | Workflow subsystem disabled, or the artifact could not be pulled onto local disk in time (`Retry-After`) |
+
+#### Preparing a contact map
+
+```bash
+curl http://localhost:8000/tilesets/4dn/<local_id>/status      # {"ready": false}
+curl -X POST http://localhost:8000/tilesets/4dn/<local_id>     # 202, Location: /jobs/<id>
+curl http://localhost:8000/jobs/<id>                           # poll to completion
+curl http://localhost:8000/tilesets/4dn/<local_id>/status      # {"ready": true}
+```
+
+`POST` is idempotent: a file whose artifact already exists returns `200 {"ready": true}` rather than creating a no-op job. The probe never dispatches, mirroring the `/data` and `/index` readiness probes. Both answer `501` for a `.hic`, deliberately — a readiness probe that promised `ready: true` for a file the tile endpoint then refuses would be worse than no probe at all.
+
+| Code | Description |
+|------|-------------|
+| 200 | Ready — nothing to prepare |
+| 202 | Workflow accepted; `Location` points at `/jobs/{id}` |
+| 400 | Invalid DCC or path-param shape |
+| 403 | File requires consortium/protected access (HuBMAP) |
+| 404 | File not found, or not a contact map |
+| 409 | File metadata is incomplete (no md5), so no artifact can be addressed for it |
+| 429 | Active-workflow ceiling reached (`CFDB_WORKFLOW_MAX_ACTIVE`); `Retry-After` set |
+| 501 | This build carries no tile backend, or the file is a `.hic` |
+| 503 | Workflow subsystem disabled, or shutting down (`Retry-After`) |
+
+#### Serving tiles locally
+
+`make api` builds from `Dockerfile.api`, which carries no clodius, so its tile routes answer `501` — correct while the `tiles` extra stays optional, but it leaves the whole chain untestable through the documented Docker flow. `make api-tiles` layers the tile backend on (installed from the public fork at the same sha `pyproject.toml` pins) and adds the one piece `make api` does not need: a cache volume shared with a worker, because a tileset artifact is built by the worker and then opened locally by the API with h5py. Both targets are interim scaffolding and are retired once `tiles` becomes an ordinary dependency, at which point `make api` covers this on its own.
+
+The worker reuses the API image rather than `cfdb-wool`: the matrix processor needs `cooler` and `h5py`, which arrive with clodius and are absent from the worker image.
+
+```bash
+make mongodb        # database
+make worker-tiles   # worker FIRST — see below
+make api-tiles      # API with the tile backend
+```
+
+Start the worker **before** POSTing a tileset. A dispatch that finds no worker is queued rather than failed, so the job then waits out `CFDB_WORKFLOW_RETRY_INTERVAL_S` (2 min) before the retry tick picks it up — correct behaviour, but a confusing two minutes of `pending` if you were not expecting it.
+
+The database starts empty, so seed a contact-map document before requesting anything: `/tileset_info` and `/tiles` resolve a file by `{submission, local_id}` and need `filename` (the `.mcool` suffix is what routes it), `md5` (the cache key is content-addressed on it), `access_url`, `file_format.name: "HDF5"`, `dcc.dcc_abbreviation`, and `data_access_level: "public"`, plus `genome_assembly` if you want `coordSystem` in the payload. Note that 4DN's `@@download` URLs answer `403` without credentials; use the open-data S3 mirror (`4dn-open-data-public.s3.amazonaws.com`), which the URL allowlist already covers.
+
+#### Rendering in Gosling
+
+```js
+{ data: { type: "matrix", url: "http://localhost:8000/tileset_info/?d=4dn/<local_id>" } }
+```
+
+Gosling splits that URL into a server and a tileset uid, then drives `/tiles` itself.
+
+#### Wire compatibility with HiGlass
+
+The endpoints were checked against two live HiGlass servers — `https://higlass.io/api/v1` and `https://server.gosling-lang.org/api/v1` — and, more usefully, against higlass-server's own tile implementation (`clodius.tiles.cooler`, the v1 module, which the fork still ships alongside `tiles_v2`) run locally over the same `.mcool`. The `tileset_info` and tile payload shapes match: tiles carry exactly `dense`, `dtype`, `min_value`, `max_value` and `size`, 256x256, with no `shape` field. Per-tile `dtype` variation between `float16` and `float32` is not a cfdb quirk — both reference servers do the same thing.
+
+One representational difference is worth recording, because it looks alarming and is not. **higlass-server sends half of a symmetric matrix; cfdb sends the whole thing.** For a diagonal tile higlass-server emits only the lower triangle, and of each mirrored off-diagonal pair it populates one position and returns zeros for the other. cfdb populates every position with the full correct block. The values themselves agree — cfdb's tiles are bit-identical to a direct `cooler` read at every intrachromosomal resolution.
+
+This is invisible to the client, for two reasons that were verified rather than assumed:
+
+- The HiGlass client only ever *requests* one triangle. `tilesToId` asks for the tile at the transposed position with a `mirrored` flag and derives the other half itself, so the mirror-position tiles cfdb would happily serve are never fetched. For every off-diagonal tile the client actually requests, cfdb's bytes are identical to higlass-server's.
+- For diagonal tiles the client symmetrizes the payload itself, in `tileDataToPixData`, by copying the lower triangle over the upper one. That is an assignment rather than an accumulation, so on an already-symmetric tile it writes each value back over an identical value and changes nothing. Applying that same step to both servers' diagonal tiles yields identical pixel arrays. The three `extent` modes take different paths through this code and all three agree.
+
+**Do not start emitting `mirror_tiles`.** The client's `mirrorTiles()` reads `!(mirror_tiles && (mirror_tiles === false || mirror_tiles === 'false'))`, so mirroring is on unless the field is the literal *string* `"false"` — a boolean `false` does not disable it, because `false && ...` short-circuits before the equality test runs. Omitting the field, which is what cfdb does, selects the on behaviour that makes the equivalence above hold, and is what every other server in the ecosystem does.
+
+**One deliberate divergence from higlass-server: an out-of-ladder tile is a per-tile error object, not an absent key.** `clodius.tiles.cooler` (the v1 module higlass-server runs) silently omits a position past the resolution ladder, returning a batch response shorter than the request. `tiles_v2`'s `CoolerTileset` — what cfdb runs — instead returns exactly one entry per requested id, rendering the out-of-ladder position as `{"error": ..., "error_type": "TileOutOfBounds"}` in that slot. The HiGlass client does not appear to treat the two differently — it draws nothing at a position whether the key is absent or holds an error object — so this has not been observed to change what renders. It is called out because it means a response can now be built by zipping request against result, which used to be unsafe.
+
+#### Limitations
+
+- **The clodius tile backend is an optional extra, so deployed images do not carry it.** Tile reading is backed by the [`abdenlab/clodius`](https://github.com/abdenlab/clodius) fork's `tiles_v2` subpackage, installed via `uv sync --extra tiles` from a commit-pinned git reference on the fork's `main` (a sha, deliberately, rather than a floating branch reference — the fork treats `tiles_v2` as unstable and cfdb is its first consumer, so what runs must be exactly what was validated). The extra stays optional because clodius requires Python 3.12 while cfdb still supports 3.11, so `Dockerfile.api` and `Dockerfile.wool` do not install it and images built today answer `501` on the tile routes. Promoting the dependency to an unconditional one — which raises the floor to 3.12 and lets the images carry the backend — is tracked as follow-up work.
+- **ENCODE `.hic` contact maps are not served.** The pinned clodius does not carry a `.hic` tileset at all, which makes this an unconditional `501` today. It would stay unconditional even if a future clodius did carry one: `.hic` support (tracked separately, on a different path than the tiles_v2 backend above) is built on `hictkpy`, whose entry points take `str | os.PathLike` and nothing else. There is no URL, HTTP, or S3 surface in the library, so a `.hic` can only be read from a local copy. Making that copy is not viable at this corpus's scale: 3,903 files totalling ~78 TB, a median of 10.3 GB, and a largest single file of 315 GB — past the 200 GiB ceiling on Fargate ephemeral storage, so it could not be cached on an API task at any budget. Serving them needs either a remote-capable reader (hictk tracks S3 support in [paulsengroup/hictk#395](https://github.com/paulsengroup/hictk/issues/395), currently scoped to Cooler rather than `.hic`) or an explicit size cap accepting partial coverage — an 8 GiB cap would reach 43% of the files, 20 GiB 67%, 50 GiB 91%. That is deferred rather than decided. 4DN `.mcool` files are unaffected.
+- **`coordSystem` is omitted for the 21 4DN contact maps that carry no `genomeAssembly`.** It is left out entirely rather than emitted as an empty string: HiGlass matches `coordSystem` against chromosome-info tilesets, so a plausible-looking placeholder risks a silently misaligned track, whereas an absent key makes the client fall back to the `chromsizes` array every tileset info carries. The heatmap still renders.
+- **ICE-balanced heatmaps are unavailable for the 10 flat `.cool` files.** Coarsening runs without `--balance` because balancing a large flat cooler costs minutes to hours; clodius falls back cleanly to unbalanced when no `weight` column exists.
+- **Interchromosomal tiles are served as the concatenated-genome lattice clodius produces**, with no special-casing.
+- **Tile payloads are quantized per tile.** clodius emits `float16` whenever a tile's values fit that range and `float32` otherwise, so `dtype` varies from tile to tile within one tileset and a client must read it rather than assume. Verified against direct `cooler` reads: intrachromosomal tiles are bit-identical to the source data round-tripped through the declared dtype, so the only deviation is float16's ~1e-3 relative quantization on tiles that use it. That is well inside a heatmap's colour resolution, but it means tile values are not a substitute for reading the cooler when exact counts matter.
+- **The `tileset` artifact for an `.mcool` is a byte-identical copy of the upstream file.** Across all 773 4DN mcools that is a material S3 footprint if every one is ever browsed; the workers stack's `CacheArtifactExpirationDays` (30 days) trims it, at the cost of re-materializing anything revisited after a month.
+- **The local tileset copies are per-API-task.** `DesiredCount` is 1 today; scaling the API horizontally multiplies both the disk footprint and the cold-open cost, and an ALB without session affinity scatters one user's tiles across tasks.
+
 ### Preprocessing & indexing workflow
 
 Many upstream files are not directly consumable by Gosling Designer without preprocessing (e.g., sort+index for BAM, bgzip+tabix for VCF/GFF/BED). When `/data` or `/index` is called for a format that needs preprocessing and the processed artifact is not yet in cache, the API dispatches a workflow and returns `202 Accepted` with a `Location` header pointing to a job status endpoint. A subsequent call, after the workflow completes, streams the processed artifact from cache (with `Range` support). Both endpoints share a single workflow per source file via a Mongo-backed mutex.
 
 The preprocessed artifact is the default response. Clients that want the raw upstream file instead can pass `?raw=true`; on `/index`, `raw=true` serves only an upstream sidecar (e.g., 4DN's `extra_files`) and 404s when none exists. `HEAD` requests never dispatch preprocessing — on cache miss they return 404 so monitoring probes and prefetch tools cannot trigger workflows as a side-effect. Issue a `GET` when you actually want the artifact.
+
+Contact maps add a third artifact kind, `tileset`, alongside `data` and `index`. It is not streamable over `/data` or `/index` and no router serves it: unlike the other two it exists to be *opened* locally by the tile server and read a 256×256 block at a time, not handed back as bytes. It is produced only by `POST /tilesets/{dcc}/{local_id}` — see [Matrix tile serving](#matrix-tile-serving-hi-c-contact-maps). Because contact maps produce no `data` or `index` artifact, `/data` continues to stream them straight from upstream and `/index` continues to report that they have no index.
 
 | Format | Workflow | Cached artifacts |
 |--------|----------|------------------|
