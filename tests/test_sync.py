@@ -534,6 +534,35 @@ class TestPruneNonPublicHubmapRawRecords:
         assert len(mock_db.file_in_collection.docs) == 0
         assert len(mock_db.file.docs) == 0
 
+    @pytest.mark.asyncio
+    async def test_file_matched_via_persistent_id_fallback(self, mock_db):
+        """
+        GIVEN a non-public dataset whose files carry the dataset DOI as their
+              own persistent_id, with no file_in_collection entry at all --
+              the shape HuBMAP's C2M2 export actually produces, since it
+              never populates file_in_collection and the materializer falls
+              back to matching file.persistent_id against
+              collection.persistent_id (materialize/src/main.rs)
+        WHEN _prune_non_public_hubmap_raw_records is called
+        THEN the file is deleted via the persistent_id fallback match, even
+             though the file_in_collection-based path finds nothing
+        """
+        dataset_metadata = {
+            "https://doi.org/protected": {"data_access_level": "protected"},
+        }
+
+        mock_db.collection.docs = [
+            {"submission": "hubmap", "persistent_id": "https://doi.org/protected", "id_namespace": "ns", "local_id": "prot-coll"},
+        ]
+        # No file_in_collection entries at all -- HuBMAP never populates this table.
+        mock_db.file.docs = [
+            {"submission": "hubmap", "id_namespace": "ns", "local_id": "f1", "persistent_id": "https://doi.org/protected"},
+        ]
+
+        await _prune_non_public_hubmap_raw_records(dataset_metadata)
+
+        assert len(mock_db.file.docs) == 0
+
 
 # ---------------------------------------------------------------------------
 # _enrich_hubmap_collections_and_subjects
