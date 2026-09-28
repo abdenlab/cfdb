@@ -35,19 +35,23 @@ Requires Python 3.11 or later.
 ### Docker Startup
 
 ```bash
-# 1. Start MongoDB (restores sample data and creates indexes)
+# 1. Start MongoDB (creates indexes, and restores a dump if one is present)
 make mongodb
 
 # 2. Start the API server
 make api
 
-# 3. (Optional) Sync latest DCC metadata
+# 3. Populate the database
 curl -X POST http://localhost:8000/sync
 ```
 
 This starts:
 - MongoDB on port 27017 (with indexes)
 - GraphQL/REST API on port 8000
+
+**The database starts empty.** A 4DN sample dump used to be committed under `database/`, but it was removed and the directory gitignored, so a clean checkout has no data to restore and step 3 is how you get some — it is not optional. `make mongodb` still creates every index, so an empty database is a working one rather than a broken one.
+
+`database/` remains the drop-in point if you do have a dump: put a `mongodump --gzip` tree there (`database/cfdb/*.bson.gz`) and it is restored on the next `make mongodb`. It is mounted read-only at run time rather than baked into the image, so obtaining a dump later costs a container restart and not a rebuild.
 
 ### Production (TLS/X.509)
 
