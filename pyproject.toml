@@ -39,7 +39,30 @@ readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
 
 [project.optional-dependencies]
-dev = ["allpairspy", "cloudpickle", "cryptography", "debugpy", "httpx", "hypothesis", "mongomock-motor", "moto[ecs,s3]", "pytest-asyncio", "pytest-mock", "ruff"]
+dev = ["allpairspy", "clodius; python_version >= '3.12'", "cloudpickle", "cryptography", "debugpy", "httpx", "hypothesis", "mongomock-motor", "moto[ecs,s3]", "pytest-asyncio", "pytest-mock", "ruff"]
+# Matrix tile serving (issue #82). Deliberately an extra rather than a
+# runtime dependency, for two reasons that both bite if it moves.
+#
+# First, `clodius` on public PyPI is a different codebase from the fork
+# this consumes — the public releases carry no ``tiles_v2`` — so a bare
+# `pip install .` that resolved the name from PyPI would install a
+# package that imports and then fails at the first tile. An extra makes
+# that resolution impossible rather than merely unlikely.
+#
+# Second, the fork requires Python >= 3.12 while cfdb still supports
+# 3.11. An extra alone does not buy that back — uv resolves universally
+# across the whole `requires-python` range and rejects the lock outright
+# — so the dependency carries an explicit `python_version >= '3.12'`
+# marker. On 3.11 the requirement simply is not there, which is what lets
+# the 3.11 support promise survive until the dependency is made
+# unconditional.
+#
+# The consequence is that images built from the Dockerfiles do NOT carry
+# clodius, so the tile routes answer 501 there. See ``cfdb.tilesets.backend``
+# for the single import gate that makes that degradation explicit rather
+# than a partial failure. Promoting this to a real dependency is tracked
+# as follow-up work, gated on the fork being published.
+tiles = ["clodius; python_version >= '3.12'"]
 
 [project.scripts]
 cfdb = "cfdb.cli:cli"

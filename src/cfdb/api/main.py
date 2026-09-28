@@ -21,6 +21,11 @@ from cfdb.api.routers.data import router as data_router
 from cfdb.api.routers.index import router as index_router
 from cfdb.api.routers.jobs import router as jobs_router
 from cfdb.api.routers.sync import router as sync_router
+from cfdb.api.routers.tiles import router as tiles_router
+from cfdb.api.routers.tilesets import router as tilesets_router
+from cfdb.tilesets import backend as tileset_backend
+from cfdb.tilesets.service import TilesetService
+from cfdb.tilesets.service import build_service as build_tileset_service
 from cfdb.workflows.cache import (
     CacheBackend,
     LocalFsCache,
@@ -35,6 +40,7 @@ from cfdb.workflows.discovery import EcsDiscovery
 from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.loadbalancer import PriorityLoadBalancer
 from cfdb.workflows.processors.bam import BamIndexProcessor
+from cfdb.workflows.processors.matrix import MatrixTilesetProcessor
 from cfdb.workflows.processors.registry import default_registry
 from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 from cfdb.workflows.provisioner import EcsProvisioner
@@ -93,7 +99,20 @@ async def _reset_api_globals() -> None:
     earlier steps fail. Tests rely on this so a lifespan exception
     doesn't leak the executor / cache / processor registry / wool
     context into a subsequent app instantiation.
+
+    The tile service is *closed* before it is dropped. Nulling alone would
+    leak an open h5py handle per pooled tileset and a live thread pool
+    into the next app instantiation — precisely the leak this function
+    exists to prevent, just in a resource the others do not hold.
     """
+    if api.tileset_service is not None:
+        try:
+            await api.tileset_service.aclose()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to close the tileset service during teardown"
+            )
+    api.tileset_service = None
     api.executor = None
     api.cache = None
     api.processor_registry = None
@@ -140,6 +159,49 @@ async def _warn_if_jobs_index_out_of_sync(db, log: logging.Logger) -> None:
         "sync after ensure_indexes; the workflow mutex may not serialize "
         "concurrent dispatches"
     )
+
+
+def _build_tileset_service(
+    profile: WorkflowProfile, log: logging.Logger
+) -> "TilesetService | None":
+    """Build the matrix tile service, or explain why there isn't one.
+
+    Returns ``None`` when the installed build carries no clodius. That is
+    the expected state for images built today — the fork is private, so
+    the Dockerfiles cannot fetch it and it is installed only via the
+    ``tiles`` extra — and it must degrade to a clear 501 on the tile
+    routes rather than taking the whole application down at startup.
+
+    The service reads ``api.cache`` through a callable rather than
+    capturing it, so a lifespan that rebuilds the cache (or a test that
+    patches it) is not left with a service pointed at a stale backend.
+    """
+    if not tileset_backend.is_available():
+        log.warning(
+            "clodius is not installed; matrix tile serving is disabled and "
+            "/tileset_info and /tiles will answer 501. Install the 'tiles' "
+            "extra to enable it."
+        )
+        return None
+
+    service = build_tileset_service(
+        root=profile.cache_root.parent / "tilesets",
+        cache_provider=lambda: api.cache,
+        disk_cache_bytes=api.TILESET_DISK_CACHE_BYTES,
+        open_max=api.TILESET_OPEN_MAX,
+        tile_cache_bytes=api.TILE_CACHE_BYTES,
+        threads=api.TILE_THREADS,
+        hydrate_timeout_s=api.TILESET_HYDRATE_TIMEOUT_S,
+    )
+    log.info(
+        "Matrix tile serving enabled (disk budget %d bytes, %d open tilesets, "
+        "%d tile-cache bytes, %d threads)",
+        api.TILESET_DISK_CACHE_BYTES,
+        api.TILESET_OPEN_MAX,
+        api.TILE_CACHE_BYTES,
+        api.TILE_THREADS,
+    )
+    return service
 
 
 async def _build_cache(profile: WorkflowProfile) -> CacheBackend:
@@ -297,6 +359,8 @@ async def lifespan(_: FastAPI):
             api.processor_registry = default_registry()
             api.processor_registry.register(BamIndexProcessor())
             api.processor_registry.register(TabixIntervalProcessor())
+            api.processor_registry.register(MatrixTilesetProcessor())
+            api.tileset_service = _build_tileset_service(profile, log)
             provisioner = _build_provisioner(profile)
 
             # Lease workers from the surrounding pool rather than spawning
@@ -473,6 +537,11 @@ app.include_router(data_router)
 app.include_router(index_router)
 app.include_router(jobs_router)
 app.include_router(sync_router)
+# Mounted at the root, without a prefix: a HiGlass client constructs
+# ``{server}/tileset_info/?d=`` and ``{server}/tiles/?d=`` itself, so the
+# paths are the wire protocol rather than a cfdb naming choice.
+app.include_router(tiles_router)
+app.include_router(tilesets_router)
 
 
 @app.get("/health")

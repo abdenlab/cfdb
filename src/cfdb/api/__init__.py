@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from cfdb.workflows.constants import DEFAULT_TLS_IDENTITY, TLS_IDENTITY_ENV
 
 if TYPE_CHECKING:
+    from cfdb.tilesets.service import TilesetService
     from cfdb.workflows.cache import CacheBackend
     from cfdb.workflows.executor import JobExecutor
     from cfdb.workflows.processors.registry import ProcessorRegistry
@@ -275,10 +276,59 @@ ECS_WORKER_ASSIGN_PUBLIC_IP: Final = _parse_assign_public_ip(
 #: profile (no provisioner exists in the local/LAN profile).
 ECS_MAX_WORKERS: Final = _parse_int_env("ECS_MAX_WORKERS", 16, minimum=0)
 
+# --- Matrix tile serving (issue #82) ----------------------------------------
+
+#: Byte budget for the API task's local copies of tileset artifacts. h5py
+#: opens a file, so under the S3 profile a cached mcool has to be pulled
+#: onto local disk before any tile can be read; this bounds how much of
+#: that disk the tile server may hold. Keep it comfortably below the task's
+#: ephemeral storage, which it shares with SYNC_DATA_DIR and the container
+#: image. Default 8 GiB against a Fargate task sized at 50 GiB.
+TILESET_DISK_CACHE_BYTES: Final = _parse_int_env(
+    "CFDB_TILESET_DISK_CACHE_BYTES", 8 * 1024**3, minimum=1
+)
+
+#: How many tilesets may be held open at once. Each is an open h5py handle
+#: over a multi-GB file, so this is a file-descriptor and mmap bound, not a
+#: memory one.
+TILESET_OPEN_MAX: Final = _parse_int_env("CFDB_TILESET_OPEN_MAX", 8, minimum=1)
+
+#: Byte budget for the in-process tile cache. Bounded by bytes rather than
+#: by entry count because a 256x256 float32 tile is ~350 KiB base64-encoded
+#: — a plausible-sounding 20,000-entry cap would be ~7 GB on a 2 GiB task.
+TILE_CACHE_BYTES: Final = _parse_int_env(
+    "CFDB_TILE_CACHE_BYTES", 256 * 1024**2, minimum=1
+)
+
+#: Threads used to run clodius tile reads off the event loop.
+#:
+#: This bounds concurrency; it does NOT buy read parallelism. h5py
+#: serializes on a global lock unless linked against a thread-safe HDF5
+#: build, which the published wheels are not — so matrix tile throughput is
+#: effectively serial per API process however high this is set. What it
+#: does buy is that a multi-second tile read cannot block the event loop
+#: and stall /data and /metadata. The real throughput levers are the tile
+#: cache and horizontal scaling.
+TILE_THREADS: Final = _parse_int_env("CFDB_TILE_THREADS", 2, minimum=1)
+
+#: Seconds to wait for a cached artifact to be pulled onto local disk
+#: before giving up with 503. Bounds the cold-open cost of a multi-GB
+#: download, which lands on the first /tileset_info for a dataset rather
+#: than on any tile.
+TILESET_HYDRATE_TIMEOUT_S: Final = _parse_int_env(
+    "CFDB_TILESET_HYDRATE_TIMEOUT_S", 60, minimum=1
+)
+
 db: AsyncIOMotorDatabase | None = None
 cache: "CacheBackend | None" = None
 executor: "JobExecutor | None" = None
 processor_registry: "ProcessorRegistry | None" = None
+
+#: Serves the HiGlass tile endpoints. ``None`` when the workflow subsystem
+#: is disabled (no SYNC_DATA_DIR, hence no cache to read artifacts from) or
+#: when the installed build carries no clodius — in both cases the tile
+#: routes answer rather than half-working. See ``cfdb.tilesets.backend``.
+tileset_service: "TilesetService | None" = None
 
 #: Snapshot of the lifespan task's ``contextvars.Context()`` taken after
 #: ``wool.WorkerPool.__aenter__`` returns. uvicorn deliberately spawns
