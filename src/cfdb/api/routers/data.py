@@ -6,8 +6,15 @@ from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Path, Request, status
 
-from cfdb import api
-from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
+from cfdb.api.routers._helpers import (
+    PATH_PARAM_MAX_LEN as _PATH_PARAM_MAX_LEN,
+)
+from cfdb.api.routers._helpers import (
+    PATH_PARAM_PATTERN as _PATH_PARAM_PATTERN,
+)
+from cfdb.api.routers._helpers import (
+    resolve_file_doc,
+)
 from cfdb.api.routers.cache_stream import (
     probe_workflow_readiness,
     serve_workflow_artifact_or_dispatch,
@@ -23,12 +30,6 @@ from cfdb.services.drs import (
     DRSUpstreamError,
 )
 from cfdb.workflows.models import ArtifactKind
-
-#: Tight path-param constraint shared by /data and /index. DCC accessions
-#: across ENCODE / 4DN / HuBMAP are all subsets of ``[A-Za-z0-9._-]``;
-#: the length cap defends Mongo and log lines from unbounded input.
-_PATH_PARAM_PATTERN = r"^[A-Za-z0-9._-]+$"
-_PATH_PARAM_MAX_LEN = 256
 
 logger = logging.getLogger(__name__)
 
@@ -109,68 +110,29 @@ async def stream_file(
     await locks.wait_for_cutover()
 
     try:
-        # 1. Validate and normalize DCC name
-        from cfdb.dcc_registry import get_all_dcc_names, normalize_dcc_name
-
-        normalized_dcc = normalize_dcc_name(dcc)
-        valid_dccs = get_all_dcc_names()
-
-        if normalized_dcc not in valid_dccs:
-            logger.warning(f"Invalid DCC requested: {dcc}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
-            )
-
-        # 2. Look up the file document via the shared helper so /data and
-        #    /index converge on the same record for any given
-        #    (normalized_dcc, local_id) pair. The helper uses
-        #    FILE_DOC_PROJECTION, which strips _id and limits the doc to
-        #    the fields routers + workflows actually read.
-        if api.db is None:
-            logger.error("Database not initialized")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database not available",
-            )
-
-        logger.info(
-            f"Looking up file: submission={normalized_dcc}, local_id={local_id}"
+        # 1-4. DCC validation (400), database check (500), lookup (404),
+        #      access-method check (501), and the HuBMAP access guard
+        #      (403) — the preamble every file-serving router shares, in
+        #      the one ordering they all agree on. ``require_access_url``
+        #      is what makes the 501 precede the 403 here, matching this
+        #      handler's original ordering; /index leaves it off.
+        normalized_dcc, file_doc = await resolve_file_doc(
+            dcc, local_id, require_access_url=True
         )
-        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
 
-        if not file_doc:
-            logger.warning(f"File not found: {normalized_dcc}/{local_id}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
-            )
-
-        # 3. Check the file has an access method, then reduce the document
-        #    to what the streaming path reads. Guarding first is what lets
-        #    _FileRef.access_url be a plain str rather than an Optional the
-        #    call ordering happens to have narrowed.
-        access_url = file_doc.get("access_url")
-        if not access_url:
-            logger.warning(f"File has no access_url: {normalized_dcc}/{local_id}")
-            raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                detail="File has no access URL",
-            )
-
+        # Reduce the document to what the streaming path reads. The 501
+        # guard above is what lets ``_FileRef.access_url`` be a plain str
+        # rather than an Optional the call ordering happens to have
+        # narrowed.
         file_metadata = _FileRef(
-            access_url=access_url,
+            access_url=file_doc["access_url"],
             filename=file_doc.get("filename") or "file",
             size_in_bytes=file_doc.get("size_in_bytes"),
         )
 
-        # 4. Defence-in-depth: reject any non-public HuBMAP file that somehow
-        #    survived pruning. Placed before the workflow branch so protected
-        #    files never enter the preprocessing pipeline.
-        #
-        #    Log access_url AFTER the guard so signed/private URLs for
-        #    non-public HuBMAP files don't leak to logs before the 403.
-        enforce_hubmap_access(normalized_dcc, file_doc)
-
+        # Logged only after the HuBMAP guard inside the helper, so
+        # signed/private URLs for non-public files never reach the log
+        # ahead of the 403.
         logger.info(f"File access_url: {file_metadata.access_url}")
 
         # 5. Workflow path: if the client wants the preprocessed artifact
@@ -326,39 +288,9 @@ async def stream_file_status(
     await locks.wait_for_cutover()
 
     try:
-        from cfdb.dcc_registry import get_all_dcc_names, normalize_dcc_name
-
-        normalized_dcc = normalize_dcc_name(dcc)
-        valid_dccs = get_all_dcc_names()
-
-        if normalized_dcc not in valid_dccs:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
-            )
-
-        if api.db is None:
-            logger.error("Database not initialized")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database not available",
-            )
-
-        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
-        if not file_doc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
-            )
-
-        # Mirror ``stream_file``'s ordering: the no-access-method 501 is
-        # checked before the HuBMAP access guard.
-        if not file_doc.get("access_url"):
-            raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                detail="File has no access URL",
-            )
-
-        enforce_hubmap_access(normalized_dcc, file_doc)
+        # Mirrors ``stream_file``'s preamble exactly, including that the
+        # no-access-method 501 is checked before the HuBMAP access guard.
+        _, file_doc = await resolve_file_doc(dcc, local_id, require_access_url=True)
 
         # Workflow cache state — never dispatches. ``None`` means the file
         # is served directly from upstream (passthrough format, a format

@@ -1239,7 +1239,7 @@ class TestStreamFileMetadataReduction:
         # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
         mocker.patch(
-            "cfdb.api.routers.data.lookup_file_doc",
+            "cfdb.api.routers._helpers.lookup_file_doc",
             side_effect=RuntimeError("lookup exploded"),
         )
         mock_db.file.docs = [_make_encode_file_doc()]
