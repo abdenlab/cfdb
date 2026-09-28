@@ -1,0 +1,36 @@
+# Local-development image: the API image plus the clodius tile backend.
+#
+# Interim scaffolding for issue #82. The clodius `tiles` extra is still
+# optional (its fork requires Python 3.12 while cfdb supports 3.11), so
+# `Dockerfile.api` does not carry it and the images it builds answer 501
+# on every tile route (see the `tiles` extra in pyproject.toml). That is
+# the right production behaviour today, but it makes the tile endpoints
+# untestable through the documented `make mongodb` / `make api` flow,
+# which is the only place the whole chain -- workflow dispatch, artifact
+# cache, h5py read -- runs together.
+#
+# So this layers clodius onto the image `make api` already built rather
+# than duplicating that build, installing it straight from the public
+# fork at the same sha `[tool.uv.sources]` pins.
+#
+# DELETE THIS FILE once the `tiles` extra becomes an ordinary dependency
+# (which raises the Python floor to 3.12): `Dockerfile.api`'s existing
+# `pip install .` then carries it.
+FROM api
+
+USER root
+
+# Installed as its own layer, before the app, so that iterating on cfdb
+# does not re-resolve clodius's 25-package closure (pysam, oxbow, apsw,
+# polars, scipy, ...) on every rebuild. Keep this sha in lockstep with
+# the `[tool.uv.sources]` pin in pyproject.toml.
+RUN pip install --no-cache-dir \
+    "clodius @ git+https://github.com/abdenlab/clodius@aac90219031e8c05cf6d5a916628531a72cfc461"
+
+# clodius imports matplotlib transitively, and the image's `app` user
+# has no home directory, so matplotlib warns twice and rebuilds its font
+# cache on every start. Point it at a writable path.
+ENV MPLCONFIGDIR=/tmp/matplotlib
+
+USER app
+WORKDIR /app/src
