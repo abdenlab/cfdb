@@ -315,22 +315,27 @@ class TestCacheKey:
         assert key == f"encode/ENCFF123ABC/data/{FIXTURE_MD5}-v2"
 
     def test_cache_key_should_differ_between_artifact_kinds(self):
-        """Test that data and index artifact keys are distinct.
+        """Test that every artifact kind yields a distinct cache key.
 
         Given:
-            Two calls identical except for artifact_kind.
+            Calls identical except for artifact_kind, one per member of
+            ``ArtifactKind`` (DATA, INDEX, and TILESET).
         When:
-            cache_key is called for DATA and INDEX.
+            cache_key is called for each kind.
         Then:
-            It should return distinct keys so that the caches for the two
-            artifact kinds never alias.
+            It should return pairwise-distinct keys so that no two
+            artifact kinds — including the tileset artifact added for
+            matrix tile serving — ever alias the same cache slot.
         """
         # Act
-        data_key = cache_key("encode", "x", ArtifactKind.DATA, FIXTURE_MD5, 0)
-        index_key = cache_key("encode", "x", ArtifactKind.INDEX, FIXTURE_MD5, 0)
+        keys = {
+            kind: cache_key("encode", "x", kind, FIXTURE_MD5, 0)
+            for kind in ArtifactKind
+        }
 
         # Assert
-        assert data_key != index_key
+        assert ArtifactKind.TILESET in keys
+        assert len(set(keys.values())) == len(ArtifactKind)
 
     def test_cache_key_should_raise_when_md5_empty(self):
         """Test that cache_key rejects an empty md5.

@@ -48,6 +48,13 @@ class ArtifactKind(str, Enum):
 
     DATA = "data"
     INDEX = "index"
+    #: A file prepared for random-access tile reads (issue #82) — for
+    #: contact maps, a multi-resolution cooler. Unlike DATA and INDEX it is
+    #: never streamed to a client: /data and /index would hand back bytes,
+    #: whereas this artifact exists to be opened locally by the tile server
+    #: and read a 256x256 block at a time. That is why no router serves it
+    #: and why the tile endpoints 404 rather than 202 when it is absent.
+    TILESET = "tileset"
 
 
 class JobRecord(BaseModel):
