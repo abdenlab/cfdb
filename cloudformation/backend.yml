@@ -35,6 +35,31 @@ Parameters:
     Type: Number
     Default: 1
     Description: Number of ECS tasks
+  ApiEphemeralStorageGiB:
+    Type: Number
+    Default: 50
+    MinValue: 21
+    MaxValue: 200
+    Description: >
+      Fargate ephemeral storage (GiB) for the API task. Sized above the
+      20 GiB Fargate default because matrix tile serving (issue #82) keeps
+      local copies of contact-map artifacts on this disk: h5py opens a
+      file, so an mcool cached in S3 has to be pulled down before any tile
+      can be read from it. That disk is shared with SYNC_DATA_DIR and the
+      container image, and the byte budget for the tile copies is set
+      independently by CFDB_TILESET_DISK_CACHE_BYTES — keep that value
+      comfortably below this one, or filling the tile cache takes /data
+      and /sync down with it.
+  TilesetDiskCacheBytes:
+    Type: Number
+    Default: 8589934592
+    MinValue: 1
+    Description: >
+      Byte budget for the API task's local copies of tileset artifacts
+      (CFDB_TILESET_DISK_CACHE_BYTES). Default 8 GiB against the 50 GiB
+      ephemeral storage above. Least-recently-used copies are evicted to
+      stay within it; a single artifact larger than the whole budget is
+      refused with 503 rather than thrashing.
   EcsMaxWorkers:
     Type: Number
     Default: 16
@@ -258,6 +283,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      EphemeralStorage:
+        SizeInGiB: !Ref ApiEphemeralStorageGiB
       ExecutionRoleArn: !GetAtt ExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
@@ -305,6 +332,13 @@ Resources:
             # rather than spawning past this. Bounds workers, not the queue.
             - Name: ECS_MAX_WORKERS
               Value: !Ref EcsMaxWorkers
+            # Byte budget for the API task's local copies of tileset
+            # artifacts (issue #82). Set explicitly rather than left to the
+            # application default so it moves together with
+            # ApiEphemeralStorageGiB — the two are a pair, and a disk
+            # resized without resizing this gains nothing.
+            - Name: CFDB_TILESET_DISK_CACHE_BYTES
+              Value: !Ref TilesetDiskCacheBytes
             # Only meaningful alongside the cert Secrets below, so it is
             # rendered away when mTLS is off rather than advertising a
             # setting that does nothing. The workers stack has no

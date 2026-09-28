@@ -633,3 +633,98 @@ def test_backend_worker_tls_identity_should_only_render_when_mtls_is_enabled():
     ]
     assert len(identity_entries) == 1
     assert identity_entries[0]["Fn::If"][1]["Value"] == {"Ref": "WorkerTlsIdentity"}
+
+
+def test_api_task_should_declare_ephemeral_storage_for_the_tile_cache():
+    """Test that the API task gets a disk sized for local tileset copies.
+
+    Given:
+        The backend template's API task definition, whose task now keeps
+        local copies of contact-map artifacts (issue #82) — h5py opens a
+        file, so an mcool cached in S3 has to be pulled onto disk before
+        any tile can be read.
+    When:
+        The task definition is inspected.
+    Then:
+        It should declare EphemeralStorage from a parameter sized above
+        the 20 GiB Fargate default and constrained to Fargate's valid
+        21-200 GiB range, so an out-of-range override fails at parameter
+        validation rather than at RunTask. Without the storage, the tile
+        cache shares the default disk with SYNC_DATA_DIR and the
+        container image, and filling it takes /data and /sync down
+        alongside tile serving.
+    """
+    # Arrange
+    template = _load_template("backend.yml")
+    task_definition = template["Resources"]["TaskDefinition"]["Properties"]
+
+    # Act
+    storage = task_definition.get("EphemeralStorage")
+
+    # Assert
+    assert storage == {"SizeInGiB": {"Ref": "ApiEphemeralStorageGiB"}}
+    parameter = template["Parameters"]["ApiEphemeralStorageGiB"]
+    assert parameter["Default"] > 20
+    assert parameter["MinValue"] == 21
+    assert parameter["MaxValue"] == 200
+
+
+def test_tileset_disk_budget_should_fit_inside_the_api_ephemeral_storage():
+    """Test that the two disk parameters are consistent by default.
+
+    Given:
+        The byte budget for local tileset copies and the ephemeral
+        storage backing it.
+    When:
+        Both defaults are compared.
+    Then:
+        The budget should sit well inside the disk, which it shares with
+        SYNC_DATA_DIR and the container image. Resizing one without the
+        other is the failure this pins: a larger disk with an unchanged
+        budget gains nothing, and a larger budget on an unchanged disk
+        fills it.
+    """
+    # Arrange
+    template = _load_template("backend.yml")
+    parameters = template["Parameters"]
+
+    # Act
+    budget_bytes = parameters["TilesetDiskCacheBytes"]["Default"]
+    disk_bytes = parameters["ApiEphemeralStorageGiB"]["Default"] * 1024**3
+
+    # Assert
+    assert budget_bytes < disk_bytes / 2, (
+        "the tileset disk budget must leave room for SYNC_DATA_DIR and the "
+        "container image on the same volume"
+    )
+
+
+def test_api_container_should_wire_the_tileset_disk_budget():
+    """Test that the disk budget reaches the application.
+
+    Given:
+        The backend template's API container definition.
+    When:
+        Its Environment entries are searched.
+    Then:
+        CFDB_TILESET_DISK_CACHE_BYTES should be set from the parameter, so
+        the budget and the disk it lives on are resized together rather
+        than the budget silently keeping its application default.
+    """
+    # Arrange
+    template = _load_template("backend.yml")
+    container = template["Resources"]["TaskDefinition"]["Properties"][
+        "ContainerDefinitions"
+    ][0]
+
+    # Act
+    entries = [
+        entry
+        for entry in container["Environment"]
+        if isinstance(entry, dict)
+        and entry.get("Name") == "CFDB_TILESET_DISK_CACHE_BYTES"
+    ]
+
+    # Assert
+    assert len(entries) == 1
+    assert entries[0]["Value"] == {"Ref": "TilesetDiskCacheBytes"}
