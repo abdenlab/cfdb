@@ -40,6 +40,7 @@ import dataclasses
 import datetime
 import http.server
 import os
+import importlib.util
 import shutil
 import socketserver
 import threading
@@ -69,6 +70,7 @@ from cfdb.workflows.executor import WoolExecutor
 from cfdb.workflows.lock import get_job
 from cfdb.workflows.models import ACTIVE_STATUSES
 from cfdb.workflows.processors.bam import BamIndexProcessor
+from cfdb.workflows.processors.matrix import MatrixTilesetProcessor
 from cfdb.workflows.processors.registry import ProcessorRegistry
 from cfdb.workflows.processors.tabix import TabixIntervalProcessor
 
@@ -96,6 +98,17 @@ def tool_available(name: str) -> bool:
     negligible.
     """
     return shutil.which(name) is not None
+
+
+def cooler_available() -> bool:
+    """Return True when the ``cooler`` package is importable.
+
+    The tiles extra is optional (the clodius fork is private), so the
+    contact-map rows are gated the way the gffread/bedToBigBed rows are
+    gated on PATH tools — probed with ``find_spec`` so collection never
+    pays the import.
+    """
+    return importlib.util.find_spec("cooler") is not None
 
 
 def _require_tools() -> None:
@@ -127,6 +140,8 @@ class Format(Enum):
     BIGBED = "bigBed"
     CSV = "CSV"
     BIGWIG = "bigWig"
+    MCOOL = "mcool"
+    COOL = "cool"
 
 
 class Endpoint(Enum):
@@ -135,6 +150,7 @@ class Endpoint(Enum):
     DATA = "data"
     INDEX = "index"
     JOBS = "jobs"
+    TILESETS = "tilesets"
 
 
 class Method(Enum):
@@ -287,7 +303,26 @@ def filter_func(row: list[Any]) -> bool:
     ):
         return False
 
-    # 5. mongomock-motor + N10 only runs when mongomock-motor is
+    # 5. Contact maps ride the preparation channel only: /data streams
+    # them from upstream and /index reports that they have no index
+    # (README, "Two channels, deliberately separate"), so TILESETS pairs
+    # exclusively with the cooler formats and the cooler formats with
+    # TILESETS. The prepare endpoint is POST-driven inside the tests and
+    # the probe has no HEAD contract, so a Method axis is meaningless on
+    # those rows. The tiles toolchain is an optional extra, so cooler
+    # rows are dropped when it is absent, mirroring the tool gates above.
+    if endpoint is Endpoint.TILESETS:
+        if fmt is not None and fmt not in (Format.MCOOL, Format.COOL):
+            return False
+        if method is Method.HEAD:
+            return False
+    if fmt in (Format.MCOOL, Format.COOL):
+        if endpoint is not None and endpoint is not Endpoint.TILESETS:
+            return False
+        if not cooler_available():
+            return False
+
+    # 6. mongomock-motor + N10 only runs when mongomock-motor is
     # importable; falls out as ``True`` when it is, ``False`` when it
     # is not, so the row is skipped on hosts without it.
     if mutex_backend is MutexBackend.MONGOMOCK and concurrency is Concurrency.N10:
@@ -569,8 +604,18 @@ def integration_workdir_root(tmp_path) -> Path:
 
 @pytest.fixture()
 def install_jobs_index(mock_db):
-    """Seed the partial-unique mutex index on the FakeDB jobs collection."""
-    mock_db.jobs.create_index(
+    """Seed the partial-unique mutex index on the FakeDB jobs collection.
+
+    Uses ``register_index`` — the synchronous seam — because
+    ``create_index`` is a coroutine (Motor's is awaited in production)
+    and calling it from a sync fixture registers nothing: the coroutine
+    is dropped un-awaited and the mutex index silently never exists, so
+    concurrent claims insert duplicate active JobRecords instead of
+    funneling. That is exactly what happened here, masked for the
+    test_concurrency funnel tests by a KNOWN_BUGS retry predicate broad
+    enough to convert the assertion failure into an xfail.
+    """
+    mock_db.jobs.register_index(
         {"workflow_key": 1},
         unique=True,
         partialFilterExpression={"active": True},
@@ -594,6 +639,11 @@ async def integration_executor(
     registry = ProcessorRegistry()
     registry.register(BamIndexProcessor())
     registry.register(TabixIntervalProcessor())
+    # Registered unconditionally, mirroring the lifespan: the processor
+    # imports cooler/h5py lazily inside run(), so registration is safe on
+    # a checkout without the tiles extra — only dispatching to it is not,
+    # and the cooler rows are filtered out of the sweeps in that case.
+    registry.register(MatrixTilesetProcessor())
 
     cache = LocalFsCache(integration_cache_root)
     executor = WoolExecutor(
@@ -615,6 +665,8 @@ def make_file_meta(
     dcc: str = "ENCODE",
     local_id: str | None = None,
     extra_files: list[dict] | None = None,
+    filename: str | None = None,
+    file_format_name: str | None = None,
 ) -> dict[str, Any]:
     """Build a Mongo-style file_meta dict whose access_url resolves.
 
@@ -632,8 +684,10 @@ def make_file_meta(
         "local_id": local_id or f"ENCFF-{sample.format}",
         "md5": sample.md5,
         "access_url": f"{base_url}/{sample.path.name}",
-        "file_format": {"name": sample.format},
+        "file_format": {"name": file_format_name or sample.format},
     }
+    if filename is not None:
+        meta["filename"] = filename
     if extra_files is not None:
         meta["extra"] = {"extra_files": list(extra_files)}
     return meta

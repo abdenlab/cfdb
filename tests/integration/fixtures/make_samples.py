@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import importlib.util
 import random
 import shutil
 import subprocess
@@ -302,6 +303,32 @@ def make_bigbed(root: Path) -> SampleFile | None:
     return SampleFile(path=bb_path, md5=_md5(bb_path), format="bigBed")
 
 
+def make_mcool(root: Path) -> SampleFile | None:
+    """Emit a multi-resolution mcool, or None when cooler is unimportable.
+
+    Delegates to the shared synthetic builders so the integration chain
+    and the unit suites tile the same bytes. The tiles extra is optional,
+    so absence of ``cooler`` degrades to None the way a missing
+    ``bedToBigBed`` does for bigBed.
+    """
+    if importlib.util.find_spec("cooler") is None:
+        return None
+    from tests.fixtures.coolers import build_mcool
+
+    path = build_mcool(root / "sample.mcool")
+    return SampleFile(path=path, md5=_md5(path), format="mcool")
+
+
+def make_cool(root: Path) -> SampleFile | None:
+    """Emit a flat single-resolution cooler, or None without cooler."""
+    if importlib.util.find_spec("cooler") is None:
+        return None
+    from tests.fixtures.coolers import build_cool
+
+    path = build_cool(root / "sample.cool")
+    return SampleFile(path=path, md5=_md5(path), format="cool")
+
+
 def generate_all(root: Path) -> dict[str, SampleFile | None]:
     """Build every sample fixture under ``root``.
 
@@ -323,5 +350,7 @@ def generate_all(root: Path) -> dict[str, SampleFile | None]:
         "NarrowPeak": make_narrowpeak_gz(root),
         "BroadPeak": make_broadpeak_gz(root),
         "bigBed": make_bigbed(root),
+        "mcool": make_mcool(root),
+        "cool": make_cool(root),
     }
     return samples

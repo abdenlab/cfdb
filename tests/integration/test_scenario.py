@@ -21,6 +21,8 @@ from tests.integration.conftest import (
     MutexBackend,
     PickleBoundary,
     Scenario,
+    cooler_available,
+    filter_func,
 )
 
 
@@ -163,3 +165,113 @@ class TestScenario:
 
         # Assert
         assert rendered == "EMPTY"
+
+
+@pytest.mark.parametrize(
+    "fmt",
+    [f for f in Format if f not in (Format.MCOOL, Format.COOL)],
+    ids=lambda f: f.name,
+)
+def test_filter_func_should_reject_tilesets_rows_when_format_is_not_a_cooler(fmt):
+    """Test that filter_func drops TILESETS rows for non-contact-map formats.
+
+    Given:
+        A pairwise row pairing the TILESETS endpoint with a format
+        other than MCOOL or COOL (the preparation channel serves only
+        contact maps — README, "Two channels, deliberately separate").
+    When:
+        ``filter_func`` is applied to the row.
+    Then:
+        It should return False for every non-cooler format.
+    """
+    # Arrange
+    row = [fmt, Endpoint.TILESETS, Method.GET, CacheState.COLD]
+
+    # Act
+    accepted = filter_func(row)
+
+    # Assert
+    assert accepted is False
+
+
+@pytest.mark.parametrize(
+    "fmt", [Format.MCOOL, Format.COOL], ids=lambda f: f.name
+)
+@pytest.mark.parametrize(
+    "endpoint",
+    [e for e in Endpoint if e is not Endpoint.TILESETS],
+    ids=lambda e: e.name,
+)
+def test_filter_func_should_reject_cooler_formats_when_endpoint_is_not_tilesets(
+    fmt, endpoint
+):
+    """Test that filter_func drops cooler-format rows off the prepare channel.
+
+    Given:
+        A pairwise row pairing MCOOL or COOL with an endpoint other
+        than TILESETS (/data streams contact maps from upstream and
+        /index reports that they have no index, so those sweeps are
+        structurally meaningless for cooler formats).
+    When:
+        ``filter_func`` is applied to the row.
+    Then:
+        It should return False regardless of whether the tiles extra
+        is installed — the endpoint exclusion precedes the cooler gate.
+    """
+    # Arrange
+    row = [fmt, endpoint, Method.GET, CacheState.COLD]
+
+    # Act
+    accepted = filter_func(row)
+
+    # Assert
+    assert accepted is False
+
+
+@pytest.mark.parametrize(
+    "fmt", [Format.MCOOL, None], ids=["MCOOL", "no-format-axis"]
+)
+def test_filter_func_should_reject_head_method_when_endpoint_is_tilesets(fmt):
+    """Test that filter_func drops non-GET methods from TILESETS rows.
+
+    Given:
+        A pairwise row pairing the TILESETS endpoint with the HEAD
+        method — with and without a format axis, since the readiness
+        probe has no HEAD contract either way.
+    When:
+        ``filter_func`` is applied to the row.
+    Then:
+        It should return False on both hosts with and without the
+        tiles extra — the method exclusion fires before the cooler gate.
+    """
+    # Arrange
+    row = [v for v in (fmt, Endpoint.TILESETS, Method.HEAD) if v is not None]
+
+    # Act
+    accepted = filter_func(row)
+
+    # Assert
+    assert accepted is False
+
+
+def test_filter_func_should_accept_mcool_tilesets_cold_row_when_cooler_imports():
+    """Test that filter_func admits the canonical prepare-channel row.
+
+    Given:
+        A pairwise row combining MCOOL, TILESETS, GET, and a cold
+        cache — the exact shape the tileset-prepare e2e sweep draws.
+    When:
+        ``filter_func`` is applied to the row.
+    Then:
+        It should return True exactly when ``cooler`` is importable:
+        admitted on a host with the tiles extra, dropped (like the
+        gffread/bedToBigBed tool gates) on a host without it.
+    """
+    # Arrange
+    row = [Format.MCOOL, Endpoint.TILESETS, Method.GET, CacheState.COLD]
+
+    # Act
+    accepted = filter_func(row)
+
+    # Assert — guarded on host capability so the pin holds everywhere.
+    assert accepted is cooler_available()
