@@ -6,7 +6,7 @@
 # (and equivalent for python:3.12-slim-bookworm), paste the resulting
 # sha256 below, and rebuild. Both digests MUST be present.
 ARG RUST_BASE_DIGEST=sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89
-ARG PYTHON_BASE_DIGEST=sha256:76d4b7b6305788c6b4c6a19d6a22a3921bf802e9af4d5e1e5bd771208dba74bf
+ARG PYTHON_BASE_DIGEST=sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
 
 # Build stage for the Rust materializer
 FROM rust:1.88-slim-bookworm@${RUST_BASE_DIGEST} AS builder
