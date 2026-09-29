@@ -27,6 +27,16 @@ materialize/target
 build
 .encode_metadata.tsv
 
+# Locally-generated mTLS material (make worker-certs / make certs). Every
+# runtime path that needs these reads them from env-injected files at
+# container start (see cfdb-tls-entrypoint.sh), never from a path baked
+# into the image, so nothing under here belongs in the build context. A
+# gitignored file is not a dockerignored one -- without this, a local
+# `docker build` run after `make worker-certs` silently bakes the
+# generated private keys into the image.
+certs/*.pem
+certs/**/*.pem
+
 # Tests are not needed in the runtime image
 tests
 
