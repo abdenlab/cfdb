@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 import pytest
@@ -440,3 +441,61 @@ def mock_db(monkeypatch):
     db = FakeDB()
     monkeypatch.setattr(api, "db", db)
     return db
+
+
+# --- Contact-map fixtures (issue #82) ---------------------------------------
+#
+# Session-scoped because building one costs a few seconds, almost all of it
+# cooler's first-import cost, and every consumer opens it read-only.
+
+
+@pytest.fixture(scope="session")
+def tiny_mcool(tmp_path_factory):
+    """A real 3-resolution mcool over a 3000 bp, 3-chromosome genome."""
+    from tests.fixtures.coolers import build_mcool
+
+    return build_mcool(tmp_path_factory.mktemp("coolers") / "tiny.mcool")
+
+
+@pytest.fixture(scope="session")
+def balanced_mcool(tmp_path_factory):
+    """An mcool carrying two bin-weight columns.
+
+    Two, not one: ``weight`` is also the column clodius falls back to by
+    default, so a cooler with only that column cannot distinguish honouring
+    a named transform request from ignoring it.
+    """
+    from tests.fixtures.coolers import build_mcool
+
+    return build_mcool(
+        tmp_path_factory.mktemp("coolers_balanced") / "balanced.mcool",
+        weights={"weight": 0.5, "alt_weight": 2.0},
+    )
+
+
+@pytest.fixture()
+def make_mcool(tmp_path):
+    """Factory building a fresh mcool per call, for tests that mutate one."""
+    from tests.fixtures.coolers import build_mcool
+
+    counter = itertools.count()
+
+    def _make(**kwargs):
+        name = f"case{next(counter)}.mcool"
+        return build_mcool(tmp_path / name, **kwargs)
+
+    return _make
+
+
+@pytest.fixture()
+def make_cool(tmp_path):
+    """Factory building a fresh flat (single-resolution) cooler per call."""
+    from tests.fixtures.coolers import build_cool
+
+    counter = itertools.count()
+
+    def _make(**kwargs):
+        name = f"flat{next(counter)}.cool"
+        return build_cool(tmp_path / name, **kwargs)
+
+    return _make

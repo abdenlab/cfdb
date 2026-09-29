@@ -131,6 +131,20 @@ class LocalFsCache(CacheBackend):
     def root(self) -> Path:
         return self._root
 
+    def path_for(self, key: str) -> Path:
+        """Return the on-disk path a key maps to, validated against traversal.
+
+        Public because the tile server needs a real filesystem path: h5py
+        opens a file, it does not consume a byte stream, so ``get`` is the
+        wrong shape for it. On this backend the cached artifact already is
+        a local file, so the tile server can open it in place instead of
+        copying it — which is also what lets the whole tile subsystem be
+        unit-tested without S3.
+
+        The path is not guaranteed to exist; call :meth:`head` for that.
+        """
+        return _safe_key_path(self.root, key)
+
     async def head(self, key: str) -> Optional[CacheEntry]:
         """Return size metadata for a key, or None if absent."""
         path = _safe_key_path(self.root, key)

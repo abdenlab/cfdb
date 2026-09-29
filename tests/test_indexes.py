@@ -415,6 +415,51 @@ def test_create_indexes_js_data_indexes_should_match_python():
     assert js_set == py_set
 
 
+def test_create_indexes_js_ensure_index_should_tolerate_only_namespace_not_found():
+    """Test the JS ensureIndex helper swallows nothing but NamespaceNotFound.
+
+    ``getIndexes`` raises NamespaceNotFound (code 26) on a collection
+    that has never been written to -- every collection on a clean
+    checkout, since the sample dump is gitignored. The helper must treat
+    that one error as "no indexes yet" and fall through to createIndex,
+    while rethrowing anything else so a genuine server failure cannot be
+    masked into a silently half-indexed database.
+
+    Given:
+        The committed scripts/create-indexes.js source, comments
+        stripped.
+    When:
+        The ``ensureIndex`` try/catch around ``getIndexes`` is inspected.
+    Then:
+        Its catch should rethrow unless the error's codeName is
+        NamespaceNotFound or its code is 26, fall back to an empty index
+        list in that case, and be the file's only catch block.
+    """
+    # Arrange
+    code = re.sub(r"//.*", "", _JS)
+
+    # Act
+    match = re.search(
+        r"try\s*\{\s*existing\s*=\s*coll\.getIndexes\(\)\s*;\s*\}\s*"
+        r"catch\s*\(\s*(\w+)\s*\)\s*\{\s*"
+        r"if\s*\(\s*\1\.codeName\s*!==\s*\"NamespaceNotFound\"\s*"
+        r"&&\s*\1\.code\s*!==\s*26\s*\)\s*\{\s*"
+        r"throw\s+\1\s*;\s*\}\s*"
+        r"existing\s*=\s*\[\]\s*;\s*\}",
+        code,
+    )
+
+    # Assert
+    assert match is not None, (
+        "ensureIndex must catch getIndexes failures, rethrow everything "
+        "but NamespaceNotFound (codeName or code 26), and fall back to []"
+    )
+    assert code.count("catch") == 1, (
+        "the NamespaceNotFound guard should be the only swallowed error "
+        "in create-indexes.js"
+    )
+
+
 def _conflict_collection(mocker, *, existing_info: dict, create_side_effect):
     """Build a Mongo-shaped collection mock for conflict-recovery tests."""
     collection = mocker.MagicMock()

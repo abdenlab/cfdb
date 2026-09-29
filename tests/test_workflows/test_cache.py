@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -394,6 +395,135 @@ class TestLocalFsCache:
 
         # Assert
         assert collected == b"0123456789"
+
+    @pytest.mark.asyncio
+    async def test_path_for_should_return_committed_artifact_path_when_key_present(
+        self, tmp_path
+    ):
+        """Test that path_for agrees with put and head for a stored artifact.
+
+        Given:
+            A LocalFsCache with an artifact committed via ``put`` under a
+            nested key.
+        When:
+            ``path_for`` is called with that key.
+        Then:
+            It should return an existing path whose bytes equal the
+            committed source and whose size matches what ``head``
+            reports.
+        """
+        # Arrange
+        cache = LocalFsCache(tmp_path)
+        source = tmp_path / "src"
+        payload = b"tileset artifact bytes"
+        _write(source, payload)
+        await cache.put("4dn/x/tileset/aa-v0", source)
+
+        # Act
+        path = cache.path_for("4dn/x/tileset/aa-v0")
+
+        # Assert
+        assert path.exists()
+        assert path.read_bytes() == payload
+        entry = await cache.head("4dn/x/tileset/aa-v0")
+        assert entry is not None
+        assert path.stat().st_size == entry.size == len(payload)
+
+    @pytest.mark.asyncio
+    async def test_path_for_should_return_nonexistent_path_when_key_absent(
+        self, tmp_path
+    ):
+        """Test that path_for on an absent key neither raises nor creates.
+
+        Given:
+            An empty LocalFsCache and a well-formed key that was never
+            written.
+        When:
+            ``path_for`` is called with that key.
+        Then:
+            It should return a non-existent path under the cache root
+            without raising or creating anything on disk, and ``head``
+            should still miss.
+        """
+        # Arrange
+        cache = LocalFsCache(tmp_path)
+
+        # Act
+        path = cache.path_for("encode/x/data/aa-v0")
+
+        # Assert
+        assert not path.exists()
+        assert tmp_path.resolve() in path.parents
+        assert list(tmp_path.rglob("*")) == []
+        assert await cache.head("encode/x/data/aa-v0") is None
+
+    @pytest.mark.parametrize(
+        "key",
+        ["../escape", "a/../../b", "/absolute", "", "///"],
+        ids=["dotdot", "nested-dotdot", "absolute", "empty", "slashes-only"],
+    )
+    def test_path_for_should_raise_when_key_is_malformed(self, tmp_path, key):
+        """Test that path_for rejects traversal-shaped and degenerate keys.
+
+        Given:
+            A LocalFsCache and a key that is empty, root-collapsing, or
+            carries a path-traversal segment.
+        When:
+            ``path_for`` is called with that key.
+        Then:
+            It should raise ValueError so the tile server's second public
+            door onto the key-to-path resolution cannot escape the cache
+            root.
+        """
+        # Arrange
+        cache = LocalFsCache(tmp_path)
+
+        # Act & assert
+        with pytest.raises(ValueError):
+            cache.path_for(key)
+
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        key=st.one_of(
+            st.sampled_from(
+                ["..", "../x", "a/../../b", "/abs", "", "///", "a/..", "./."]
+            ),
+            st.text(alphabet="ab./_-", min_size=0, max_size=24),
+            st.text(min_size=0, max_size=24),
+        )
+    )
+    def test_path_for_property_contains_or_rejects_every_key(self, tmp_path, key):
+        """Test that path_for either rejects a key or contains it under root.
+
+        Given:
+            An arbitrary Hypothesis-generated text key, biased toward
+            ``..`` segments, slashes, and empty strings alongside benign
+            keys.
+        When:
+            ``path_for`` is called on a fresh cache root.
+        Then:
+            It should either raise ValueError or return a path strictly
+            under the root, and it should never create anything on disk.
+        """
+        # Arrange — a per-example root because hypothesis reuses tmp_path
+        # across examples within a single test method.
+        root = Path(tempfile.mkdtemp(dir=tmp_path))
+        cache = LocalFsCache(root)
+
+        # Act
+        try:
+            path = cache.path_for(key)
+        except ValueError:
+            path = None
+
+        # Assert
+        if path is not None:
+            assert root.resolve() in path.parents
+        assert list(root.rglob("*")) == []
 
     @settings(
         max_examples=25,

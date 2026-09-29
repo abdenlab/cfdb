@@ -28,13 +28,21 @@ from urllib.parse import urljoin
 from fastapi import APIRouter, Header, HTTPException, Path, Request, status
 
 from cfdb import api
-from cfdb.api.routers._helpers import enforce_hubmap_access, lookup_file_doc
+from cfdb.api.routers._helpers import (
+    PATH_PARAM_MAX_LEN as _PATH_PARAM_MAX_LEN,
+)
+from cfdb.api.routers._helpers import (
+    PATH_PARAM_PATTERN as _PATH_PARAM_PATTERN,
+)
+from cfdb.api.routers._helpers import (
+    resolve_file_doc,
+)
 from cfdb.api.routers.cache_stream import (
     probe_workflow_readiness,
     serve_workflow_artifact_or_dispatch,
     stream_upstream_url,
 )
-from cfdb.dcc_registry import get_all_dcc_names, get_dcc_config, normalize_dcc_name
+from cfdb.dcc_registry import get_dcc_config
 from cfdb.models import coerce_4dn_cv_token
 from cfdb.services import locks
 from cfdb.workflows.models import ArtifactKind
@@ -43,12 +51,6 @@ from cfdb.workflows.urlsafe import UnsafeOutboundURL, validate_outbound_url
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/index", tags=["index"])
-
-#: Mirrors the constraint applied in ``routers/data.py`` so both endpoints
-#: reject the same shape of path-param input. ENCODE/4DN/HuBMAP accessions
-#: all live under ``[A-Za-z0-9._-]``.
-_PATH_PARAM_PATTERN = r"^[A-Za-z0-9._-]+$"
-_PATH_PARAM_MAX_LEN = 256
 
 #: Sidecar ``file_format`` tokens (4DN ``display_title`` values or bare
 #: strings) recognized as index artifacts in 4DN's ``extra.extra_files`` /
@@ -85,37 +87,13 @@ async def stream_index_file(
     await locks.wait_for_cutover()
 
     try:
-        normalized_dcc = normalize_dcc_name(dcc)
-        valid_dccs = get_all_dcc_names()
-
-        if normalized_dcc not in valid_dccs:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
-            )
-
-        if api.db is None:
-            logger.error("Database not initialized")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database not available",
-            )
-
-        # Look up the file document via the shared helper so /data and
-        # /index converge on the same record for any given
-        # (normalized_dcc, local_id) pair. FILE_DOC_PROJECTION strips _id
-        # so bson.ObjectId never crosses into the workflow subsystem.
-        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
-
-        if not file_doc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
-            )
-
-        # Defense-in-depth: reject any non-public HuBMAP file that survived
-        # pruning before either the sidecar fast path or the workflow path
-        # can stream upstream bytes or cache them.
-        enforce_hubmap_access(normalized_dcc, file_doc)
+        # DCC validation (400), database check (500), lookup (404), and
+        # the HuBMAP access guard (403) — shared with /data so both
+        # converge on the same record for a given (dcc, local_id) pair and
+        # the workflow_key mutex actually serializes them. No
+        # ``require_access_url``: /index has never demanded an access URL,
+        # because a sidecar-served file may not need one.
+        normalized_dcc, file_doc = await resolve_file_doc(dcc, local_id)
 
         # 1. Upstream sidecar (e.g., 4DN's extra_files) always takes
         #    precedence when present — the upstream DCC pre-built the
@@ -222,29 +200,8 @@ async def stream_index_file_status(
     await locks.wait_for_cutover()
 
     try:
-        normalized_dcc = normalize_dcc_name(dcc)
-        valid_dccs = get_all_dcc_names()
-
-        if normalized_dcc not in valid_dccs:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown DCC '{dcc}'. Valid DCCs: {', '.join(valid_dccs)}",
-            )
-
-        if api.db is None:
-            logger.error("Database not initialized")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database not available",
-            )
-
-        file_doc = await lookup_file_doc(api.db, normalized_dcc, local_id)
-        if not file_doc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
-            )
-
-        enforce_hubmap_access(normalized_dcc, file_doc)
+        # Mirrors ``stream_index_file``'s preamble exactly.
+        normalized_dcc, file_doc = await resolve_file_doc(dcc, local_id)
 
         # 1. Upstream sidecar present → a GET streams it immediately.
         #    A malformed sidecar raises 502, mirroring the stream path.

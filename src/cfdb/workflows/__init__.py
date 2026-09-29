@@ -60,6 +60,15 @@ Concurrency / admission (bounded-concurrency control, issue #45):
   retry scheduler re-attempts dispatch for a queued job awaiting
   capacity; a small random jitter is added per attempt. Default ``120``
   (2 min).
+
+Matrix tile serving (issue #82):
+
+- ``CFDB_TILESET_MAX_SOURCE_BYTES`` — refuse to materialize a contact map
+  larger than this, before downloading a byte. Default ``21474836480``
+  (20 GiB); ``0`` disables the guard. The tileset artifact for an
+  ``.mcool`` is a copy of the upstream file, so an oversized or
+  mislabelled source would otherwise fill the worker's disk and fail the
+  job somewhere less legible than at admission.
 """
 
 from __future__ import annotations
@@ -199,4 +208,14 @@ WORKFLOW_RETRY_INTERVAL_S: Final = _positive_int(
     "CFDB_WORKFLOW_RETRY_INTERVAL_S",
     os.getenv("CFDB_WORKFLOW_RETRY_INTERVAL_S", "120"),
     minimum=1,
+)
+
+# --- Matrix tile serving (issue #82) ----------------------------------------
+
+# Upper bound on the source of a tileset artifact, checked before the
+# download starts. ``minimum=0`` because 0 is a valid "no cap" sentinel.
+TILESET_MAX_SOURCE_BYTES: Final = _positive_int(
+    "CFDB_TILESET_MAX_SOURCE_BYTES",
+    os.getenv("CFDB_TILESET_MAX_SOURCE_BYTES", str(20 * 1024**3)),
+    minimum=0,
 )

@@ -869,6 +869,25 @@ async def _prune_non_public_hubmap_raw_records(
         f"HuBMAP pruning: deleted {fic_result.deleted_count} file_in_collection links"
     )
 
+    # 4b. Delete files matched to a non-public dataset via the persistent_id
+    # (DOI) fallback join. HuBMAP's C2M2 export never populates
+    # file_in_collection (confirmed empty on every sync), so the
+    # materializer falls back to matching file.persistent_id against
+    # collection.persistent_id (see materialize/src/main.rs, "Fallback:
+    # look up collection by persistent_id"). Step 4 above is blind to that
+    # join, so without this a file whose own persistent_id names a
+    # non-public dataset survives pruning and gets the blanket
+    # data_access_level=public stamp below regardless of its true access
+    # level -- confirmed to leak files registered under dbGaP
+    # controlled-access studies.
+    doi_result = await api.db.file.delete_many(
+        {"submission": "hubmap", "persistent_id": {"$in": non_public_dois}}
+    )
+    logger.info(
+        f"HuBMAP pruning: deleted {doi_result.deleted_count} file records via "
+        "persistent_id (DOI) fallback match"
+    )
+
     # 5. Find which candidate files still have links (shared with a public collection)
     if candidate_file_keys:
         still_linked: set[tuple[str, str]] = set()
