@@ -74,6 +74,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
+        git \
         samtools \
         tabix \
         bcftools \
@@ -83,6 +84,19 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
         https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/bigBedToBed \
     && echo "${UCSC_BIGBEDTOBED_SHA256}  /usr/local/bin/bigBedToBed" | sha256sum -c - \
     && chmod +x /usr/local/bin/bigBedToBed
+
+# uv, for the install step below. Plain `pip install .` does not read
+# [tool.uv.sources] at all -- that section is a uv-only concept -- so it
+# would resolve `clodius` from public PyPI instead of the pinned fork
+# commit. The public package is a different codebase (see the
+# [tool.uv.sources] comment in pyproject.toml): it installs cleanly and
+# then fails at import (`ModuleNotFoundError: No module named
+# 'clodius.core'`), which is silent at build time and only surfaces as a
+# 501 on every tile route at runtime. `uv pip install` honors
+# [tool.uv.sources] the same way `uv sync` does (it does not read
+# uv.lock -- that part is `uv sync`-only), which is enough to resolve
+# the pin correctly.
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:100047e74f30778ab704942321a09750d6158739573ff58bf3924085cc6cd2d8 /uv /uvx /usr/local/bin/
 
 # Install the cfdb package — non-editable, production deps only (wool,
 # aiohttp, boto3, click, motor, pymongo). uvicorn is intentionally omitted;
@@ -96,7 +110,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+docker
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 COPY . /app
-RUN pip install --no-cache-dir .
+RUN uv pip install --system --no-cache .
 
 # mTLS cert-materialization entrypoint. ECS injects the worker-channel
 # certs as env vars (Secrets Manager), but cfdb reads CFDB_WORKER_TLS_*
