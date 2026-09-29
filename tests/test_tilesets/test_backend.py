@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from importlib.util import find_spec
 
 import pytest
 
@@ -61,6 +62,7 @@ class TestLoadBackend:
             clodius exception types the per-tile/500 split keys on.
         """
         # Arrange
+        pytest.importorskip("clodius")
         from clodius.core.errors import TileOutOfBounds, TilesetError
         from clodius.tiles_v2.cooler import CoolerTileset
 
@@ -109,6 +111,9 @@ class TestIsAvailable:
         Then:
             It should return True.
         """
+        # Arrange
+        pytest.importorskip("clodius")
+
         # Act
         result = is_available()
 
@@ -144,7 +149,17 @@ class TestLoadHicTileset:
 
 
 class TestIsTileError:
-    """The classification that splits per-tile payloads from 500s."""
+    """The classification that splits per-tile payloads from 500s.
+
+    Every test here loads a real backend, so the whole class needs clodius
+    installed — unlike TestLoadBackend's absent-module tests, there is no
+    sys.modules trick that stands in for a real error hierarchy to
+    classify against.
+    """
+
+    pytestmark = pytest.mark.skipif(
+        find_spec("clodius") is None, reason="requires the clodius tile backend"
+    )
 
     def test_should_recognize_a_clodius_tile_error(self):
         """Test that a clodius per-tile error is classified as such.

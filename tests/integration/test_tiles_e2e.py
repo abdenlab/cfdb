@@ -16,9 +16,19 @@ from __future__ import annotations
 import asyncio
 import base64
 
-import numpy as np
 import pytest
 import pytest_asyncio
+
+# numpy arrives transitively with clodius/cooler, which are only installed
+# for the tiles extra (Python >= 3.12). tests.fixtures.coolers guards its
+# own numpy import the same way, but this module's own bare import would
+# fail collection before ever reaching that one, so it needs the same
+# guard directly. The tile backend itself loads lazily, so nothing else
+# below pulls in cooler or clodius at import time -- guard the whole
+# module here instead.
+np = pytest.importorskip("numpy")
+pytest.importorskip("cooler")
+pytest.importorskip("clodius.tiles_v2.cooler")
 
 from cfdb import api
 from cfdb.api.routers.tiles import tiles, tileset_info
@@ -32,13 +42,6 @@ from cfdb.workflows.processors.matrix import MatrixTilesetProcessor
 from tests.fixtures.coolers import CANONICAL_CHROMSIZES, build_cool, build_mcool
 from tests.fixtures.remote_cache import FakeRemoteCache
 from tests.test_workflows import FIXTURE_MD5, FIXTURE_MD5_ALT
-
-# None of the imports above pull in cooler or clodius at import time (the
-# tile backend loads lazily), so on a checkout without the tiles extra the
-# failure would otherwise land inside the first fixture as an error rather
-# than a skip. Guard the whole module instead.
-pytest.importorskip("cooler")
-pytest.importorskip("clodius.tiles_v2.cooler")
 
 pytestmark = pytest.mark.integration
 

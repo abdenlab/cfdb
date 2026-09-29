@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 
-import numpy as np
 import pytest
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
+
+# numpy arrives transitively with clodius, which is only installed for the
+# tiles extra (Python >= 3.12). Guard rather than let a bare import fail
+# collection outright on 3.11.
+np = pytest.importorskip("numpy")
 
 from cfdb.tilesets.errors import (
     TilesetHydrationTimeout,

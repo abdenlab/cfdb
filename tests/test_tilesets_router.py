@@ -105,6 +105,7 @@ class TestStatusProbe:
             never dispatching.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, executor, _ = prep_env
         mock_db.file.docs = [_file_doc()]
 
@@ -232,6 +233,7 @@ class TestStatusProbe:
             signals the same condition.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(api, "cache", None)
@@ -255,6 +257,7 @@ class TestStatusProbe:
             retry will fix and which is not the server's fault.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, _ = prep_env
         doc = _file_doc()
         del doc["md5"]
@@ -310,6 +313,7 @@ class TestStatusProbe:
             reordering the guards would silently change the answer.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [
             _file_doc(submission="encode", local_id="ENCFF123ABC", filename="c.hic")
@@ -338,6 +342,7 @@ class TestStatusProbe:
             the exception text to an unauthenticated caller.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(
@@ -370,6 +375,7 @@ class TestPrepare:
             for /data and /index preprocessing.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, executor, _ = prep_env
         mock_db.file.docs = [_file_doc()]
 
@@ -454,6 +460,7 @@ class TestPrepare:
             /index rather than queuing past it.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(
@@ -485,6 +492,7 @@ class TestPrepare:
             a reorder would silently break.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(
@@ -509,6 +517,7 @@ class TestPrepare:
             this file, not a server fault.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(
@@ -563,6 +572,7 @@ class TestPrepare:
             output could never be addressed must not be queued.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, executor, _ = prep_env
         doc = _file_doc()
         del doc["md5"]
@@ -591,6 +601,7 @@ class TestPrepare:
             build.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, executor, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(api, "cache", None)
@@ -618,6 +629,7 @@ class TestPrepare:
             the exception text to an unauthenticated caller.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(
@@ -650,6 +662,7 @@ class TestPrepare:
             it up as a 409 or 503 a client would retry forever.
         """
         # Arrange
+        pytest.importorskip("clodius")
         _, mock_db, _, mocker = prep_env
         mock_db.file.docs = [_file_doc()]
         mocker.patch.object(
