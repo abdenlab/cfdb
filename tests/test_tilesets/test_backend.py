@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from importlib.util import find_spec
 
 import pytest
 
@@ -29,23 +28,26 @@ class TestLoadBackend:
     """The one seam that turns the tile subsystem on or off."""
 
     def test_should_raise_when_clodius_is_absent(self, mocker):
-        """Test the degraded import gate of a build without the tiles extra.
+        """Test the degraded import gate of a broken or incomplete install.
 
         Given:
             ``sys.modules`` patched so both clodius modules the gate
-            imports from raise ImportError, simulating an image built
-            without the ``tiles`` extra.
+            imports from raise ImportError, simulating a build whose
+            install of the ordinary clodius dependency is broken or
+            incomplete.
         When:
             load_backend is called.
         Then:
-            It should raise TileBackendUnavailable naming the ``tiles``
-            extra, chained from the underlying ImportError.
+            It should raise TileBackendUnavailable, chained from the
+            underlying ImportError.
         """
         # Arrange
         mocker.patch.dict(sys.modules, _ABSENT_BACKEND_MODULES)
 
         # Act & assert
-        with pytest.raises(TileBackendUnavailable, match="'tiles' extra") as excinfo:
+        with pytest.raises(
+            TileBackendUnavailable, match="clodius tile backend"
+        ) as excinfo:
             load_backend()
         assert isinstance(excinfo.value.__cause__, ImportError)
 
@@ -62,7 +64,6 @@ class TestLoadBackend:
             clodius exception types the per-tile/500 split keys on.
         """
         # Arrange
-        pytest.importorskip("clodius")
         from clodius.core.errors import TileOutOfBounds, TilesetError
         from clodius.tiles_v2.cooler import CoolerTileset
 
@@ -111,9 +112,6 @@ class TestIsAvailable:
         Then:
             It should return True.
         """
-        # Arrange
-        pytest.importorskip("clodius")
-
         # Act
         result = is_available()
 
@@ -151,15 +149,10 @@ class TestLoadHicTileset:
 class TestIsTileError:
     """The classification that splits per-tile payloads from 500s.
 
-    Every test here loads a real backend, so the whole class needs clodius
-    installed — unlike TestLoadBackend's absent-module tests, there is no
-    sys.modules trick that stands in for a real error hierarchy to
-    classify against.
+    Every test here loads a real backend and classifies against clodius's
+    real error hierarchy — unlike TestLoadBackend's absent-module tests,
+    there is no sys.modules trick standing in for it.
     """
-
-    pytestmark = pytest.mark.skipif(
-        find_spec("clodius") is None, reason="requires the clodius tile backend"
-    )
 
     def test_should_recognize_a_clodius_tile_error(self):
         """Test that a clodius per-tile error is classified as such.

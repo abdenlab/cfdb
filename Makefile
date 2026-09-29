@@ -52,62 +52,6 @@ api:
 	docker run -d --name api --network cvh-backend-network --network-alias cvh-backend -p 8000:8000 -e SYNC_DATA_DIR=/tmp/sync-data api
 	@echo "API container is up and running on port 8000 (http://0.0.0.0:8000/metadata)."
 
-# --- Local-dev matrix tile serving (issue #82) -----------------------
-#
-# `make api` builds an image with no clodius, so its tile routes answer
-# 501 -- correct for production while the `tiles` extra stays optional,
-# but it leaves the whole tile chain untestable through the documented
-# Docker flow. These targets layer clodius on (installed from the public
-# fork at the sha pyproject.toml pins) and add the piece `make api` does
-# not need: a cache volume shared with a worker, since a tileset
-# artifact is built by the worker and then opened by the API.
-#
-# Retire both once `tiles` becomes an ordinary dependency (raising the
-# Python floor to 3.12) -- `make api` then covers this on its own.
-
-api-tiles:
-	make network
-	@docker stop api 2>/dev/null || true
-	@docker rm api 2>/dev/null || true
-	@echo "Building the API image..."
-	docker build -t api -f Dockerfile.api .
-	@echo "Layering the clodius tile backend on top..."
-	docker build -t api-tiles -f Dockerfile.api-tiles .
-	@# The image runs as `app`, but a freshly created named volume is
-	@# owned by root, so the lifespan's mkdir under SYNC_DATA_DIR fails
-	@# with PermissionError and the API 500s on every workflow route.
-	@docker volume create cfdb-sync >/dev/null
-	@docker run --rm --user 0 --entrypoint chown -v cfdb-sync:/tmp/sync-data api-tiles -R app:app /tmp/sync-data
-	@echo "Starting the API container with matrix tile serving enabled..."
-	docker run -d --name api --network cvh-backend-network --network-alias cvh-backend -p 8000:8000 \
-		-e SYNC_DATA_DIR=/tmp/sync-data \
-		-e WORKFLOW_POOL_NAMESPACE=$${WORKFLOW_POOL_NAMESPACE:-cfdb-workers} \
-		-v cfdb-sync:/tmp/sync-data \
-		api-tiles
-	@echo "API up on port 8000."
-	@# Start the worker FIRST next time: the API dispatches on request, and a
-	@# dispatch that finds no worker is queued rather than failed, so the job
-	@# then waits out CFDB_WORKFLOW_RETRY_INTERVAL_S (2 min) before running.
-	@echo "Run 'make worker-tiles' before POSTing a tileset, or the first job waits ~2 min for the retry tick."
-
-# The worker that builds tileset artifacts. It reuses the API image
-# rather than `cfdb-wool`, because the matrix processor needs cooler and
-# h5py, which arrive with clodius and are absent from the worker image.
-# It shares the API's cache volume: the worker writes the artifact, the
-# API opens it locally with h5py.
-worker-tiles:
-	make network
-	@docker stop worker 2>/dev/null || true
-	@docker rm worker 2>/dev/null || true
-	@echo "Starting a containerized LAN worker pool (namespace=$${WORKFLOW_POOL_NAMESPACE:-cfdb-workers})..."
-	docker run -d --name worker --network cvh-backend-network \
-		-e SYNC_DATA_DIR=/tmp/sync-data \
-		-e WORKFLOW_POOL_NAMESPACE=$${WORKFLOW_POOL_NAMESPACE:-cfdb-workers} \
-		-e WORKFLOW_WORKER_COUNT=$${WORKFLOW_WORKER_COUNT:-1} \
-		-v cfdb-sync:/tmp/sync-data \
-		api-tiles python -m cfdb.workflows.worker_lan
-	@echo "Worker container is up. Check logs with: docker logs -f worker"
-
 schema:
 	@echo "Regenerating schema.graphql from the Strawberry schema..."
 	uv run python scripts/export_schema.py

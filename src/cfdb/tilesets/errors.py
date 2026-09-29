@@ -42,10 +42,10 @@ class TileBackendUnavailable(TilesetError):
     """The installed build carries no usable tile backend.
 
     Rendered as 501. Two distinct causes share it: clodius is absent
-    entirely (the images do not yet carry it — see the ``tiles`` extra in
-    ``pyproject.toml``), or the request is for a ``.hic``, which cfdb
-    deliberately does not serve because the backend reads local files only
-    and those files are too large to cache.
+    entirely (a broken or incomplete install — it is an ordinary
+    dependency, see ``pyproject.toml``), or the request is for a ``.hic``,
+    which cfdb deliberately does not serve because the backend reads
+    local files only and those files are too large to cache.
     """
 
 

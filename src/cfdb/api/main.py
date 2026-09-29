@@ -166,11 +166,11 @@ def _build_tileset_service(
 ) -> "TilesetService | None":
     """Build the matrix tile service, or explain why there isn't one.
 
-    Returns ``None`` when the installed build carries no clodius. That is
-    the expected state for images built today — the fork is private, so
-    the Dockerfiles cannot fetch it and it is installed only via the
-    ``tiles`` extra — and it must degrade to a clear 501 on the tile
-    routes rather than taking the whole application down at startup.
+    Returns ``None`` when the installed build carries no clodius. clodius
+    is an ordinary dependency, so this is a broken or incomplete install
+    rather than an expected state — but it must still degrade to a clear
+    501 on the tile routes rather than taking the whole application down
+    at startup.
 
     The service reads ``api.cache`` through a callable rather than
     capturing it, so a lifespan that rebuilds the cache (or a test that

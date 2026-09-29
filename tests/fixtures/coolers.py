@@ -23,13 +23,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
-
-#: numpy arrives transitively with clodius/cooler, which are only
-#: installed for the ``tiles`` extra (Python >= 3.12). Guard here rather
-#: than let a bare ``import numpy`` fail collection outright on 3.11,
-#: since every caller of this module already expects a skip in that case.
-np = pytest.importorskip("numpy")
 
 #: Tiling genome, 3000 bp total. Deliberately tiny relative to the bin
 #: sizes below: a cooler tile is 256 bins wide, so a realistic 1 kb binsize

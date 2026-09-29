@@ -1,12 +1,12 @@
 """The single import gate for the clodius tile backend.
 
 Every import of clodius in cfdb goes through here, so the whole subsystem
-has exactly one on/off seam. That matters because clodius is currently an
-optional extra installed from a sibling checkout (the fork is private, so
-the Dockerfiles cannot fetch it) — which means production images do not
-carry it. Concentrating the import lets that degrade to a clear 501 on the
-tile routes instead of an ImportError at application startup or, worse, a
-subsystem that half-works.
+has exactly one on/off seam. clodius is an ordinary dependency (see
+``pyproject.toml``) and every image carries it, so in practice this gate
+never trips — but concentrating the import here means a broken or
+partial install still degrades to a clear 501 on the tile routes instead
+of an ImportError at application startup, or worse, a subsystem that
+half-works.
 
 The gate also resolves ``clodius.tiles_v2.hic`` separately from the cooler
 tileset. The module is not part of the pinned build — cfdb does not serve
@@ -61,9 +61,9 @@ def load_backend() -> ClodiusBackend:
     except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
         raise TileBackendUnavailable(
             "Matrix tile serving requires the clodius tile backend, which "
-            "this build does not carry. Install the 'tiles' extra "
-            "(`uv sync --extra tiles`, which resolves clodius from the "
-            "sibling checkout) to enable it."
+            "this build does not carry. clodius is an ordinary dependency "
+            "(`uv sync`), so this means the install is broken or "
+            "incomplete rather than a feature that needs enabling."
         ) from exc
 
     return ClodiusBackend(
