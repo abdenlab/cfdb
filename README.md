@@ -10,15 +10,9 @@ CFDB is a Python package for querying and serving enriched C2M2 (Crosscut Metada
 pip install git+https://github.com/abdenlab/cfdb.git
 ```
 
-Requires Python 3.11 or later.
+Requires Python 3.12 or later.
 
-Matrix tile serving for Hi-C contact maps is an optional extra, because the [`abdenlab/clodius`](https://github.com/abdenlab/clodius) fork it depends on requires Python 3.12 while cfdb still supports 3.11. The dependency is pinned to a commit sha of the public fork, so enabling it needs nothing beyond the extra:
-
-```bash
-uv sync --extra tiles
-```
-
-Without it the API runs unchanged and the tile endpoints answer `501`. See [Matrix tile serving](#matrix-tile-serving-hi-c-contact-maps).
+Matrix tile serving for Hi-C contact maps (see [Matrix tile serving](#matrix-tile-serving-hi-c-contact-maps)) is backed by the [`abdenlab/clodius`](https://github.com/abdenlab/clodius) fork, pinned to a commit sha of the public fork as an ordinary dependency — no separate install step is needed beyond the usual `pip install` / `uv sync` above.
 
 ### Environment Variables
 
@@ -930,7 +924,7 @@ Both endpoints accept repeatable `d` parameters, capped at 64 per request. The r
 | 400 | Malformed uid, no `d` parameter, more than 64 `d` parameters, or an unknown DCC |
 | 403 | File requires consortium/protected access (HuBMAP) |
 | 404 | File not found, not a contact map, or its tileset artifact has not been built yet |
-| 501 | This build carries no tile backend (see the `tiles` extra below), or the file is a `.hic` |
+| 501 | This build carries no tile backend (a broken or incomplete install), or the file is a `.hic` |
 | 503 | Workflow subsystem disabled, or the artifact could not be pulled onto local disk in time (`Retry-After`) |
 
 #### Preparing a contact map
@@ -958,15 +952,15 @@ curl http://localhost:8000/tilesets/4dn/<local_id>/status      # {"ready": true}
 
 #### Serving tiles locally
 
-`make api` builds from `Dockerfile.api`, which carries no clodius, so its tile routes answer `501` — correct while the `tiles` extra stays optional, but it leaves the whole chain untestable through the documented Docker flow. `make api-tiles` layers the tile backend on (installed from the public fork at the same sha `pyproject.toml` pins) and adds the one piece `make api` does not need: a cache volume shared with a worker, because a tileset artifact is built by the worker and then opened locally by the API with h5py. Both targets are interim scaffolding and are retired once `tiles` becomes an ordinary dependency, at which point `make api` covers this on its own.
-
-The worker reuses the API image rather than `cfdb-wool`: the matrix processor needs `cooler` and `h5py`, which arrive with clodius and are absent from the worker image.
+`clodius` is an ordinary dependency (see [Installation](#installation)), so `make api` and `make wool` both carry the tile backend directly — there is no separate tile-enabled image to build or retire. Start MongoDB, a worker, and the API the same way any other workflow-subsystem feature is tested locally:
 
 ```bash
 make mongodb        # database
-make worker-tiles   # worker FIRST — see below
-make api-tiles      # API with the tile backend
+make worker-local    # worker FIRST — see below
+uv run uvicorn cfdb.api.main:app --reload  # API, with SYNC_DATA_DIR set to the same path the worker uses
 ```
+
+`make api` remains available for a quick container-only smoke test, but a container's `SYNC_DATA_DIR` is private to that container's filesystem — running the API and a worker in separate containers needs a shared bind mount for the cache to work, same as any other `SYNC_DATA_DIR`-dependent flow (see [Running a local worker pool](#running-a-local-worker-pool) below). Running both as bare `uv run` processes against the same local `SYNC_DATA_DIR` sidesteps that entirely.
 
 Start the worker **before** POSTing a tileset. A dispatch that finds no worker is queued rather than failed, so the job then waits out `CFDB_WORKFLOW_RETRY_INTERVAL_S` (2 min) before the retry tick picks it up — correct behaviour, but a confusing two minutes of `pending` if you were not expecting it.
 
@@ -997,8 +991,7 @@ This is invisible to the client, for two reasons that were verified rather than 
 
 #### Limitations
 
-- **The clodius tile backend is an optional extra, so deployed images do not carry it.** Tile reading is backed by the [`abdenlab/clodius`](https://github.com/abdenlab/clodius) fork's `tiles_v2` subpackage, installed via `uv sync --extra tiles` from a commit-pinned git reference on the fork's `main` (a sha, deliberately, rather than a floating branch reference — the fork treats `tiles_v2` as unstable and cfdb is its first consumer, so what runs must be exactly what was validated). The extra stays optional because clodius requires Python 3.12 while cfdb still supports 3.11, so `Dockerfile.api` and `Dockerfile.wool` do not install it and images built today answer `501` on the tile routes. Promoting the dependency to an unconditional one — which raises the floor to 3.12 and lets the images carry the backend — is tracked as follow-up work.
-- **ENCODE `.hic` contact maps are not served.** The pinned clodius does not carry a `.hic` tileset at all, which makes this an unconditional `501` today. It would stay unconditional even if a future clodius did carry one: `.hic` support (tracked separately, on a different path than the tiles_v2 backend above) is built on `hictkpy`, whose entry points take `str | os.PathLike` and nothing else. There is no URL, HTTP, or S3 surface in the library, so a `.hic` can only be read from a local copy. Making that copy is not viable at this corpus's scale: 3,903 files totalling ~78 TB, a median of 10.3 GB, and a largest single file of 315 GB — past the 200 GiB ceiling on Fargate ephemeral storage, so it could not be cached on an API task at any budget. Serving them needs either a remote-capable reader (hictk tracks S3 support in [paulsengroup/hictk#395](https://github.com/paulsengroup/hictk/issues/395), currently scoped to Cooler rather than `.hic`) or an explicit size cap accepting partial coverage — an 8 GiB cap would reach 43% of the files, 20 GiB 67%, 50 GiB 91%. That is deferred rather than decided. 4DN `.mcool` files are unaffected.
+- **ENCODE `.hic` contact maps are not served.** The pinned clodius does not carry a `.hic` tileset at all, which makes this an unconditional `501` today. It would stay unconditional even if a future clodius did carry one: `.hic` support is built on `hictkpy`, whose entry points take `str | os.PathLike` and nothing else. There is no URL, HTTP, or S3 surface in the library, so a `.hic` can only be read from a local copy. Making that copy is not viable at this corpus's scale: 3,903 files totalling ~78 TB, a median of 10.3 GB, and a largest single file of 315 GB — past the 200 GiB ceiling on Fargate ephemeral storage, so it could not be cached on an API task at any budget. Serving them needs either a remote-capable reader (hictk tracks S3 support in [paulsengroup/hictk#395](https://github.com/paulsengroup/hictk/issues/395), currently scoped to Cooler rather than `.hic`) or an explicit size cap accepting partial coverage — an 8 GiB cap would reach 43% of the files, 20 GiB 67%, 50 GiB 91%. That is deferred rather than decided. 4DN `.mcool` files are unaffected.
 - **`coordSystem` is omitted for the 21 4DN contact maps that carry no `genomeAssembly`.** It is left out entirely rather than emitted as an empty string: HiGlass matches `coordSystem` against chromosome-info tilesets, so a plausible-looking placeholder risks a silently misaligned track, whereas an absent key makes the client fall back to the `chromsizes` array every tileset info carries. The heatmap still renders.
 - **ICE-balanced heatmaps are unavailable for the 10 flat `.cool` files.** Coarsening runs without `--balance` because balancing a large flat cooler costs minutes to hours; clodius falls back cleanly to unbalanced when no `weight` column exists.
 - **Interchromosomal tiles are served as the concatenated-genome lattice clodius produces**, with no special-casing.

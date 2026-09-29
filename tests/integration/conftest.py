@@ -103,10 +103,11 @@ def tool_available(name: str) -> bool:
 def cooler_available() -> bool:
     """Return True when the ``cooler`` package is importable.
 
-    The tiles extra is optional (the clodius fork is private), so the
-    contact-map rows are gated the way the gffread/bedToBigBed rows are
-    gated on PATH tools — probed with ``find_spec`` so collection never
-    pays the import.
+    clodius is an ordinary dependency, so this is always True in a
+    correctly installed environment — kept as a probe (find_spec, so
+    collection never pays the import) for the same defense-in-depth
+    reason the gffread/bedToBigBed rows are gated on PATH tools: a
+    broken or partial install degrades to a skip rather than a failure.
     """
     return importlib.util.find_spec("cooler") is not None
 

@@ -19,13 +19,10 @@ from __future__ import annotations
 import asyncio
 import base64
 
+import numpy as np
 import pytest
 import pytest_asyncio
 
-# numpy arrives transitively with clodius/cooler, which are only installed
-# for the tiles extra (Python >= 3.12); guard it alongside the others
-# rather than let a bare import fail collection outright on 3.11.
-np = pytest.importorskip("numpy")
 pytest.importorskip("cooler")
 pytest.importorskip("moto")
 

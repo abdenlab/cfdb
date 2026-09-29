@@ -16,17 +16,13 @@ from __future__ import annotations
 import asyncio
 import base64
 
+import numpy as np
 import pytest
 import pytest_asyncio
 
-# numpy arrives transitively with clodius/cooler, which are only installed
-# for the tiles extra (Python >= 3.12). tests.fixtures.coolers guards its
-# own numpy import the same way, but this module's own bare import would
-# fail collection before ever reaching that one, so it needs the same
-# guard directly. The tile backend itself loads lazily, so nothing else
-# below pulls in cooler or clodius at import time -- guard the whole
-# module here instead.
-np = pytest.importorskip("numpy")
+# The tile backend itself loads lazily, so nothing below pulls in cooler
+# or clodius at import time -- guard the whole module here instead of
+# letting the failure land inside the first fixture as an error.
 pytest.importorskip("cooler")
 pytest.importorskip("clodius.tiles_v2.cooler")
 

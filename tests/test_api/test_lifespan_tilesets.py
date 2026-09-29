@@ -79,9 +79,6 @@ async def test_lifespan_should_build_the_tile_service_when_clodius_is_present(
         ``api.tileset_service`` should be populated, so the tile routes
         serve rather than answering 501.
     """
-    # Arrange
-    pytest.importorskip("clodius")
-
     # Act
     async with main.lifespan(main.app):
         service = api.tileset_service
@@ -133,7 +130,6 @@ async def test_lifespan_should_close_and_clear_the_tile_service_on_teardown(
         leak ``_reset_api_globals`` exists to prevent.
     """
     # Arrange
-    pytest.importorskip("clodius")
     closed: list[bool] = []
 
     # Act
@@ -223,7 +219,6 @@ async def test_lifespan_should_propagate_config_to_the_tile_service(
         ``CFDB_TILESET_*`` / ``CFDB_TILE_*`` env knobs.
     """
     # Arrange
-    pytest.importorskip("clodius")
     spy = mocker.spy(main, "build_tileset_service")
 
     # Act
@@ -259,7 +254,6 @@ async def test_lifespan_should_null_all_globals_when_service_close_raises(
         the next app instantiation.
     """
     # Arrange
-    pytest.importorskip("clodius")
     original_close = None
 
     # Act
@@ -302,7 +296,6 @@ async def test_lifespan_should_build_the_tile_service_when_the_cache_is_s3(
         tiles are served.
     """
     # Arrange
-    pytest.importorskip("clodius")
     assert stub_lifespan.kind == "s3-cached"
 
     # Act
@@ -332,7 +325,6 @@ async def test_lifespan_should_wire_the_cache_provider_to_late_bind(
         service pointed at a stale backend.
     """
     # Arrange
-    pytest.importorskip("clodius")
     from cfdb.tilesets.errors import TilesetNotReady
 
     doc = {
