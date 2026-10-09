@@ -94,3 +94,44 @@ MATERIALIZED_SOURCES = frozenset({MatrixSource.MCOOL, MatrixSource.COOL})
 def needs_materialization(file_meta: dict[str, Any]) -> bool:
     """True when this file must be preprocessed before it can be tiled."""
     return matrix_source_kind(file_meta) in MATERIALIZED_SOURCES
+
+
+#: ``file_format.name`` for a bigInteract file — minted rather than an EDAM
+#: term (``services/ontology_mappings.py``), specifically so it is distinct
+#: from plain ``bigBed`` and from this module's own ``HDF5_FORMAT_NAME``.
+#: Unlike :class:`MatrixSource`, a bigInteract file needs no filename-suffix
+#: dance and no materialization: the name alone identifies it, and it is
+#: read in place from its upstream URL — see
+#: :meth:`~cfdb.tilesets.service.TilesetService._open_bbi_interaction`.
+BBI_INTERACTION_FORMAT_NAME = "bigInteract"
+
+
+def is_bbi_interaction_source(file_meta: dict[str, Any]) -> bool:
+    """True when ``file_meta`` is a bigInteract file."""
+    file_format = file_meta.get("file_format")
+    return (
+        isinstance(file_format, dict)
+        and file_format.get("name") == BBI_INTERACTION_FORMAT_NAME
+    )
+
+
+#: Suffix on a tileset uid that selects the 1D arc/link presentation of a
+#: bigInteract file rather than its default 2D rectangle-domain one. ``:``
+#: rather than ``.`` deliberately: a uid half must stay free of ``.``
+#: (clodius parses a tile id by splitting on it), and this never reaches
+#: clodius at all — ``split_bbi_presentation`` strips it before anything
+#: downstream sees the uid.
+LINKS_PRESENTATION_SUFFIX = ":links"
+
+
+def split_bbi_presentation(uid: str) -> tuple[str, str]:
+    """Split a bigInteract uid into its base uid and presentation mode.
+
+    Returns:
+        ``(base_uid, presentation)``, where ``presentation`` is
+        ``"links"`` when ``uid`` ends with :data:`LINKS_PRESENTATION_SUFFIX`
+        and ``"rectangles"`` (the default) otherwise.
+    """
+    if uid.endswith(LINKS_PRESENTATION_SUFFIX):
+        return uid[: -len(LINKS_PRESENTATION_SUFFIX)], "links"
+    return uid, "rectangles"

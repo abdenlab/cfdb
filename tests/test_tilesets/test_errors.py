@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 
 import cfdb.tilesets.errors as errors_module
-from cfdb.tilesets.errors import TilesetError
+from cfdb.tilesets.errors import TilesetError, TilesetSourceUnavailable
 
 
 class TestTilesetErrorHierarchy:
@@ -54,3 +54,44 @@ class TestTilesetErrorHierarchy:
             "TilesetTooLarge",
             "TilesetHydrationTimeout",
         } <= names
+
+
+class TestTilesetSourceUnavailable:
+    """The one TilesetError carrying its own HTTP status code."""
+
+    def test_should_default_the_status_code_to_502(self):
+        """Test the constructor's default when no status_code is given.
+
+        Given:
+            TilesetSourceUnavailable constructed with only a message.
+        When:
+            Its status_code attribute is read.
+        Then:
+            It should be 502 — every real call site passes an explicit
+            status_code, so this default is otherwise never exercised.
+        """
+        # Act
+        exc = TilesetSourceUnavailable("upstream unreachable")
+
+        # Assert
+        assert exc.status_code == 502
+
+    def test_should_preserve_an_explicit_status_code(self):
+        """Test that a passed-in status_code is stored as given.
+
+        Given:
+            TilesetSourceUnavailable constructed with an explicit
+            status_code.
+        When:
+            Its status_code attribute is read.
+        Then:
+            It should equal the value passed in, and the instance
+            should still be a TilesetError.
+        """
+        # Act
+        exc = TilesetSourceUnavailable("not found upstream", status_code=404)
+
+        # Assert
+        assert exc.status_code == 404
+        assert isinstance(exc, TilesetError)
+        assert str(exc) == "not found upstream"

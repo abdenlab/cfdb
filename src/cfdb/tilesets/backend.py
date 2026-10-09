@@ -119,6 +119,57 @@ def load_hic_tileset() -> type:
     return HicTileset
 
 
+def load_bbi_interaction_tilesets() -> tuple[type, type, type, type[Exception]]:
+    """Resolve the bigInteract tileset classes, ``LinkPolicy``, and the
+    pybigtools read-error type.
+
+    Kept separate from :class:`ClodiusBackend`, same reasoning as
+    :func:`load_hic_tileset`: this is a second, independently-gated
+    capability rather than a core field every caller needs. Unlike
+    ``.hic``, there is no permanent refusal behind this gate — pybigtools
+    (the reader these classes use) has native remote-HTTP support, so a
+    clodius new enough to carry them is enough to serve bigInteract tiles
+    straight from the upstream URL. See
+    :meth:`~cfdb.tilesets.service.TilesetService._open_bbi_interaction`.
+
+    ``clodius.tiles_v2.bbi`` also carries a third interaction tileset,
+    ``BBIInteractionTileset`` ("paired intervals") — the base both classes
+    below subclass. It is deliberately not resolved here: clodius's own
+    docstring for it says to prefer the two concrete subclasses, which is
+    what every caller in this codebase does.
+
+    ``pybigtools.BBIReadError`` is resolved here rather than imported
+    directly in ``service.py``, for the same reason the tileset classes
+    are: ``pybigtools`` is pulled in transitively through clodius, not a
+    direct cfdb dependency, so every name from it goes through this one
+    gate.
+
+    Raises:
+        TileBackendUnavailable: when the installed clodius predates
+            clodius#15/#19 and carries no ``clodius.tiles_v2.bbi``
+            interaction tileset classes.
+    """
+    try:
+        import pybigtools
+        from clodius.core.policies import LinkPolicy
+        from clodius.tiles_v2.bbi import (
+            BBIInteraction2DTileset,
+            BBIInteractionLinksTileset,
+        )
+    except ImportError as exc:
+        raise TileBackendUnavailable(
+            "Serving bigInteract tiles requires clodius.tiles_v2.bbi's "
+            "interaction tileset classes, which the installed clodius "
+            "does not provide."
+        ) from exc
+    return (
+        BBIInteraction2DTileset,
+        BBIInteractionLinksTileset,
+        LinkPolicy,
+        pybigtools.BBIReadError,
+    )
+
+
 def is_tile_error(backend: ClodiusBackend, exc: BaseException) -> bool:
     """True when ``exc`` is a clodius per-tile error rather than a bug.
 

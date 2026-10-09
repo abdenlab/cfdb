@@ -29,20 +29,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cfdb.tilesets.backend import load_backend, load_hic_tileset
+import fsspec
+
+from cfdb.services import drs
+from cfdb.tilesets.backend import (
+    load_backend,
+    load_bbi_interaction_tilesets,
+    load_hic_tileset,
+)
 from cfdb.tilesets.errors import (
     TileBackendUnavailable,
     TilesetHydrationTimeout,
     TilesetIdentityIncomplete,
     TilesetNotReady,
+    TilesetSourceUnavailable,
     TilesetUnsupported,
 )
-from cfdb.tilesets.formats import MatrixSource, matrix_source_kind
+from cfdb.tilesets.formats import (
+    MatrixSource,
+    is_bbi_interaction_source,
+    matrix_source_kind,
+    split_bbi_presentation,
+)
 from cfdb.tilesets.store import LocalTilesetStore
 from cfdb.tilesets.wire import error_payload, tileset_info_payload
 from cfdb.workflows.cache import CacheBackend
+from cfdb.workflows.fetcher import resolve_download_url
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.matrix import MatrixTilesetProcessor
+from cfdb.workflows.urlsafe import UnsafeOutboundURL
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +102,13 @@ class TilesetService:
         self._open: OrderedDict[str, _OpenTileset] = OrderedDict()
         self._open_lock = asyncio.Lock()
         #: ``(cache_key, tile_id.raw)`` to payload, least-recently-used
-        #: first. Keyed on the cache key rather than the uid because the
-        #: key embeds ``md5-v{processor_version}``, so an upstream byte
-        #: change or a processor bump invalidates every tile for free.
+        #: first. Keyed on the cache key rather than the uid because for
+        #: an mcool/cool/hic the key embeds ``md5-v{processor_version}``,
+        #: so an upstream byte change or a processor bump invalidates
+        #: every tile for free. A bigInteract's key has no such identity
+        #: (see ``_cache_key``) — its tiles are only invalidated by the
+        #: ordinary LRU/byte-budget eviction, same as an open handle
+        #: outliving an upstream change for any remote-read source.
         self._tiles: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._tile_bytes = 0
         store.set_release_hook(self._release_for_eviction)
@@ -115,7 +134,7 @@ class TilesetService:
         position's slot rather than raising or being omitted — one bad id in
         a batch must not blank the whole track.
         """
-        cache_key = self._cache_key(file_doc)
+        cache_key = self._cache_key(uid, file_doc)
 
         payloads: dict[str, dict[str, Any]] = {}
         pending: list[str] = []
@@ -180,7 +199,7 @@ class TilesetService:
 
     async def _acquire(self, uid: str, file_doc: dict[str, Any]) -> _OpenTileset:
         """Return an open tileset for ``uid``, opening one if needed."""
-        cache_key = self._cache_key(file_doc)
+        cache_key = self._cache_key(uid, file_doc)
 
         async with self._open_lock:
             entry = self._open.get(cache_key)
@@ -231,11 +250,13 @@ class TilesetService:
     ) -> Any:
         """Construct a tileset for ``file_doc``, without dispatching anything."""
         kind = matrix_source_kind(file_doc)
-        if kind is None:
-            raise TilesetUnsupported(f"{uid} is not a contact map")
-        if kind is MatrixSource.HIC:
-            return await self._open_hic(uid, file_doc)
-        return await self._open_cooler(uid, cache_key)
+        if kind is not None:
+            if kind is MatrixSource.HIC:
+                return await self._open_hic(uid, file_doc)
+            return await self._open_cooler(uid, cache_key)
+        if is_bbi_interaction_source(file_doc):
+            return await self._open_bbi_interaction(uid, file_doc)
+        raise TilesetUnsupported(f"{uid} is not a tileable source")
 
     async def _open_cooler(self, uid: str, cache_key: str) -> Any:
         """Open the cached mcool artifact for ``uid``."""
@@ -299,6 +320,71 @@ class TilesetService:
             "remote support), and cfdb does not materialize .hic artifacts. "
             "4DN .mcool contact maps are unaffected."
         )
+
+    async def _open_bbi_interaction(self, uid: str, file_doc: dict[str, Any]) -> Any:
+        """Open a bigInteract tileset directly from its upstream URL.
+
+        Unlike :meth:`_open_cooler`, there is no cache artifact and no
+        ``LocalTilesetStore`` interaction at all here — pybigtools (the
+        reader clodius's bbi tilesets use) has native remote-HTTP
+        support, so the tileset reads the upstream URL itself over HTTP
+        Range requests via an ``fsspec``-backed factory, with no local
+        copy ever made.
+        """
+        base_uid, presentation = split_bbi_presentation(uid)
+        rect_cls, links_cls, link_policy, bbi_read_error = (
+            load_bbi_interaction_tilesets()
+        )
+
+        access_url = file_doc.get("access_url")
+        if not access_url:
+            raise TilesetUnsupported(f"{base_uid} has no access_url")
+
+        # The 404/403/504/502 branches below genuinely mirror what the
+        # same DRS failure maps to on /data. The 400 branches do not —
+        # /data has no 400 case for either UnsafeOutboundURL or a bare
+        # ValueError from the DRS layer; 400 is cfdb's own choice for a
+        # malformed or disallowed URL on this path specifically.
+        try:
+            resolved_url = await resolve_download_url(access_url)
+        except UnsafeOutboundURL as exc:
+            raise TilesetSourceUnavailable(str(exc), status_code=400) from exc
+        except drs.DRSNotFound as exc:
+            raise TilesetSourceUnavailable(str(exc), status_code=404) from exc
+        except drs.DRSForbidden as exc:
+            raise TilesetSourceUnavailable(str(exc), status_code=403) from exc
+        except drs.DRSTimeout as exc:
+            raise TilesetSourceUnavailable(str(exc), status_code=504) from exc
+        except (drs.DRSRedirectBlocked, drs.DRSUpstreamError, drs.DRSError) as exc:
+            raise TilesetSourceUnavailable(str(exc), status_code=502) from exc
+        except ValueError as exc:
+            # parse_drs_uri (malformed drs:// URI) and
+            # get_https_download_url (no usable access method, e.g. a
+            # Globus-only object) both raise a bare ValueError that
+            # isn't UnsafeOutboundURL — latent today, since bigInteract
+            # access_urls are always plain https:// in practice, but not
+            # guarded against by anything in the data model.
+            raise TilesetSourceUnavailable(str(exc), status_code=400) from exc
+
+        def factory():
+            return fsspec.open(resolved_url, "rb").open()
+
+        # Resolving the URL is not the same as reading it: constructing
+        # the tileset is what performs the actual network request
+        # (clodius's "registration is free" construction reads the file
+        # header immediately). A real fetch failure here raises a raw
+        # fsspec/pybigtools exception, not a TilesetError, so it must be
+        # translated the same way the resolution step above is —
+        # otherwise it escapes the router's per-dataset handling and
+        # 500s the whole batch rather than failing just this uid.
+        try:
+            if presentation == "links":
+                return await self._run(
+                    lambda: links_cls(factory, link_policy=link_policy.EITHER)
+                )
+            return await self._run(lambda: rect_cls(factory))
+        except (OSError, bbi_read_error) as exc:
+            raise TilesetSourceUnavailable(str(exc), status_code=502) from exc
 
     async def _close(self, entry: _OpenTileset) -> None:
         """Close a handle off the event loop."""
@@ -401,13 +487,20 @@ class TilesetService:
 
     # --- plumbing -----------------------------------------------------------
 
-    def _cache_key(self, file_doc: dict[str, Any]) -> str:
-        """The TILESET cache key for ``file_doc``.
+    def _cache_key(self, uid: str, file_doc: dict[str, Any]) -> str:
+        """The open-handle-pool key for ``uid``.
 
-        Derived through the processor rather than re-implemented, so the
-        writer, the readiness probe, and this reader agree by construction
-        rather than by three formulas kept in sync.
+        For an mcool/cool/hic, derived through the processor rather than
+        re-implemented, so the writer, the readiness probe, and this
+        reader agree by construction rather than by three formulas kept
+        in sync. A bigInteract file has no such artifact at all — nothing
+        is cached, there is no processor-derived identity to borrow — so
+        its key is just the uid itself (already unique per presentation,
+        since the rectangles/links uids differ by their ``:links``
+        suffix); it needs no md5, unlike the processor-derived path.
         """
+        if is_bbi_interaction_source(file_doc):
+            return f"bbi:{uid}"
         try:
             return self._processor.cache_key_for(file_doc, ArtifactKind.TILESET)
         except ValueError as exc:
@@ -418,12 +511,21 @@ class TilesetService:
         return await asyncio.get_running_loop().run_in_executor(self._pool, fn)
 
 
-def _payload_bytes(payload: dict[str, Any]) -> int:
+def _payload_bytes(payload: Any) -> int:
     """Approximate on-heap size of a tile payload.
 
-    The base64 ``dense`` string dominates by orders of magnitude; the
-    handful of floats beside it are not worth measuring.
+    A matrix tile (``dict``, cooler/hic) is dominated by its base64
+    ``dense`` string by orders of magnitude; the handful of floats
+    beside it are not worth measuring. A bigInteract tile has no such
+    field at all — clodius's ``BBIInteraction*Tileset`` returns a
+    ``list`` of record dicts instead of a ``dense`` matrix block — so
+    it is charged by its rendered content length instead. Either shape
+    may also be a per-tile error ``dict`` (``{"error": ..., "error_type":
+    ...}``), which falls through the ``dense`` lookup to 0, same as
+    today.
     """
+    if isinstance(payload, list):
+        return sum(len(str(record)) for record in payload)
     dense = payload.get("dense")
     return len(dense) if isinstance(dense, (str, bytes)) else 0
 

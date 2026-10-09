@@ -499,3 +499,55 @@ def make_cool(tmp_path):
         return build_cool(tmp_path / name, **kwargs)
 
     return _make
+
+
+# --- bigInteract fixtures (issue #120) --------------------------------------
+#
+# bigInteract tiles are read directly from the file's upstream URL rather
+# than a local cache artifact (see ``TilesetService._open_bbi_interaction``),
+# so exercising the real read path needs a real file served over real HTTP
+# — a mocked byte stream would not prove the fsspec Range-read factory
+# actually works. Session-scoped: the file and the server are read-only and
+# every consuming test only reads from them.
+
+
+@pytest.fixture(scope="session")
+def tiny_biginteract(tmp_path_factory):
+    """A real bed5+13 bigInteract file with a handful of interactions."""
+    from tests.fixtures.biginteract import build_biginteract
+
+    return build_biginteract(tmp_path_factory.mktemp("biginteract") / "tiny.bb")
+
+
+@pytest.fixture(scope="session")
+def biginteract_server(tiny_biginteract):
+    """Serve ``tiny_biginteract``'s directory over real HTTP on 127.0.0.1.
+
+    Mirrors ``tests/integration/conftest.py``'s ``sample_server`` fixture,
+    at a much smaller scale — this one file, no wool worker, no sample
+    generation. Yields the file's full URL directly rather than a base
+    URL, since every consumer wants exactly this one file.
+    """
+    import http.server
+    import socketserver
+    import threading
+
+    directory = str(tiny_biginteract.parent)
+    filename = tiny_biginteract.name
+
+    class _Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=directory, **kwargs)
+
+        def log_message(self, *_args, **_kwargs) -> None:  # pragma: no cover
+            return
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}/{filename}"
+    finally:
+        server.shutdown()
+        server.server_close()
