@@ -25,7 +25,7 @@
 # runtime stage; update both together during a maintenance window:
 #   docker pull python:3.12-slim-bookworm
 #   docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim-bookworm
-ARG PYTHON_BASE_DIGEST=sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+ARG PYTHON_BASE_DIGEST=sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
 
 # Pin the image to linux/amd64. The bigBed workflow shells out to UCSC's
 # ``bigBedToBed``, which UCSC publishes only as a linux.x86_64 binary (no
