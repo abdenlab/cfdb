@@ -41,14 +41,14 @@ WORKDIR /app
 # UCSC ships a new build the layer rebuilds with the new hash after
 # maintainers re-verify out-of-band. Updating: download the binary,
 # run ``sha256sum``, paste here.
-ARG UCSC_BIGBEDTOBED_SHA256=45cf45c3bd0b77c7f940ff467f30b3563aedb243079617b16f6125d222ff480f
+ARG UCSC_BIGBEDTOBED_SHA256=aa0f66449838339c0e6102994cc65cbad27b628c39ffa19316b4baa4663a9eab
 
 # sha256 of the AWS RDS combined CA bundle this image embeds. AWS
 # rotates ``global-bundle.pem`` periodically (next-public rotations are
 # announced in advance). When AWS publishes a new bundle, maintainers
 # re-verify out-of-band and update this hash. Without the pin a MITM at
 # build-time could swap the trust anchor used for prod DB TLS.
-ARG RDS_BUNDLE_SHA256=e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
+ARG RDS_BUNDLE_SHA256=fe45bbebf92ad3e27a583bbb2ddd1553c521ed4d49af5514dc0a40372ea5395c
 
 # Install curl (for ECS health checks) and the bioinformatics tools the
 # workflow subsystem shells out to for preprocessing and indexing.

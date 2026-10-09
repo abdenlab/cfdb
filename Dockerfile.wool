@@ -52,7 +52,7 @@ WORKDIR /app
 # lockstep with Dockerfile.api. When UCSC ships a new build the layer
 # rebuilds with the new hash after maintainers re-verify out-of-band.
 # Updating: download the binary, run ``sha256sum``, paste here.
-ARG UCSC_BIGBEDTOBED_SHA256=45cf45c3bd0b77c7f940ff467f30b3563aedb243079617b16f6125d222ff480f
+ARG UCSC_BIGBEDTOBED_SHA256=aa0f66449838339c0e6102994cc65cbad27b628c39ffa19316b4baa4663a9eab
 
 # Install curl (for the container/ECS health check) and the bioinformatics
 # tools the workflow subsystem shells out to. samtools/tabix/bcftools/
