@@ -1050,3 +1050,170 @@ class TestDegradedModes:
             await tileset_info(d=[UID])
         assert exc_info.value.status_code == 503
         assert exc_info.value.headers["Retry-After"] == "30"
+
+
+def _biginteract_doc(access_url: str, **overrides) -> dict:
+    """Return a projected document for an ENCODE bigInteract file."""
+    doc = {
+        "submission": "encode",
+        "local_id": "ENCFF000BIG",
+        "md5": FIXTURE_MD5,
+        "filename": "sample.bigInteract",
+        "file_format": {"name": "bigInteract"},
+        "access_url": access_url,
+        "dcc": {"dcc_abbreviation": "ENCODE"},
+    }
+    doc.update(overrides)
+    return doc
+
+
+class TestBbiInteraction:
+    """``/tileset_info`` and ``/tiles`` for bigInteract files.
+
+    ``cfdb.tilesets.service.resolve_download_url`` is mocked for the same
+    reason ``tests/test_tilesets/test_service.py``'s equivalent class
+    mocks it — the SSRF allowlist's loopback escape hatch is read into a
+    module constant at import time, already evaluated before this test
+    module loads. Everything downstream of that one hop — real service
+    dispatch, a real ``fsspec`` factory, real clodius reads — runs for
+    real against ``biginteract_server``.
+    """
+
+    BIGINTERACT_UID = "encode/ENCFF000BIG"
+
+    @pytest.mark.asyncio
+    async def test_should_serve_both_presentations_from_one_uid(
+        self, tile_env, biginteract_server, mocker
+    ):
+        """Test that the rectangle and links uids resolve to the same file.
+
+        Given:
+            One bigInteract document, requested under its default uid and
+            its ``:links`` uid.
+        When:
+            tileset_info is requested for both.
+        Then:
+            Each should report the datatype for its own presentation, and
+            both should be keyed by the exact uid that was requested.
+        """
+        # Arrange
+        _, mock_db, _ = tile_env
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        doc = _biginteract_doc(biginteract_server)
+        mock_db.file.docs = [doc]
+        links_uid = f"{self.BIGINTERACT_UID}:links"
+
+        # Act
+        response = await tileset_info(d=[self.BIGINTERACT_UID, links_uid])
+
+        # Assert
+        assert response[self.BIGINTERACT_UID]["datatype"] == "2d-rectangle-domains"
+        assert response[links_uid]["datatype"] == "bedlike"
+        assert response[self.BIGINTERACT_UID]["uuid"] == self.BIGINTERACT_UID
+        assert response[links_uid]["uuid"] == links_uid
+
+    @pytest.mark.asyncio
+    async def test_should_serve_real_tiles_for_both_presentations(
+        self, tile_env, biginteract_server, mocker
+    ):
+        """Test a real tile read through the router for each presentation.
+
+        Given:
+            The same bigInteract document, requested as a rectangle
+            ``z.x.y`` tile id and a links ``z.x`` tile id.
+        When:
+            tiles is requested for both.
+        Then:
+            Each should carry the real interaction records clodius read
+            over HTTP, not an error object.
+        """
+        # Arrange
+        _, mock_db, _ = tile_env
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        doc = _biginteract_doc(biginteract_server)
+        mock_db.file.docs = [doc]
+        rect_raw = f"{self.BIGINTERACT_UID}.0.0.0"
+        links_raw = f"{self.BIGINTERACT_UID}:links.0.0"
+
+        # Act
+        response = await tiles(d=[rect_raw, links_raw])
+
+        # Assert
+        assert isinstance(response[rect_raw], list) and response[rect_raw]
+        assert isinstance(response[links_raw], list) and response[links_raw]
+
+    @pytest.mark.asyncio
+    async def test_should_surface_the_specific_status_for_a_solo_request(
+        self, tile_env, mocker
+    ):
+        """Test that a solo request preserves TilesetSourceUnavailable's status.
+
+        Given:
+            A bigInteract document whose upstream resolution fails with
+            DRSForbidden — the same condition /data maps to 403.
+        When:
+            tileset_info is requested for just that one uid.
+        Then:
+            It should raise HTTPException(403), not the generic 404 every
+            other per-dataset TilesetError gets.
+        """
+        # Arrange
+        from cfdb.services import drs
+
+        _, mock_db, _ = tile_env
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            side_effect=drs.DRSForbidden("denied"),
+        )
+        doc = _biginteract_doc("https://example.org/irrelevant.bb")
+        mock_db.file.docs = [doc]
+
+        # Act & Assert
+        with pytest.raises(HTTPException) as exc_info:
+            await tileset_info(d=[self.BIGINTERACT_UID])
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_should_render_a_batch_entry_as_an_error_object_regardless(
+        self, tile_env, mocker
+    ):
+        """Test that a resolution failure stays per-dataset inside a batch.
+
+        Given:
+            Two bigInteract documents, both hitting the same upstream
+            resolution failure, requested together.
+        When:
+            tileset_info is requested for both at once.
+        Then:
+            Both should render as inline error objects — proving the
+            batch is not aborted by a TilesetSourceUnavailable the way a
+            solo request would be — rather than either raising and
+            blanking the whole response.
+        """
+        # Arrange
+        from cfdb.services import drs
+
+        _, mock_db, _ = tile_env
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            side_effect=drs.DRSForbidden("denied"),
+        )
+        first = _biginteract_doc("https://example.org/irrelevant.bb")
+        second = _biginteract_doc(
+            "https://example.org/irrelevant.bb", local_id="ENCFF111SIB"
+        )
+        mock_db.file.docs = [first, second]
+        other_uid = "encode/ENCFF111SIB"
+
+        # Act
+        response = await tileset_info(d=[self.BIGINTERACT_UID, other_uid])
+
+        # Assert
+        assert "error" in response[self.BIGINTERACT_UID]
+        assert "error" in response[other_uid]

@@ -10,6 +10,7 @@ from cfdb.tilesets.backend import (
     is_available,
     is_tile_error,
     load_backend,
+    load_bbi_interaction_tilesets,
     load_hic_tileset,
 )
 from cfdb.tilesets.errors import TileBackendUnavailable
@@ -144,6 +145,63 @@ class TestLoadHicTileset:
         ) as excinfo:
             load_hic_tileset()
         assert isinstance(excinfo.value.__cause__, ImportError)
+
+
+class TestLoadBbiInteractionTilesets:
+    """The bigInteract tileset gate, resolved separately from the cooler one."""
+
+    def test_should_raise_when_the_bbi_module_is_missing(self, mocker):
+        """Test the error reported by a clodius that predates bigInteract.
+
+        Given:
+            ``sys.modules`` patched so ``clodius.tiles_v2.bbi`` raises
+            ImportError while the cooler tileset stays importable.
+        When:
+            load_bbi_interaction_tilesets is called.
+        Then:
+            It should raise TileBackendUnavailable naming the bigInteract
+            interaction tileset classes, chained from the ImportError.
+        """
+        # Arrange
+        mocker.patch.dict(sys.modules, {"clodius.tiles_v2.bbi": None})
+
+        # Act & assert
+        with pytest.raises(
+            TileBackendUnavailable, match="interaction tileset classes"
+        ) as excinfo:
+            load_bbi_interaction_tilesets()
+        assert isinstance(excinfo.value.__cause__, ImportError)
+
+    def test_should_resolve_the_bbi_interaction_classes(self):
+        """Test the resolved-names contract of a build with bigInteract support.
+
+        Given:
+            An environment where clodius carries ``clodius.tiles_v2.bbi``.
+        When:
+            load_bbi_interaction_tilesets is called.
+        Then:
+            It should return the 2D rectangle tileset, the links tileset,
+            clodius's LinkPolicy enum, and pybigtools's read-error type,
+            matching real clodius/pybigtools names.
+        """
+        # Arrange
+        import pybigtools
+        from clodius.core.policies import LinkPolicy
+        from clodius.tiles_v2.bbi import (
+            BBIInteraction2DTileset,
+            BBIInteractionLinksTileset,
+        )
+
+        # Act
+        rect_cls, links_cls, link_policy, bbi_read_error = (
+            load_bbi_interaction_tilesets()
+        )
+
+        # Assert
+        assert rect_cls is BBIInteraction2DTileset
+        assert links_cls is BBIInteractionLinksTileset
+        assert link_policy is LinkPolicy
+        assert bbi_read_error is pybigtools.BBIReadError
 
 
 class TestIsTileError:

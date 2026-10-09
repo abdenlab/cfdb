@@ -10,16 +10,21 @@ import pytest
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
+from cfdb.services import drs
 from cfdb.tilesets.errors import (
     TilesetHydrationTimeout,
     TilesetIdentityIncomplete,
     TilesetNotReady,
+    TilesetSourceUnavailable,
     TilesetUnsupported,
 )
+from cfdb.tilesets.backend import load_bbi_interaction_tilesets
 from cfdb.tilesets.service import build_service
 from cfdb.workflows.cache import LocalFsCache
 from cfdb.workflows.models import ArtifactKind
 from cfdb.workflows.processors.matrix import MatrixTilesetProcessor
+from cfdb.workflows.urlsafe import UnsafeOutboundURL
+from tests.fixtures.biginteract import CANONICAL_RECORDS
 from tests.fixtures.remote_cache import FakeRemoteCache
 from tests.test_workflows import FIXTURE_MD5, FIXTURE_MD5_ALT
 
@@ -1134,3 +1139,549 @@ class TestOpenTilesetLifetime:
         # Assert
         close_spy.assert_called_once()
         assert close_spy.call_args.args[0] is held
+
+
+def _biginteract_doc(access_url: str, **overrides) -> dict:
+    """Return a projected document for an ENCODE bigInteract file."""
+    doc = {
+        "submission": "encode",
+        "local_id": "ENCFF000BIG",
+        "md5": FIXTURE_MD5,
+        "filename": "sample.bigInteract",
+        "file_format": {"name": "bigInteract"},
+        "access_url": access_url,
+        "dcc": {"dcc_abbreviation": "ENCODE"},
+    }
+    doc.update(overrides)
+    return doc
+
+
+class TestBbiInteraction:
+    """bigInteract: read straight from the upstream URL, never the cache.
+
+    ``resolve_download_url`` is mocked throughout rather than left to run
+    for real against ``http://127.0.0.1`` — the SSRF allowlist's loopback
+    escape hatch is read into a module constant at import time
+    (``cfdb.workflows.urlsafe._ALLOW_HTTP_LOOPBACK``), which has already
+    been evaluated False by the time this test module loads, so setting
+    the env var here would do nothing. Mocking the one URL-resolution hop
+    still exercises everything that matters: real service dispatch, a
+    real ``fsspec`` factory, and real clodius tile reads over real HTTP
+    against ``biginteract_server``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_should_serve_tileset_info_for_the_rectangle_presentation(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test the default (no-suffix) uid's tileset_info document.
+
+        Given:
+            A bigInteract file whose uid carries no presentation suffix.
+        When:
+            tileset_info is requested.
+        Then:
+            It should report the 2D rectangle-domain datatype, with no
+            cache or local store ever consulted.
+        """
+        # Arrange
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+
+        def _unreachable_cache():
+            raise AssertionError("the cache must not be consulted for bigInteract")
+
+        service = build(cache_provider=_unreachable_cache)
+        doc = _biginteract_doc(biginteract_server)
+        uid = "encode/ENCFF000BIG"
+
+        # Act
+        info = await service.tileset_info(uid, doc)
+
+        # Assert
+        assert info["datatype"] == "2d-rectangle-domains"
+        assert info["uuid"] == uid
+
+    @pytest.mark.asyncio
+    async def test_should_serve_tileset_info_for_the_links_presentation(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test the ``:links``-suffixed uid's tileset_info document.
+
+        Given:
+            The same bigInteract file, requested under its ``:links``
+            uid.
+        When:
+            tileset_info is requested.
+        Then:
+            It should report the 1D "bedlike" datatype rather than the
+            default rectangle one — a different tileset class entirely,
+            selected from the same uid string.
+        """
+        # Arrange
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        service = build()
+        doc = _biginteract_doc(biginteract_server)
+        uid = "encode/ENCFF000BIG:links"
+
+        # Act
+        info = await service.tileset_info(uid, doc)
+
+        # Assert
+        assert info["datatype"] == "bedlike"
+        assert info["uuid"] == uid
+
+    @pytest.mark.asyncio
+    async def test_should_read_a_real_rectangle_tile(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test a real 2D tile read over the fsspec factory.
+
+        Given:
+            The rectangle-presentation uid and a ``z.x.y`` tile id
+            covering the whole genome at zoom 0.
+        When:
+            tiles is requested.
+        Then:
+            It should return the real interaction records clodius read
+            over HTTP, not an error payload or an empty list.
+        """
+        # Arrange
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        service = build()
+        doc = _biginteract_doc(biginteract_server)
+        uid = "encode/ENCFF000BIG"
+        raw = f"{uid}.0.0.0"
+
+        # Act
+        payloads = await service.tiles(uid, doc, [raw])
+
+        # Assert
+        payload = payloads[raw]
+        assert isinstance(payload, list)
+        assert len(payload) == len(CANONICAL_RECORDS)
+        assert all("xStart" in record and "yStart" in record for record in payload)
+
+    @pytest.mark.asyncio
+    async def test_should_read_a_real_links_tile(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test a real 1D tile read over the fsspec factory.
+
+        Given:
+            The links-presentation uid and a ``z.x`` (one-coordinate)
+            tile id covering the whole genome at zoom 0.
+        When:
+            tiles is requested.
+        Then:
+            It should return the same real records — the links
+            presentation shares the same underlying data, just a
+            different id grammar.
+        """
+        # Arrange
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        service = build()
+        doc = _biginteract_doc(biginteract_server)
+        uid = "encode/ENCFF000BIG:links"
+        raw = f"{uid}.0.0"
+
+        # Act
+        payloads = await service.tiles(uid, doc, [raw])
+
+        # Assert
+        payload = payloads[raw]
+        assert isinstance(payload, list)
+        assert len(payload) == len(CANONICAL_RECORDS)
+
+    def test_should_read_tiles_via_genuine_range_requests(self, tiny_biginteract):
+        """Test that the fsspec factory performs real, partial HTTP reads.
+
+        Given:
+            A bigInteract file served by a handler that genuinely
+            implements ``Range``/``206`` (unlike ``biginteract_server``'s
+            plain ``SimpleHTTPRequestHandler``, which ignores ``Range``
+            entirely and always returns the whole file), read through a
+            small ``block_size`` so a read spanning more than one block
+            must issue more than one HTTP request.
+        When:
+            A tile is read from a tileset built over this factory.
+        Then:
+            More than one distinct byte range should have been
+            requested, and at least one of them should start past byte
+            0 — the property that distinguishes "read remotely in
+            pieces" from "download the whole file on first touch",
+            which ``biginteract_server`` cannot exercise at its size.
+        """
+        import http.server
+        import re
+        import threading
+
+        import fsspec
+        from clodius.tiles_v2.bbi import BBIInteraction2DTileset
+
+        # Arrange
+        data = tiny_biginteract.read_bytes()
+        ranges_seen: list[tuple[int, int] | str] = []
+
+        class _RangeHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args, **_kwargs) -> None:
+                return
+
+            def do_HEAD(self) -> None:
+                self._respond(head_only=True)
+
+            def do_GET(self) -> None:
+                self._respond(head_only=False)
+
+            def _respond(self, *, head_only: bool) -> None:
+                range_header = self.headers.get("Range")
+                if range_header:
+                    match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+                    start = int(match.group(1))
+                    end = int(match.group(2)) if match.group(2) else len(data) - 1
+                    end = min(end, len(data) - 1)
+                    ranges_seen.append((start, end))
+                    chunk = data[start : end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{end}/{len(data)}"
+                    )
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    if not head_only:
+                        self.wfile.write(chunk)
+                else:
+                    ranges_seen.append("full")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    if not head_only:
+                        self.wfile.write(data)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RangeHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{port}/tiny.bb"
+
+            def factory():
+                return fsspec.open(url, "rb", block_size=32).open()
+
+            # Act
+            tileset = BBIInteraction2DTileset(factory)
+            tile_id = tileset.parse_tile_id("u.0.0.0")
+            tileset.tiles([tile_id])
+
+            # Assert
+            byte_ranges = [r for r in ranges_seen if isinstance(r, tuple)]
+            assert len(byte_ranges) > 1
+            assert any(start > 0 for start, _ in byte_ranges)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    @pytest.mark.asyncio
+    async def test_should_key_the_two_presentations_independently(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test that rectangles and links open distinct tileset handles.
+
+        Given:
+            Both uids for the same bigInteract file, read under an
+            open-tileset cap of one.
+        When:
+            The links presentation is opened right after the rectangle
+            one.
+        Then:
+            Opening the second should evict and close the first — the
+            only way that happens is if the ``:links`` suffix changed
+            the cache key, since a shared key would just reuse the
+            already-open handle and close nothing.
+        """
+        # Arrange
+        rect_cls, _, _, _ = load_bbi_interaction_tilesets()
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        service = build(open_max=1)
+        doc = _biginteract_doc(biginteract_server)
+        close_spy = mocker.spy(rect_cls, "close")
+
+        await service.tileset_info("encode/ENCFF000BIG", doc)
+        # Construction self-releases its own validation-time handle
+        # (clodius's "registration is free" property) — not the
+        # eviction this test is about.
+        close_spy.assert_called_once()
+        close_spy.reset_mock()
+
+        # Act
+        await service.tileset_info("encode/ENCFF000BIG:links", doc)
+
+        # Assert — the rectangle presentation's handle was evicted and
+        # closed to make room for the links one, proving they held
+        # independent cache entries.
+        close_spy.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_should_close_a_bbi_handle_evicted_past_the_open_cap(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test that the open-handle pool bounds bigInteract tilesets too.
+
+        Given:
+            An open-tileset cap of one and two distinct bigInteract
+            files.
+        When:
+            Both are opened.
+        Then:
+            The first handle should be closed — the same eviction
+            contract the cooler path already has, now exercised against
+            clodius's BBI-specific close()/read-lock semantics instead
+            of h5py's.
+        """
+        # Arrange
+        rect_cls, _, _, _ = load_bbi_interaction_tilesets()
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        service = build(open_max=1)
+        first_doc = _biginteract_doc(biginteract_server)
+        second_doc = _biginteract_doc(biginteract_server, local_id="ENCFF111SIB")
+        close_spy = mocker.spy(rect_cls, "close")
+
+        async with service.checkout("encode/ENCFF000BIG", first_doc) as first:
+            assert first.info() is not None  # force the handle open
+        close_spy.assert_called_once()
+        assert close_spy.call_args.args[0] is first
+        close_spy.reset_mock()
+
+        # Act
+        await service.tileset_info("encode/ENCFF111SIB", second_doc)
+
+        # Assert — second's own construction releases itself too; the
+        # eviction this test targets is the call right after it,
+        # against first.
+        assert close_spy.call_count == 2
+        assert close_spy.call_args_list[-1].args[0] is first
+
+    @pytest.mark.asyncio
+    async def test_should_defer_closing_a_bbi_handle_that_is_being_read(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test the reference-counted close for a live bigInteract reader.
+
+        Given:
+            A bigInteract tileset checked out by a reader, and a second
+            distinct bigInteract file opened that evicts it past the
+            cap.
+        When:
+            The eviction lands while the first reader is still inside
+            its checkout.
+        Then:
+            The handle must stay open until that reader leaves, then be
+            closed exactly once — clodius's BBI tilesets take their own
+            read lock around close(), so this is a real, not assumed,
+            property of the new code path.
+        """
+        # Arrange
+        rect_cls, _, _, _ = load_bbi_interaction_tilesets()
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=biginteract_server,
+        )
+        service = build(open_max=1)
+        first_doc = _biginteract_doc(biginteract_server)
+        second_doc = _biginteract_doc(biginteract_server, local_id="ENCFF111SIB")
+        close_spy = mocker.spy(rect_cls, "close")
+
+        # Act & Assert
+        async with service.checkout("encode/ENCFF000BIG", first_doc) as held:
+            assert held.info() is not None  # force the handle open
+            close_spy.assert_called_once()
+            close_spy.reset_mock()
+
+            await service.tileset_info("encode/ENCFF111SIB", second_doc)
+            close_spy.assert_called_once()
+            assert close_spy.call_args.args[0] is not held
+            close_spy.reset_mock()
+
+            assert held.info() is not None  # still serving the reader
+            close_spy.assert_not_called()
+
+        # Assert — the last reader out performs the deferred close
+        close_spy.assert_called_once()
+        assert close_spy.call_args.args[0] is held
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("exc_factory", "expected_status"),
+        [
+            (lambda: drs.DRSNotFound("missing"), 404),
+            (lambda: drs.DRSForbidden("denied"), 403),
+            (lambda: drs.DRSTimeout("slow"), 504),
+            (lambda: drs.DRSUpstreamError("broke"), 502),
+            (lambda: UnsafeOutboundURL("bad host"), 400),
+            (lambda: ValueError("malformed drs:// URI"), 400),
+        ],
+    )
+    async def test_should_translate_a_resolution_failure(
+        self, service_factory, mocker, exc_factory, expected_status
+    ):
+        """Test that each upstream-resolution failure maps to the right status.
+
+        Given:
+            resolve_download_url raising each DRS exception (mapped to
+            the same status /data maps the same failure to) or a bare
+            ValueError (a malformed DRS URI or an unusable access
+            method — cfdb's own 400, not a /data mirror).
+        When:
+            tileset_info is requested.
+        Then:
+            It should raise TilesetSourceUnavailable carrying the
+            expected status code, so the router can preserve it for a
+            solo request.
+        """
+        # Arrange
+        _, build = service_factory
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            side_effect=exc_factory(),
+        )
+        service = build()
+        doc = _biginteract_doc("https://example.org/irrelevant.bb")
+
+        # Act & Assert
+        with pytest.raises(TilesetSourceUnavailable) as excinfo:
+            await service.tileset_info("encode/ENCFF000BIG", doc)
+        assert excinfo.value.status_code == expected_status
+
+    @pytest.mark.asyncio
+    async def test_should_translate_a_real_fetch_failure(
+        self, service_factory, biginteract_server, mocker
+    ):
+        """Test that a failure in the real remote read, not just resolution, is caught.
+
+        Given:
+            resolve_download_url succeeding, but the URL it resolves to
+            404ing on the actual fetch — the construction step that
+            reads the file header, not the resolution step above it.
+        When:
+            tileset_info is requested.
+        Then:
+            It should raise TilesetSourceUnavailable(502) rather than
+            letting the raw FileNotFoundError escape uncaught.
+        """
+        # Arrange
+        _, build = service_factory
+        missing_url = f"{biginteract_server}-does-not-exist"
+        mocker.patch(
+            "cfdb.tilesets.service.resolve_download_url",
+            return_value=missing_url,
+        )
+        service = build()
+        doc = _biginteract_doc(missing_url)
+
+        # Act & Assert
+        with pytest.raises(TilesetSourceUnavailable) as excinfo:
+            await service.tileset_info("encode/ENCFF000BIG", doc)
+        assert excinfo.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_should_translate_a_malformed_response(
+        self, service_factory, tmp_path, mocker
+    ):
+        """Test that a 200 response of non-bigBed bytes is caught too.
+
+        Given:
+            A server that resolves the URL and answers 200, but whose
+            body is not a real bigBed file — the failure pybigtools
+            itself raises during header parsing, not an OSError.
+        When:
+            tileset_info is requested.
+        Then:
+            It should raise TilesetSourceUnavailable(502) rather than
+            letting the raw pybigtools.BBIReadError escape uncaught.
+        """
+        import http.server
+        import socketserver
+        import threading
+
+        # Arrange
+        garbage = tmp_path / "garbage.bb"
+        garbage.write_bytes(b"not a bigbed file")
+
+        class _Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(tmp_path), **kwargs)
+
+            def log_message(self, *_args, **_kwargs) -> None:
+                return
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{port}/garbage.bb"
+        try:
+            _, build = service_factory
+            mocker.patch(
+                "cfdb.tilesets.service.resolve_download_url",
+                return_value=url,
+            )
+            service = build()
+            doc = _biginteract_doc(url)
+
+            # Act & Assert
+            with pytest.raises(TilesetSourceUnavailable) as excinfo:
+                await service.tileset_info("encode/ENCFF000BIG", doc)
+            assert excinfo.value.status_code == 502
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    @pytest.mark.asyncio
+    async def test_should_refuse_a_document_with_no_access_url(self, service_factory):
+        """Test the guard against a bigInteract document with no access_url.
+
+        Given:
+            A bigInteract document whose access_url is falsy — nothing
+            to resolve or open.
+        When:
+            tileset_info is requested.
+        Then:
+            It should raise TilesetUnsupported rather than attempting
+            URL resolution at all.
+        """
+        # Arrange
+        _, build = service_factory
+        service = build()
+        doc = _biginteract_doc(None)
+
+        # Act & Assert
+        with pytest.raises(TilesetUnsupported):
+            await service.tileset_info("encode/ENCFF000BIG", doc)

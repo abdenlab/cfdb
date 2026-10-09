@@ -9,9 +9,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cfdb.tilesets.formats import (
+    LINKS_PRESENTATION_SUFFIX,
     MatrixSource,
+    is_bbi_interaction_source,
     matrix_source_kind,
     needs_materialization,
+    split_bbi_presentation,
 )
 
 #: The suffixes the module claims, restated literally so the property
@@ -382,3 +385,225 @@ class TestImportHygiene:
 
         # Assert
         assert imported <= {"__future__", "enum", "pathlib", "typing"}, imported
+
+
+class TestIsBbiInteractionSource:
+    """bigInteract gets its own minted format name, not an EDAM term."""
+
+    def test_should_recognize_a_biginteract_document(self):
+        """Test that an exact format-name match is recognized.
+
+        Given:
+            A document whose ``file_format.name`` is exactly
+            ``"bigInteract"``.
+        When:
+            is_bbi_interaction_source is called.
+        Then:
+            It should return True.
+        """
+        # Arrange
+        doc = {"file_format": {"name": "bigInteract"}}
+
+        # Act
+        result = is_bbi_interaction_source(doc)
+
+        # Assert
+        assert result is True
+
+    @pytest.mark.parametrize(
+        "doc",
+        [
+            {"file_format": {"name": "bigBed"}},
+            {"file_format": {"name": "BIGINTERACT"}},
+            {"file_format": {"name": "biginteract"}},
+            {},
+            {"file_format": None},
+            {"file_format": "bigInteract"},
+            {"file_format": {}},
+        ],
+        ids=[
+            "plain-bigbed",
+            "upper-cased",
+            "lower-cased",
+            "no-format",
+            "null-format",
+            "format-not-a-dict",
+            "format-missing-name",
+        ],
+    )
+    def test_should_reject_everything_else(self, doc):
+        """Test that only an exact, correctly-shaped match is recognized.
+
+        Given:
+            A document that is not a bigInteract file — wrong format
+            name, wrong casing, or a malformed/missing ``file_format``.
+        When:
+            is_bbi_interaction_source is called.
+        Then:
+            It should return False rather than raising. The match is
+            deliberately case-sensitive: cfdb mints this name itself
+            (``services/ontology_mappings.py``), so there is no upstream
+            casing variance to tolerate, unlike ``HDF5_FORMAT_NAME``.
+        """
+        # Act
+        result = is_bbi_interaction_source(doc)
+
+        # Assert
+        assert result is False
+
+    @settings(max_examples=50)
+    @given(
+        doc=st.fixed_dictionaries(
+            {},
+            optional={
+                "file_format": st.one_of(
+                    _json_scalars,
+                    st.dictionaries(st.text(), _json_scalars, max_size=3),
+                    st.just({"name": "bigInteract"}),
+                    st.just({"name": "BIGINTERACT"}),
+                    st.just({"name": "biginteract"}),
+                    st.just({"name": "bigBed"}),
+                )
+            },
+        )
+    )
+    def test_should_classify_totally_and_soundly(self, doc):
+        """Test totality and soundness over arbitrary documents.
+
+        Given:
+            An arbitrary document whose ``file_format`` is possibly a
+            non-dict, missing, or a dict with a name near the
+            bigInteract/bigBed boundary.
+        When:
+            is_bbi_interaction_source is called.
+        Then:
+            It should never raise, and return True exactly when
+            file_format is a dict with name == "bigInteract" exactly.
+        """
+        # Act
+        result = is_bbi_interaction_source(doc)
+
+        # Assert
+        file_format = doc.get("file_format")
+        expected = (
+            isinstance(file_format, dict) and file_format.get("name") == "bigInteract"
+        )
+        assert result is expected
+
+
+class TestSplitBbiPresentation:
+    """The ``:links`` uid suffix that selects the 1D presentation."""
+
+    def test_should_default_to_rectangles_with_no_suffix(self):
+        """Test the default presentation for a plain uid.
+
+        Given:
+            A uid with no ``:links`` suffix.
+        When:
+            split_bbi_presentation is called.
+        Then:
+            It should return the uid unchanged, paired with
+            "rectangles".
+        """
+        # Arrange
+        uid = "encode/ENCFF000BIG"
+
+        # Act
+        base_uid, presentation = split_bbi_presentation(uid)
+
+        # Assert
+        assert base_uid == uid
+        assert presentation == "rectangles"
+
+    def test_should_select_links_and_strip_the_suffix(self):
+        """Test the links presentation for a suffixed uid.
+
+        Given:
+            The same uid with a ``:links`` suffix appended.
+        When:
+            split_bbi_presentation is called.
+        Then:
+            It should return the base uid with the suffix removed,
+            paired with "links".
+        """
+        # Arrange
+        uid = "encode/ENCFF000BIG:links"
+
+        # Act
+        base_uid, presentation = split_bbi_presentation(uid)
+
+        # Assert
+        assert base_uid == "encode/ENCFF000BIG"
+        assert presentation == "links"
+
+    def test_should_split_a_uid_that_is_only_the_suffix(self):
+        """Test the degenerate case where the whole uid is the suffix.
+
+        Given:
+            A uid equal to exactly ``:links``, with nothing before it.
+        When:
+            split_bbi_presentation is called.
+        Then:
+            It should return an empty base uid paired with "links" —
+            the suffix still anchors at the end, even with nothing to
+            strip it from.
+        """
+        # Arrange
+        uid = ":links"
+
+        # Act
+        base_uid, presentation = split_bbi_presentation(uid)
+
+        # Assert
+        assert base_uid == ""
+        assert presentation == "links"
+
+    def test_should_not_match_the_suffix_in_the_middle_of_a_uid(self):
+        """Test that the suffix must anchor at the end, not appear anywhere.
+
+        Given:
+            A uid that contains the literal text ``:links`` followed by
+            more characters, rather than ending with it.
+        When:
+            split_bbi_presentation is called.
+        Then:
+            It should return the uid unchanged, paired with
+            "rectangles" — a uid is only detected as the links
+            presentation when ``:links`` is its trailing suffix.
+        """
+        # Arrange
+        uid = "encode/ENCFF000BIG:linksextra"
+
+        # Act
+        base_uid, presentation = split_bbi_presentation(uid)
+
+        # Assert
+        assert base_uid == uid
+        assert presentation == "rectangles"
+
+    @settings(max_examples=100)
+    @given(uid=st.text())
+    def test_should_split_totally_and_invertibly(self, uid):
+        """Test totality and the round-trip property over arbitrary strings.
+
+        Given:
+            Any string.
+        When:
+            split_bbi_presentation is called.
+        Then:
+            It should never raise; presentation should be "links" iff
+            the input ends with the exact suffix; and rejoining
+            base_uid with the suffix should recover the original
+            whenever presentation is "links", while base_uid should
+            equal the original string otherwise.
+        """
+        # Act
+        base_uid, presentation = split_bbi_presentation(uid)
+
+        # Assert
+        if uid.endswith(LINKS_PRESENTATION_SUFFIX):
+            assert presentation == "links"
+            assert base_uid + LINKS_PRESENTATION_SUFFIX == uid
+        else:
+            assert presentation == "rectangles"
+            assert base_uid == uid
