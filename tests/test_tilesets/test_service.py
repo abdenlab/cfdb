@@ -931,14 +931,23 @@ class TestOpenTilesetLifetime:
 
         async with service.checkout(UID, first_doc) as first:
             assert first.info() is not None  # force the handle open
-        close_spy.assert_not_called()
+        # Constructing `first` already released its own validation-time
+        # handle — clodius's construction reads the file's chromsizes
+        # then releases, reopening lazily on the first real call
+        # (clodius#14/#18's "registration is free" property) — not the
+        # eviction this test is about.
+        close_spy.assert_called_once()
+        assert close_spy.call_args.args[0] is first
+        close_spy.reset_mock()
 
         # Act
         await service.tileset_info("4dn/4DNFIXYZ789", second_doc)
 
-        # Assert
-        close_spy.assert_called_once()
-        assert close_spy.call_args.args[0] is first
+        # Assert — `second`'s own construction releases itself the same
+        # way; the eviction this test targets is the call right after it,
+        # against `first`.
+        assert close_spy.call_count == 2
+        assert close_spy.call_args_list[-1].args[0] is first
 
     @pytest.mark.asyncio
     async def test_should_defer_closing_a_handle_that_is_being_read(
@@ -974,11 +983,24 @@ class TestOpenTilesetLifetime:
         # Act & Assert
         async with service.checkout(UID, first_doc) as held:
             assert held.info() is not None  # force the handle open
-            await service.tileset_info("4dn/4DNFIXYZ789", second_doc)
-            close_spy.assert_not_called()
-            assert held.info() is not None  # still serving the reader
+            # Constructing `held` already released its own
+            # validation-time handle (clodius#14/#18's "registration is
+            # free" property) — not the eviction this test is about.
+            close_spy.assert_called_once()
+            close_spy.reset_mock()
 
-        # Assert — the last reader out performs the close
+            await service.tileset_info("4dn/4DNFIXYZ789", second_doc)
+            # `second`'s own construction releases itself the same way.
+            # The real eviction must still defer, because `held` is
+            # still checked out — it must not be among these calls.
+            close_spy.assert_called_once()
+            assert close_spy.call_args.args[0] is not held
+            close_spy.reset_mock()
+
+            assert held.info() is not None  # still serving the reader
+            close_spy.assert_not_called()
+
+        # Assert — the last reader out performs the (deferred) close
         close_spy.assert_called_once()
         assert close_spy.call_args.args[0] is held
 
@@ -1022,12 +1044,18 @@ class TestOpenTilesetLifetime:
         remote.gate.set()
         await asyncio.gather(first, second)
 
-        # Assert
+        # Assert — the winner is closed exactly once: its own
+        # construction-time self-release (clodius#14/#18's
+        # "registration is free" property), never a second time while
+        # it's the shared, still-open handle. The loser is closed twice
+        # (that same self-release, plus the explicit dedup cleanup) —
+        # this test only cares that those never land on the winner.
         assert seen[0] is seen[1]
-        assert close_spy.call_count <= 1
-        assert all(
-            call.args[0] is not seen[0] for call in close_spy.call_args_list
-        )
+        winner = seen[0]
+        winner_closes = [
+            call for call in close_spy.call_args_list if call.args[0] is winner
+        ]
+        assert len(winner_closes) == 1
 
     @pytest.mark.asyncio
     async def test_should_survive_aclose_while_a_reader_is_inside_checkout(
