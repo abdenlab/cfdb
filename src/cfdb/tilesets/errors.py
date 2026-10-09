@@ -65,3 +65,29 @@ class TilesetHydrationTimeout(TilesetError):
     Rendered as 503 with ``Retry-After``: the download may well finish,
     and a retry will find it.
     """
+
+
+class TilesetSourceUnavailable(TilesetError):
+    """Resolving or reading a remote-source tileset's upstream URL failed.
+
+    Only raised by formats served without local materialization (today,
+    bigInteract — see
+    :meth:`~cfdb.tilesets.service.TilesetService._open_bbi_interaction`).
+    Distinct from :class:`TilesetNotReady`: there is no "not yet built"
+    state here, no preparation channel to ask — the failure is in
+    reaching the DCC's own upstream file. ``status_code`` is not one
+    fixed value, and its two sources differ in how closely they track
+    ``/data`` (``cfdb.api.routers.data``): a DRS-resolution failure
+    (object not found, access denied, upstream timeout or error) carries
+    the same 404/403/504/502 that failure maps to on ``/data``, while a
+    malformed or disallowed URL (the SSRF allowlist, a malformed DRS
+    URI, or no usable access method) carries 400 as cfdb's own choice
+    for the tileset path specifically — ``/data`` has no 400 case for
+    any of these, so that one status is not a claim of parity. A batch
+    entry still renders as a plain ``{"error": ...}`` object regardless
+    of which, like every other per-dataset ``TilesetError``.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 502) -> None:
+        super().__init__(message)
+        self.status_code = status_code

@@ -40,6 +40,7 @@ from cfdb.tilesets.errors import (
     TilesetHydrationTimeout,
     TilesetTooLarge,
 )
+from cfdb.tilesets.formats import split_bbi_presentation
 from cfdb.tilesets.wire import error_payload
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,20 @@ def _split_uid(uid: str) -> tuple[str, str]:
                 ),
             )
     return dcc, local_id
+
+
+def _dcc_and_local_id(uid: str) -> tuple[str, str]:
+    """Split a uid for the file-document lookup, ignoring any presentation.
+
+    A bigInteract uid may carry a ``:links`` suffix (see
+    ``cfdb.tilesets.formats.split_bbi_presentation``) that selects which
+    tileset class serves it — that suffix is meaningless to the Mongo
+    lookup, which is keyed on ``(dcc, local_id)`` alone, so it is
+    stripped here. ``uid`` itself (suffix intact) is still what's passed
+    to ``TilesetService``, which re-derives the presentation on its own.
+    """
+    base_uid, _ = split_bbi_presentation(uid)
+    return _split_uid(base_uid)
 
 
 def _require_service():
@@ -171,9 +186,12 @@ def _render_dataset_failure(
     """
     _reraise_infrastructure(exc)
     if solo:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        )
+        # TilesetSourceUnavailable carries the specific status /data
+        # already maps the same upstream failure to (404/403/504/502);
+        # every other per-dataset TilesetError has no such attribute and
+        # keeps the plain 404.
+        status_code = getattr(exc, "status_code", status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status_code, detail=str(exc))
     logger.info(f"Tileset {uid} unavailable: {exc}")
     return error_payload(str(exc))
 
@@ -196,7 +214,7 @@ async def tileset_info(
 
     response: dict[str, Any] = {}
     for uid in uids:
-        dcc, local_id = _split_uid(uid)
+        dcc, local_id = _dcc_and_local_id(uid)
         _, file_doc = await resolve_file_doc(dcc, local_id)
         try:
             response[uid] = await service.tileset_info(uid, file_doc)
@@ -235,7 +253,7 @@ async def tiles(
 
     response: dict[str, Any] = {}
     for uid, uid_tile_ids in grouped.items():
-        dcc, local_id = _split_uid(uid)
+        dcc, local_id = _dcc_and_local_id(uid)
         _, file_doc = await resolve_file_doc(dcc, local_id)
         try:
             response.update(await service.tiles(uid, file_doc, uid_tile_ids))

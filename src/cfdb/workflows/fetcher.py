@@ -39,7 +39,7 @@ async def download_source(file_meta: dict[str, Any], dest: Path) -> Path:
         raise ValueError("file_meta has no access_url — cannot fetch source")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    download_url = await _resolve_download_url(access_url)
+    download_url = await resolve_download_url(access_url)
 
     part = dest.with_suffix(dest.suffix + ".part")
     bytes_written = 0
@@ -90,7 +90,7 @@ async def peek_decompressed_prefix(
     if not access_url:
         raise ValueError("file_meta has no access_url — cannot peek source")
 
-    download_url = await _resolve_download_url(access_url)
+    download_url = await resolve_download_url(access_url)
     range_header = f"bytes=0-{max_compressed_bytes - 1}"
 
     decompressor = None
@@ -117,7 +117,7 @@ async def peek_decompressed_prefix(
     return bytes(out)
 
 
-async def _resolve_download_url(access_url: str) -> str:
+async def resolve_download_url(access_url: str) -> str:
     """Return a direct HTTPS URL for ``access_url``.
 
     Direct ``https://`` URLs pass through. ``drs://`` URIs are resolved
@@ -125,6 +125,11 @@ async def _resolve_download_url(access_url: str) -> str:
     URI and the resolved HTTPS URL go through ``validate_outbound_url``
     so a poisoned ``access_url`` or a DRS object pointing at an internal
     host gets rejected before any worker-side fetch.
+
+    Public (not module-private) because ``cfdb.tilesets.service`` calls
+    it too, to resolve a bigInteract file's upstream URL for remote tile
+    reads — the same resolution step ``download_source`` runs before
+    writing bytes to disk, just without the download.
     """
     validate_outbound_url(access_url)
     if access_url.startswith("drs://"):
