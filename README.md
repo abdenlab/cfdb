@@ -999,6 +999,27 @@ This is invisible to the client, for two reasons that were verified rather than 
 - **The `tileset` artifact for an `.mcool` is a byte-identical copy of the upstream file.** Across all 773 4DN mcools that is a material S3 footprint if every one is ever browsed; the workers stack's `CacheArtifactExpirationDays` (30 days) trims it, at the cost of re-materializing anything revisited after a month.
 - **The local tileset copies are per-API-task.** `DesiredCount` is 1 today; scaling the API horizontally multiplies both the disk footprint and the cold-open cost, and an ALB without session affinity scatters one user's tiles across tasks.
 
+### Interaction tile serving (bigInteract)
+
+`GET /tileset_info` and `GET /tiles` also serve `bigInteract` files — UCSC's bed5+13 format for paired-region interactions (chromatin loops, regulatory element–gene pairs, and the like) — through the same uid scheme as contact maps, but with none of that section's local-materialization machinery: a bigInteract tileset is read straight from the file's upstream URL over HTTP Range requests, via `fsspec`, every time. There is no cache artifact, no `POST /tilesets/{dcc}/{local_id}` preparation step, and no `CFDB_TILESET_DISK_CACHE_BYTES` budget to exhaust — this format never touches `LocalTilesetStore`.
+
+**Two presentations, two uids.** clodius exposes bigInteract three different ways; cfdb resolves two of them and serves both rather than picking one:
+
+| uid | Tileset | `datatype` | Tile id shape |
+|-----|---------|------------|----------------|
+| `{dcc}/{local_id}` | 2D rectangle domains | `2d-rectangle-domains` | `z.x.y` (same convention as a contact map) |
+| `{dcc}/{local_id}:links` | 1D arc/link track | `bedlike` | `z.x` |
+
+clodius's third presentation, `BBIInteractionTileset` ("paired intervals" — the base class the two rows above subclass), is deliberately not resolved: clodius's own docstring for it recommends preferring the two concrete subclasses, and cfdb has no caller for the raw shape.
+
+The `:links` suffix lives only on the wire — it selects which clodius tileset class opens the file, and is stripped before the `(dcc, local_id)` Mongo lookup runs; the file document itself is identical either way. `:` rather than `.` is deliberate: the existing restriction on a `.` inside a uid half (clodius parses `uid.z.x[.y]` by splitting on it) still applies, and `:` never collides with it.
+
+**No `.hic`-style refusal.** `.hic` stays unservable because `hictkpy` has no remote-read entry point at all (see the Limitations above). bigInteract's reader, `pybigtools`, has native HTTP support, which is what makes reading it in place — rather than materializing a local copy — the *default* and only path here, not a future optimization.
+
+**No preparation or readiness probe.** `GET /tilesets/{dcc}/{local_id}/status` and `POST /tilesets/{dcc}/{local_id}` are specific to the contact-map materialization pipeline and do not apply to bigInteract files — `/tileset_info` and `/tiles` are the whole interface.
+
+A bigInteract upstream-resolution failure surfaces through the same per-dataset-vs-infrastructure split every other tileset failure does: a solo request gets a specific HTTP status, and a batch entry renders as an inline `{"error": ...}` object beside its siblings rather than failing the whole request. The status itself has two sources. A DRS lookup that 404s, times out, is forbidden, or errors upstream carries the same 404/403/504/502 that failure would get on `/data` — that part is genuine parity. A malformed or disallowed URL (the SSRF allowlist, a malformed DRS URI, or no usable access method) carries 400, which is cfdb's own choice for the tileset path rather than a mirror of `/data` — `/data` has no 400 case for any of these. A failure in the actual remote read itself (the URL resolves but the fetch then fails, or the bytes aren't a real bigBed) carries 502.
+
 ### Preprocessing & indexing workflow
 
 Many upstream files are not directly consumable by Gosling Designer without preprocessing (e.g., sort+index for BAM, bgzip+tabix for VCF/GFF/BED). When `/data` or `/index` is called for a format that needs preprocessing and the processed artifact is not yet in cache, the API dispatches a workflow and returns `202 Accepted` with a `Location` header pointing to a job status endpoint. A subsequent call, after the workflow completes, streams the processed artifact from cache (with `Range` support). Both endpoints share a single workflow per source file via a Mongo-backed mutex.
