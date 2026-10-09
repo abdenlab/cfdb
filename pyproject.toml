@@ -23,6 +23,11 @@ dependencies = [
     "click",
     "debugpy",
     "fastapi",
+    # bigInteract tileset serving (issue #120) reads its source directly
+    # over HTTPS Range requests rather than a local copy — `aiohttp`
+    # (already a dependency above) is what fsspec's `http`/`https`
+    # filesystem implementation uses.
+    "fsspec",
     "grpcio>=1.81.1",
     "motor",
     "pydantic>=2,<3",
@@ -58,12 +63,17 @@ dev = ["allpairspy", "cloudpickle", "cryptography", "debugpy", "httpx", "hypothe
 [tool.uv.sources]
 # Pinned to a sha, not a branch: clodius considers ``tiles_v2`` unstable
 # and cfdb is its first consumer, so what runs must be exactly what was
-# validated. This sha is the tip of the fork's ``main`` — the
-# 6-restore-dropped-guards branch (restored ``tiles_v2`` validation
-# guards, see ``cfdb.tilesets.backend.ClodiusBackend.tile_error``, now
-# bound to ``TilesetError``, and the tile-omission contract change
-# documented on ``cfdb.tilesets.service.TilesetService._read_tiles``) has
-# been merged there. Stay pinned to a commit sha rather than a branch
+# validated. This sha is the tip of the fork's ``main`` as of clodius#19
+# ("Accept a file-like source in the bbi tilesets", issue #120's
+# dependency), which lands a shared ``Source`` abstraction (path, or a
+# zero-argument factory returning a fresh seekable binary handle) in
+# ``clodius/tiles_v2/bbi.py`` — what lets cfdb serve a bigInteract tile
+# straight from its upstream URL instead of a local copy. The same
+# abstraction landed for the HDF5-backed tilesets (``cooler``,
+# ``multivec``) in the prior clodius#18; cfdb does not use that side of
+# it yet (``_open_cooler`` still hydrates to local disk — see
+# ``cfdb.tilesets.service``), but the pin brings both along, since they
+# share one commit. Stay pinned to a commit sha rather than a branch
 # reference regardless — a branch reference floats, and what runs must
 # be exactly what was validated.
 #
@@ -74,7 +84,7 @@ dev = ["allpairspy", "cloudpickle", "cryptography", "debugpy", "httpx", "hypothe
 # only, which does not fit this corpus at any disk budget. Serving
 # ``.hic`` at all is tracked as separate follow-up work, not something
 # this pin is expected to grow.
-clodius = { git = "https://github.com/abdenlab/clodius", rev = "07f043bea3380bbc38e76f0970d93abed0be4f69" }
+clodius = { git = "https://github.com/abdenlab/clodius", rev = "610777e89aad82dceaffcbf49ed2b5df1861f6b2" }
 
 [project.scripts]
 cfdb = "cfdb.cli:cli"
