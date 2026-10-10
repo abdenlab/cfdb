@@ -92,7 +92,7 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 
 | Target | Description |
 |--------|-------------|
-| `make mongodb` | Build and start MongoDB with sample data and indexes |
+| `make mongodb` | Build and start MongoDB, creating indexes. The database starts empty unless a `mongodump --gzip` tree is present in `database/`, which is restored if one is. |
 | `make api` | Build and start the API container |
 | `make api-tiles` | Build and start the API container **with matrix tile serving enabled**, on a cache volume shared with the worker (local dev; see [Serving tiles locally](#serving-tiles-locally)) |
 | `make worker-tiles` | Start a containerized LAN worker pool on that same cache volume |
