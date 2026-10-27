@@ -58,7 +58,12 @@ readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 
 [project.optional-dependencies]
-dev = ["allpairspy", "cloudpickle", "cryptography", "debugpy", "httpx", "hypothesis", "mongomock-motor", "moto[ecs,s3]", "pytest-asyncio", "pytest-mock", "ruff"]
+dev = ["allpairspy", "cloudpickle", "cryptography", "debugpy", "duckdb", "httpx", "hypothesis", "mongomock-motor", "moto[ecs,s3]", "pytest-asyncio", "pytest-mock", "ruff"]
+# The DuckDB dump (issue #123) is an offline batch tool most deployments
+# never run, so its only dependency stays behind an extra rather than
+# growing the API image:
+# ``pip install "cfdb[duckdb] @ git+https://github.com/abdenlab/cfdb.git"``.
+duckdb = ["duckdb"]
 
 [tool.uv.sources]
 # Pinned to a sha, not a branch: clodius considers ``tiles_v2`` unstable
@@ -100,6 +105,12 @@ pythonpath = ["src", "."]
 markers = [
     "integration: slow or tool-dependent tests (e.g. samtools, htslib, real wool WorkerPool)",
 ]
+
+# Ship the dump schema DDL inside the wheel — src-layout auto-discovery
+# includes only ``*.py`` without this, and ``cfdb.dump`` reads
+# ``schema.sql`` via importlib.resources at run time.
+[tool.setuptools.package-data]
+"cfdb.dump" = ["*.sql"]
 
 [tool.setuptools_scm]
 local_scheme = "dirty-tag"
