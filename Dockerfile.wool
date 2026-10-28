@@ -46,13 +46,14 @@ EXPOSE 8080
 
 WORKDIR /app
 
-# sha256 of the linux.x86_64 ``bigBedToBed`` binary UCSC currently
-# publishes. UCSC does not expose pre-built versioned binaries (only
-# source tarballs), so the rolling URL is bound by content hash. Kept in
-# lockstep with Dockerfile.api. When UCSC ships a new build the layer
-# rebuilds with the new hash after maintainers re-verify out-of-band.
-# Updating: download the binary, run ``sha256sum``, paste here.
-ARG UCSC_BIGBEDTOBED_SHA256=aa0f66449838339c0e6102994cc65cbad27b628c39ffa19316b4baa4663a9eab
+# sha256 of the ``bigBedToBed`` binary in UCSC's versioned snapshot
+# directory (linux.x86_64.v479). The versioned path is immutable once
+# cut, unlike the rolling linux.x86_64/ URL, whose in-place republishes
+# broke this build twice; the hash still binds the download in case the
+# host is ever compromised. Kept in lockstep with Dockerfile.api.
+# Upgrading: pick the new vNNN directory, download the binary, run
+# ``sha256sum``, paste both here.
+ARG UCSC_BIGBEDTOBED_SHA256=11fbdeddb8790b01e9e0e61eece2baf9a9595cda1fde207c7b4cea7fcbab5659
 
 # Install curl (for the container/ECS health check) and the bioinformatics
 # tools the workflow subsystem shells out to. samtools/tabix/bcftools/
@@ -81,7 +82,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
         gffread \
     && rm -rf /var/lib/apt/lists/* \
     && curl --fail -sSL -o /usr/local/bin/bigBedToBed \
-        https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/bigBedToBed \
+        https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64.v479/bigBedToBed \
     && echo "${UCSC_BIGBEDTOBED_SHA256}  /usr/local/bin/bigBedToBed" | sha256sum -c - \
     && chmod +x /usr/local/bin/bigBedToBed
 

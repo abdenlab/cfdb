@@ -35,20 +35,20 @@ EXPOSE 8000
 ENV DATABASE_URL="mongodb://cvh-backend:27017"
 WORKDIR /app
 
-# sha256 of the linux.x86_64 ``bigBedToBed`` binary UCSC currently
-# publishes. UCSC does not expose pre-built versioned binaries (only
-# source tarballs), so the rolling URL is bound by content hash. When
-# UCSC ships a new build the layer rebuilds with the new hash after
-# maintainers re-verify out-of-band. Updating: download the binary,
-# run ``sha256sum``, paste here.
-ARG UCSC_BIGBEDTOBED_SHA256=aa0f66449838339c0e6102994cc65cbad27b628c39ffa19316b4baa4663a9eab
+# sha256 of the ``bigBedToBed`` binary in UCSC's versioned snapshot
+# directory (linux.x86_64.v479). The versioned path is immutable once
+# cut, unlike the rolling linux.x86_64/ URL, whose in-place republishes
+# broke this build twice; the hash still binds the download in case the
+# host is ever compromised. Upgrading: pick the new vNNN directory,
+# download the binary, run ``sha256sum``, paste both here.
+ARG UCSC_BIGBEDTOBED_SHA256=11fbdeddb8790b01e9e0e61eece2baf9a9595cda1fde207c7b4cea7fcbab5659
 
 # sha256 of the AWS RDS combined CA bundle this image embeds. AWS
 # rotates ``global-bundle.pem`` periodically (next-public rotations are
 # announced in advance). When AWS publishes a new bundle, maintainers
 # re-verify out-of-band and update this hash. Without the pin a MITM at
 # build-time could swap the trust anchor used for prod DB TLS.
-ARG RDS_BUNDLE_SHA256=fe45bbebf92ad3e27a583bbb2ddd1553c521ed4d49af5514dc0a40372ea5395c
+ARG RDS_BUNDLE_SHA256=90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b
 
 # Install curl (for ECS health checks) and the bioinformatics tools the
 # workflow subsystem shells out to for preprocessing and indexing.
@@ -69,7 +69,7 @@ RUN find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) \
         gffread \
     && rm -rf /var/lib/apt/lists/* \
     && curl --fail -sSL -o /usr/local/bin/bigBedToBed \
-        https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/bigBedToBed \
+        https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64.v479/bigBedToBed \
     && echo "${UCSC_BIGBEDTOBED_SHA256}  /usr/local/bin/bigBedToBed" | sha256sum -c - \
     && chmod +x /usr/local/bin/bigBedToBed \
     && mkdir -p /etc/cfdb/certs \
