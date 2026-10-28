@@ -4,6 +4,8 @@ import click
 import requests
 from pymongo import MongoClient
 
+from cfdb.dcc_registry import get_all_dcc_names
+
 __client__ = None
 
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +25,7 @@ def debug(ctx, param, value):
 
     import debugpy
 
-    debugpy.listen(5678)
+    debugpy.listen(value)
     logging.debug("Waiting for debugger to attach...")
     debugpy.wait_for_client()
     logging.debug("Debugger attached")
@@ -108,6 +110,155 @@ def sync(dcc_names: tuple[str, ...], api_url: str, api_key: str):
     else:
         click.echo(f"Error: {response.status_code} - {response.text}", err=True)
         raise SystemExit(1)
+
+
+@cli.group("dump")
+def dump():
+    """Export cfdb data to offline analytic formats."""
+
+
+@dump.command("duckdb")
+@click.argument("output", type=click.Path(dir_okay=False, writable=True))
+@click.option(
+    "--database-url",
+    default="mongodb://127.0.0.1:27017",
+    envvar="DATABASE_URL",
+    help="MongoDB connection string",
+    show_default=True,
+)
+@click.option(
+    "--database-name",
+    default="cfdb",
+    envvar="DATABASE_NAME",
+    help="MongoDB database holding the materialized files collection",
+    show_default=True,
+)
+@click.option(
+    "--submission",
+    "-s",
+    "submissions",
+    multiple=True,
+    type=click.Choice(get_all_dcc_names(), case_sensitive=False),
+    help="Restrict the dump to these consortia. Repeatable; omit for all.",
+)
+@click.option(
+    "--to-parquet",
+    "to_parquet",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Also export every table as Parquet into this directory.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite OUTPUT if it already exists.",
+)
+@click.option(
+    "--debug",
+    "-d",
+    callback=debug,
+    expose_value=False,
+    help="Run with debugger listening on the specified port.",
+    is_eager=True,
+    type=int,
+)
+def dump_duckdb(
+    output: str,
+    database_url: str,
+    database_name: str,
+    submissions: tuple[str, ...],
+    to_parquet: str | None,
+    force: bool,
+):
+    """
+    Dump the materialized files collection to a relational DuckDB database.
+
+    Streams every document in ``files`` (optionally restricted by
+    --submission) and writes OUTPUT, a single .duckdb file holding the
+    flattened schema defined in src/cfdb/dump/schema.sql. Requires the
+    ``duckdb`` extra:
+    pip install "cfdb[duckdb] @ git+https://github.com/abdenlab/cfdb.git".
+
+    Examples:
+
+        cfdb dump duckdb cfdb.duckdb
+
+        cfdb dump duckdb cfdb.duckdb -s 4dn -s encode --to-parquet ./parquet
+    """
+    try:
+        import duckdb
+    except ImportError:
+        click.echo(
+            "Error: the DuckDB dump requires the 'duckdb' extra: "
+            'pip install "cfdb[duckdb] @ git+https://github.com/abdenlab/cfdb.git"',
+            err=True,
+        )
+        raise SystemExit(1)
+
+    from pathlib import Path
+
+    from cfdb.db import mongo_client_kwargs
+    from cfdb.dump import DumpError, dump_files
+
+    output_path = Path(output)
+    if output_path.exists():
+        if not force:
+            click.echo(
+                f"Error: {output_path} already exists (pass --force to overwrite)",
+                err=True,
+            )
+            raise SystemExit(1)
+        output_path.unlink()
+
+    normalized = [s.lower() for s in submissions]
+    query = {"submission": {"$in": normalized}} if normalized else {}
+    client = MongoClient(database_url, **mongo_client_kwargs())
+    cursor = client[database_name]["files"].find(query, batch_size=1000)
+
+    con = duckdb.connect(str(output_path))
+    completed = False
+    try:
+        report = dump_files(
+            cursor,
+            con,
+            source_database=database_name,
+            submissions=normalized or None,
+        )
+        completed = True
+    except DumpError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    finally:
+        client.close()
+        if not completed:
+            # A partial dump is worse than no dump: a finally block (rather
+            # than except) runs this cleanup on every exit path, including
+            # KeyboardInterrupt.
+            con.close()
+            output_path.unlink(missing_ok=True)
+
+    # From here the dump is complete and self-describing; a failure in the
+    # secondary parquet export must not destroy it.
+    export_error: Exception | None = None
+    if to_parquet:
+        parquet_dir = str(Path(to_parquet)).replace("'", "''")
+        try:
+            con.execute(f"EXPORT DATABASE '{parquet_dir}' (FORMAT PARQUET)")
+        except Exception as e:
+            export_error = e
+    con.close()
+
+    click.echo(report.summary())
+    click.echo(f"Wrote {output_path}")
+    if export_error is not None:
+        click.echo(
+            f"Error: Parquet export to {to_parquet} failed ({export_error}); "
+            f"{output_path} is complete and was kept",
+            err=True,
+        )
+        raise SystemExit(1)
+    if to_parquet:
+        click.echo(f"Exported Parquet to {to_parquet}")
 
 
 if __name__ == "__main__":

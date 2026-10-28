@@ -1240,3 +1240,52 @@ cfdb sync 4dn hubmap
 - `--api-url` - cfdb API base URL (default: `http://localhost:8000`, env: `CFDB_API_URL`)
 - `--api-key` - API key for sync endpoint (env: `SYNC_API_KEY`)
 - `--debug` / `-d` - Enable debugpy debugging
+
+### DuckDB dump
+
+`cfdb dump duckdb` flattens the materialized `files` collection into a single relational DuckDB file, so corpus-level questions — counts by assembly and consortium, every contact map from a given tissue, `output_type` coverage — become SQL anyone can run on a laptop instead of aggregation pipelines run by whoever holds Mongo credentials. It requires the `duckdb` extra: `pip install "cfdb[duckdb] @ git+https://github.com/abdenlab/cfdb.git"` (or `uv sync --extra dev` in a checkout).
+
+```bash
+# Dump everything
+cfdb dump duckdb cfdb.duckdb
+
+# One or more consortia, plus a Parquet export of every table
+cfdb dump duckdb cfdb.duckdb -s 4dn -s encode --to-parquet ./parquet
+```
+
+**Options:**
+- `--database-url` - MongoDB connection string (default: `mongodb://127.0.0.1:27017`, env: `DATABASE_URL`)
+- `--database-name` - Database holding the `files` collection (default: `cfdb`, env: `DATABASE_NAME`)
+- `--submission` / `-s` - Restrict to these consortia (`4dn`, `encode`, `hubmap`); repeatable, omit for all
+- `--to-parquet` - Also `EXPORT DATABASE` every table as Parquet into this directory
+- `--force` - Overwrite the output file if it exists
+
+**Schema.** The schema of record is [`src/cfdb/dump/schema.sql`](src/cfdb/dump/schema.sql) — a checked-in artifact in the same spirit as `schema.graphql`, versioned by its `schema_version` header and designed in [#123](https://github.com/abdenlab/cfdb/issues/123). The tables mirror C2M2 where C2M2 has a table (`file`, `collection`, `biosample`, `subject`, and the six junctions, all keyed by natural `(id_namespace, local_id)` composites, with `submission` as a non-key column on every entity); enrichment with a cross-consortium slot lives in promoted common columns (`genome_assembly`, `output_type`, `experiment_type`, `analyte_class`, …); the per-consortium residue lives in 1:1 `*_extra_*` extension tables, which omit verbatim-promoted fields but keep any field whose promotion is derived rather than verbatim (`replicate_info` survives because the replicate columns are regex-extracted from it). Three views carry the joins analysts would otherwise retype: `v_file` (one row per file with term names and extension columns inlined), `v_file_biosample` (the file × collection × biosample × subject fan-out grain), and `v_subject_demographics` (sex/race/age coalesced across the C2M2 columns and HuBMAP's enrichment, with a `*_source` column per value so provenance survives the coalesce).
+
+**Common-column mapping.** Each promoted column and the upstream field that fills it, per consortium. A column populated by one consortium today is still a common column, not a 4DN or ENCODE column: it names a slot any consortium could fill, which is what makes the next DCC's ingest a mapping exercise rather than a schema change.
+
+`file`:
+
+| Column | 4DN source | ENCODE source | HuBMAP source |
+|---|---|---|---|
+| `genome_assembly` | `genome_assembly` | `File assembly` | dataset `genome_assembly` |
+| `genome_annotation` | — | `Genome annotation` | — |
+| `output_type` | `file_type` | `Output type` | — |
+| `output_type_detail` | `file_type_detailed` | `File format type` | — |
+| `biological_replicates` | parsed from `replicate_info` | `Biological replicate(s)` | — |
+| `technical_replicates` | parsed from `replicate_info` | `Technical replicate(s)` | — |
+| `assay_info` | `assay_info` | — | — |
+| `condition` | `condition` | — | — |
+
+`collection`:
+
+| Column | 4DN source | ENCODE source | HuBMAP source |
+|---|---|---|---|
+| `lab` | `lab` | `Lab` | — |
+| `experiment_type` | `experiment_type` | assay | `dataset_type` |
+| `experiment_target` | — | `Experiment target` / `Targets` | — |
+| `analyte_class` | — | `Library made from` | `analyte_class` |
+
+Enrichment with no common slot today — ENCODE's `annotation_type`, `organism`, `software_used`, `encyclopedia_version`, `life_stage`, `age`, `age_units` among it — stays in the extension tables under its upstream name, and promoting such a field later is a schema change the `schema_version` header records.
+
+**Loader policies.** Entity rows repeated across documents are first-write-wins, and every divergent later copy is counted and sampled into `dump_conflict` — divergence is reported, never silently resolved. Junction rows take the union over all copies instead, so a relationship present in only one copy is never dropped. A `(id_namespace, local_id)` key appearing under two submissions aborts the dump: the natural keys are only globally unique because id_namespaces are DCC-scoped, and the loader asserts that rather than trusting it (duplicate file keys abort likewise). String-typed numbers from the C2M2 TSV path (`size_in_bytes` on 4DN/HuBMAP) and unparseable timestamps coerce to NULL with a counter, a document failing model validation is skipped with a counter, and every counter plus per-table row counts land in `dump_stat`, next to `dump_info` (schema version, generation time, cfdb version/commit, source database, submissions, file count) — so a dump is self-describing about which code produced it and where the source disagreed with itself. Counters measure occurrences, not entities: a divergent or uncoercible value on an entity embedded by many documents counts once per embedding document, so a large count can be one bad shared entity rather than many. Foreign keys are declared and enforced, so a dump that violates referential integrity fails at write time rather than surprising a reader. An aborted or interrupted run deletes its partial output, and the backstop if one ever survives is `dump_info`: the row is written last, so a database without one is a partial dump.
