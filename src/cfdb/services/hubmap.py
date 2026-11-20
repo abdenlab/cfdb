@@ -123,8 +123,8 @@ from cfdb.services.ontology_mappings import (
 
 logger = logging.getLogger(__name__)
 
-# Rate limit: max 10 requests/second → 100ms between requests
-_REQUEST_INTERVAL = 0.1
+#: Pause between search requests: at most 10 requests a second.
+REQUEST_INTERVAL_SECONDS = 0.1
 
 ASSETS_BASE_URL = "https://assets.hubmapconsortium.org"
 PORTAL_DATASET_URL = "https://portal.hubmapconsortium.org/browse/dataset/{uuid}"
@@ -277,7 +277,7 @@ _PAGE_TIMEOUT_SECONDS = 60
 #: the old slice is gone; re-sending the same ``search_after`` page is
 #: idempotent, which is what makes retrying safe.
 _PAGE_ATTEMPTS = 3
-_RETRY_BACKOFF_SECONDS = 2.0
+RETRY_BACKOFF_SECONDS = 2.0
 
 #: Upstream statuses worth retrying. Anything else is a request the server
 #: will refuse again, so it is raised at once.
@@ -416,7 +416,7 @@ async def _search_page(
                 f"HuBMAP {label} search page failed (attempt {attempt} of "
                 f"{_PAGE_ATTEMPTS}): {e!r}; retrying"
             )
-            await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     raise AssertionError("unreachable: the last attempt returns or raises")
 
@@ -491,7 +491,7 @@ async def fetch_dataset_metadata_bulk(
                 session, search_url, query, "dataset", deadline=deadline
             )
 
-            await asyncio.sleep(_REQUEST_INTERVAL)
+            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
 
             if not hits:
                 break
@@ -681,7 +681,7 @@ async def fetch_file_metadata(
             if search_after is None:
                 expected = total
 
-            await asyncio.sleep(_REQUEST_INTERVAL)
+            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
 
             if not hits:
                 break

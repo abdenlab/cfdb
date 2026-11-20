@@ -673,9 +673,9 @@ async def test_sync_hubmap_should_prefetch_outside_the_cutover_lock(
 ):
     """Test the network prefetch does not hold the read surface hostage.
 
-    The cutover lock blocks every API request, and the dataset and
-    organ prefetches touch no database state, so running them under
-    the lock would only lengthen the outage.
+    The cutover lock blocks every API request, and the dataset
+    prefetch touches no database state, so running it under the lock
+    would only lengthen the outage.
 
     Given:
         A dataset fetch that records whether the cutover lock is active

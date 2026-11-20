@@ -148,11 +148,12 @@ def _page(*sources: dict, sort_key: str = "file_uuid") -> dict:
 def no_backoff(mocker):
     """Make the fetchers' retry backoff and rate-limit pauses instant.
 
-    Returns the mock, so a test can count the pauses it took.
+    Zeroes the loader's own pacing constants rather than stubbing
+    ``asyncio.sleep``, which is the shared module attribute every coroutine
+    running during the test would see.
     """
-    return mocker.patch.object(
-        hubmap_module.asyncio, "sleep", mocker.AsyncMock()
-    )
+    mocker.patch.object(hubmap_module, "RETRY_BACKOFF_SECONDS", 0)
+    mocker.patch.object(hubmap_module, "REQUEST_INTERVAL_SECONDS", 0)
 
 
 def test_file_extensions_from_env_should_return_default_when_unset(
@@ -648,7 +649,7 @@ def test_transform_file_to_cfdb_should_degrade_when_dataset_unknown():
 
 def test_transform_file_to_cfdb_should_map_organs_through_the_organ_map(
     ):
-    """Test anatomy terms come from the UBKG mapping, never fabricated.
+    """Test anatomy terms come from the organ map, never fabricated.
 
     Given:
         One mappable organ code, one unmapped, and one duplicated, with
@@ -657,7 +658,7 @@ def test_transform_file_to_cfdb_should_map_organs_through_the_organ_map(
         transform_file_to_cfdb runs.
     Then:
         The collection should carry exactly one UBERON term, named by
-        the UBKG term rather than the document's drifting label, and
+        the organ map's term rather than the document's drifting label, and
         the unmapped code should be counted.
     """
     from collections import Counter
