@@ -1256,6 +1256,31 @@ def test_dump_files_should_roundtrip_json_and_list_columns():
     assert hints == ["is_sc", "rna"]
 
 
+def test_dump_files_should_carry_the_hubmap_dataset_status():
+    """Test the collection enrichment's dataset status reaches the dump.
+
+    Given:
+        A HuBMAP document whose collection enrichment carries a
+        dataset_status.
+    When:
+        The document is dumped.
+    Then:
+        collection_extra_hubmap.dataset_status should hold that value.
+    """
+    # Arrange
+    doc = make_hubmap_doc()
+    doc["collections"][0]["extra"]["hubmap"]["dataset_status"] = "Published"
+
+    # Act
+    con, _ = run_dump([doc])
+
+    # Assert
+    (status,) = con.execute(
+        "SELECT dataset_status FROM collection_extra_hubmap"
+    ).fetchone()
+    assert status == "Published"
+
+
 def test_dump_files_should_order_extra_files_by_source_position():
     """Test sidecar child-table ordinal ordering.
 
