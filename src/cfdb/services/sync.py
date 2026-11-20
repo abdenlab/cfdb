@@ -1281,6 +1281,16 @@ async def sync_hubmap(task: SyncTask) -> None:
             f"HuBMAP ingest: skipped {malformed} documents that failed to "
             "transform or to validate"
         )
+    missing = {
+        key.removeprefix("missing:"): n
+        for key, n in stats.items()
+        if key.startswith("missing:")
+    }
+    if missing:
+        logger.warning(
+            f"HuBMAP ingest: files missing upstream integrity fields {missing}; "
+            "those fields were stored as null"
+        )
     unjoined = {
         key: stats[key] for key in ("unjoined_dataset", "unjoined_donor") if stats[key]
     }

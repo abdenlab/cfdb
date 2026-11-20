@@ -767,6 +767,39 @@ def test_transform_file_to_cfdb_should_count_extensions_into_stats():
     assert stats["extension:.h5ad"] == 1
 
 
+def test_transform_file_to_cfdb_should_count_missing_size_and_checksums():
+    """Test absent integrity fields are counted, not silently nulled.
+
+    Real sizes and checksums on every file is a promise of the loader, so
+    each shortfall has to be visible in the sync's counters.
+
+    Given:
+        One document with no size and no md5, and one complete document,
+        sharing a stats counter.
+    When:
+        transform_file_to_cfdb runs over both.
+    Then:
+        The counter should record one missing size and one missing md5,
+        and no missing sha256.
+    """
+    from collections import Counter
+
+    # Arrange
+    stats: Counter = Counter()
+    incomplete = _file_doc(file_uuid="a", size=None, md5_checksum=None)
+
+    # Act
+    for src in (incomplete, _file_doc(file_uuid="b")):
+        transform_file_to_cfdb(
+            src, dataset_metadata={}, donor_lookup={}, stats=stats
+        )
+
+    # Assert
+    assert stats["missing:size"] == 1
+    assert stats["missing:md5"] == 1
+    assert stats["missing:sha256"] == 0
+
+
 def test_transform_file_to_cfdb_should_name_anatomy_from_the_uberon_table():
     """Test the default organ table supplies UBERON ids and UBERON labels.
 

@@ -849,6 +849,14 @@ def transform_file_to_cfdb(
         size_in_bytes = int(src["size"])
     except (KeyError, TypeError, ValueError):
         size_in_bytes = None
+    if stats is not None:
+        # Counted so the "real size and checksums on every file" promise is
+        # observable per sync rather than assumed.
+        if size_in_bytes is None:
+            stats["missing:size"] += 1
+        for field in ("md5_checksum", "sha256_checksum"):
+            if not src.get(field):
+                stats[f"missing:{field.removesuffix('_checksum')}"] += 1
 
     if organ_map is None:
         organ_map = HUBMAP_ORGAN_TO_UBERON
