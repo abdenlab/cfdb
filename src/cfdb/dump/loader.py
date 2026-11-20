@@ -801,6 +801,7 @@ class _Dumper:
                     if hubmap.metadata is None
                     else json.dumps(hubmap.metadata, sort_keys=True)
                 ),
+                "dataset_status": hubmap.dataset_status,
             }
             if self._any_value(row, key_cols):
                 self._register("collection_extra_hubmap", row)

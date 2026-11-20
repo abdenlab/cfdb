@@ -1,6 +1,6 @@
 -- cfdb DuckDB dump schema (issue #123).
 --
--- schema_version: 2
+-- schema_version: 3
 --
 -- The schema of record for the flattened relational dump of the
 -- materialized ``files`` collection. The design rules, the per-consortium
@@ -390,6 +390,7 @@ CREATE TABLE collection_extra_hubmap (
     visualization   BOOLEAN,
     vitessce_hints  VARCHAR[],
     metadata        JSON,     -- open-ended assay-specific dict; no fixed columns
+    dataset_status  VARCHAR,
     PRIMARY KEY (id_namespace, local_id),
     FOREIGN KEY (id_namespace, local_id)
         REFERENCES collection (id_namespace, local_id)
