@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import aiohttp
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cfdb.models import FileMetadataModel
@@ -656,6 +656,141 @@ class TestTransformFileToCfdb:
         # Assert
         assert stats["extension:.h5ad"] == 1
 
+    def test_transform_file_to_cfdb_should_dedupe_repeated_donors(self):
+        """Test a donor the index repeats becomes one subject.
+
+        The live index lists a donor once per contributing tissue block --
+        one file names the same uuid 26 times -- so emitting a subject per
+        entry would stack identical subjects on one collection.
+
+        Given:
+            A document whose donors list repeats one uuid around a second.
+        When:
+            transform_file_to_cfdb runs.
+        Then:
+            The collection should carry one subject per distinct donor, in
+            first-occurrence order.
+        """
+        # Arrange
+        donors = [
+            {"entity_type": "Donor", "uuid": "donor-1"},
+            {"entity_type": "Donor", "uuid": "donor-1"},
+            {"entity_type": "Donor", "uuid": "donor-2"},
+            {"entity_type": "Donor", "uuid": "donor-1"},
+        ]
+
+        # Act
+        doc = _transform(_file_doc(donors=donors))
+
+        # Assert
+        subjects = doc["collections"][0]["subjects"]
+        assert [s["local_id"] for s in subjects] == ["donor-1", "donor-2"]
+
+    @given(
+        uuids=st.lists(
+            st.one_of(st.sampled_from(["d1", "d2", "d3"]), st.none(), st.just("")),
+            max_size=12,
+        )
+    )
+    @settings(max_examples=50)
+    def test_transform_file_to_cfdb_should_emit_each_donor_once(self, uuids):
+        """Test subjects are the distinct donors, whatever the repetition.
+
+        Given:
+            Any donors list drawn from a small uuid pool, with repeats and
+            blank or missing uuids mixed in.
+        When:
+            transform_file_to_cfdb runs.
+        Then:
+            Subject local_ids should equal the distinct non-blank uuids in
+            first-occurrence order.
+        """
+        # Arrange
+        donors = [{"entity_type": "Donor", "uuid": uuid} for uuid in uuids]
+        expected = list(dict.fromkeys(uuid for uuid in uuids if uuid))
+
+        # Act
+        doc = _transform(_file_doc(donors=donors))
+
+        # Assert
+        subjects = doc["collections"][0]["subjects"]
+        assert [s["local_id"] for s in subjects] == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("True", True),
+            ("False", False),
+            (" false ", False),
+            (True, True),
+            (False, False),
+        ],
+    )
+    def test_transform_file_to_cfdb_should_parse_is_data_product_flags(
+        self, raw, expected
+    ):
+        """Test the index's stringly-typed flag lands as a real bool.
+
+        The index serializes is_data_product as "True"/"False", so a
+        truthiness test would read "False" as true.
+
+        Given:
+            A document whose is_data_product is one of the recognized
+            spellings.
+        When:
+            transform_file_to_cfdb runs.
+        Then:
+            extra.hubmap.is_data_product should be the matching bool.
+        """
+        # Act
+        doc = _transform(_file_doc(is_data_product=raw))
+
+        # Assert
+        assert doc["extra"]["hubmap"]["is_data_product"] is expected
+
+    @pytest.mark.parametrize("raw", [None, "yes", "", 1])
+    def test_transform_file_to_cfdb_should_omit_is_data_product_when_unrecognized(
+        self, raw
+    ):
+        """Test an unrecognized flag reads as unknown, not as false.
+
+        Given:
+            A document whose is_data_product is missing or neither
+            recognized spelling.
+        When:
+            transform_file_to_cfdb runs.
+        Then:
+            extra.hubmap should carry no is_data_product key at all.
+        """
+        # Act
+        doc = _transform(_file_doc(is_data_product=raw))
+
+        # Assert
+        assert "is_data_product" not in doc["extra"]["hubmap"]
+
+    def test_transform_file_to_cfdb_should_omit_is_data_product_when_absent(self):
+        """Test a document without the flag stays unknown.
+
+        A third of the live allowlisted files carry no is_data_product, and
+        defaulting them to false would fabricate a fact.
+
+        Given:
+            A document with no is_data_product key.
+        When:
+            transform_file_to_cfdb runs.
+        Then:
+            extra.hubmap should carry no is_data_product key.
+        """
+        # Arrange
+        src = _file_doc()
+        src.pop("is_data_product", None)
+
+        # Act
+        doc = _transform(src)
+
+        # Assert
+        assert "is_data_product" not in doc["extra"]["hubmap"]
+
 
 class TestFetchFileMetadata:
     @pytest.mark.asyncio
@@ -771,6 +906,88 @@ class TestFetchFileMetadata:
         with pytest.raises(RuntimeError, match="HTTP 503"):
             [doc async for doc in fetch_file_metadata((".h5ad",))]
 
+    @pytest.mark.asyncio
+    async def test_fetch_file_metadata_should_request_is_data_product(
+        self, mocker
+    ):
+        """Test the requested source fields include the data-product flag.
+
+        A field missing from _source never crosses the wire, so the
+        transform would see every file as flagless.
+
+        Given:
+            An allowlist.
+        When:
+            fetch_file_metadata issues its first request.
+        Then:
+            The body's _source should name is_data_product.
+        """
+        # Arrange
+        session = _SearchSession()
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act
+        [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+        # Assert
+        assert "is_data_product" in session.post_bodies[0]["_source"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_file_metadata_should_raise_on_network_error(
+        self, mocker
+    ):
+        """Test a dropped connection fails the stream instead of ending it.
+
+        Given:
+            A files search endpoint whose request raises a client error.
+        When:
+            fetch_file_metadata is drained.
+        Then:
+            The client error should propagate.
+        """
+        # Arrange
+        session = _SearchSession(error=aiohttp.ClientError("reset"))
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act & assert
+        with pytest.raises(aiohttp.ClientError, match="reset"):
+            [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    @pytest.mark.asyncio
+    async def test_fetch_file_metadata_should_stop_when_a_page_has_no_sort(
+        self, mocker
+    ):
+        """Test a page without a sort cursor ends the walk.
+
+        Without a cursor there is nothing to resume from; re-sending the
+        query would re-serve the same page forever.
+
+        Given:
+            A page whose last hit carries no sort value.
+        When:
+            fetch_file_metadata is drained.
+        Then:
+            It should yield that page and issue no second request.
+        """
+        # Arrange
+        session = _SearchSession(
+            pages=[{"hits": {"hits": [{"_source": _file_doc()}]}}]
+        )
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act
+        docs = [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+        # Assert
+        assert len(docs) == 1
+        assert len(session.post_bodies) == 1
+
 
 class TestFetchDatasetMetadataBulk:
     @pytest.mark.asyncio
@@ -841,6 +1058,93 @@ class TestFetchDatasetMetadataBulk:
         with pytest.raises(RuntimeError, match="HTTP 502"):
             await fetch_dataset_metadata_bulk()
 
+    @pytest.mark.asyncio
+    async def test_fetch_dataset_metadata_bulk_should_skip_hits_without_uuid(
+        self, mocker
+    ):
+        """Test unkeyable datasets are dropped and the rest keep their context.
+
+        Given:
+            One dataset hit with no uuid and one carrying vitessce-hints
+            and assay metadata.
+        When:
+            fetch_dataset_metadata_bulk drains the index.
+        Then:
+            Only the keyed dataset should be returned, with vitessce-hints
+            under vitessce_hints and the metadata dict intact.
+        """
+        # Arrange
+        keyed = {
+            "uuid": "ds-uuid-1",
+            "vitessce-hints": ["is_sc", "rna"],
+            "metadata": {"assay_category": "sequence"},
+        }
+        session = _SearchSession(
+            pages=[_page({"pipeline": "Salmon"}, keyed, sort_key="uuid")]
+        )
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act
+        results = await fetch_dataset_metadata_bulk()
+
+        # Assert
+        assert set(results) == {"ds-uuid-1"}
+        assert results["ds-uuid-1"]["vitessce_hints"] == ["is_sc", "rna"]
+        assert results["ds-uuid-1"]["metadata"] == {"assay_category": "sequence"}
+
+    @pytest.mark.asyncio
+    async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(
+        self, mocker
+    ):
+        """Test a dropped connection refuses the partial map.
+
+        Given:
+            A dataset search endpoint whose request raises a client error.
+        When:
+            fetch_dataset_metadata_bulk runs.
+        Then:
+            The client error should propagate.
+        """
+        # Arrange
+        session = _SearchSession(error=aiohttp.ClientError("reset"))
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act & assert
+        with pytest.raises(aiohttp.ClientError, match="reset"):
+            await fetch_dataset_metadata_bulk()
+
+    @pytest.mark.asyncio
+    async def test_fetch_dataset_metadata_bulk_should_stop_when_a_page_has_no_sort(
+        self, mocker
+    ):
+        """Test a page without a sort cursor ends the walk.
+
+        Given:
+            A page whose last hit carries no sort value.
+        When:
+            fetch_dataset_metadata_bulk runs.
+        Then:
+            It should return that page's dataset after a single request.
+        """
+        # Arrange
+        session = _SearchSession(
+            pages=[{"hits": {"hits": [{"_source": {"uuid": "ds-uuid-1"}}]}}]
+        )
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act
+        results = await fetch_dataset_metadata_bulk()
+
+        # Assert
+        assert set(results) == {"ds-uuid-1"}
+        assert len(session.post_bodies) == 1
+
 
 class TestFetchOrganMap:
     @pytest.mark.asyncio
@@ -899,6 +1203,33 @@ class TestFetchOrganMap:
         # Assert
         assert organ_map == {}
         assert any("UBKG" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_fetch_organ_map_should_return_empty_and_warn_on_http_error(
+        self, mocker, caplog
+    ):
+        """Test a UBKG error status degrades anatomy like an outage does.
+
+        Given:
+            A UBKG endpoint answering HTTP 500.
+        When:
+            fetch_organ_map runs.
+        Then:
+            It should return an empty map and log a warning naming UBKG.
+        """
+        # Arrange
+        session = _OrganSession(status=500)
+        mocker.patch.object(
+            hubmap_module.aiohttp, "ClientSession", return_value=session
+        )
+
+        # Act
+        with caplog.at_level("WARNING"):
+            organ_map = await fetch_organ_map()
+
+        # Assert
+        assert organ_map == {}
+        assert any("HTTP 500" in record.message for record in caplog.records)
 
 
 class TestBuildHubmapDccRecord:
