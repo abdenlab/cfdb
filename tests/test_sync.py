@@ -992,6 +992,41 @@ async def test_sync_hubmap_should_count_the_lock_clock_from_its_heartbeat(
 
 
 @pytest.mark.asyncio
+async def test_sync_hubmap_should_refuse_to_start_the_stream_without_enough_deadline(
+    mock_db, mocker, monkeypatch
+):
+    """Test a nearly spent deadline is refused before anything is cleared.
+
+    The slice is cleared at the stream's first committed batch, so a
+    deadline expiring mid-walk would leave a truncated slice.
+
+    Given:
+        A files collection holding a HuBMAP document, and a sync lock last
+        alive 54 minutes ago -- leaving about a minute before the margin.
+    When:
+        sync_hubmap runs.
+    Then:
+        It should raise without opening the file stream, and the HuBMAP
+        document should still be served.
+    """
+    # Arrange
+    monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "1800")
+    await _seed_sync_lock(mock_db, started_ago=timedelta(minutes=54))
+    mock_db.files.docs.append({"submission": "hubmap", "local_id": "previous-1"})
+    opened: dict = {}
+    _patch_hubmap_fetches(mocker, _async_iter([]))
+    mocker.patch.object(hubmap_module, "fetch_file_metadata", _recording_stream(opened))
+
+    # Act
+    with pytest.raises(RuntimeError, match="refusing to start it"):
+        await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert opened == {}
+    assert mock_db.files.docs == [{"submission": "hubmap", "local_id": "previous-1"}]
+
+
+@pytest.mark.asyncio
 async def test_sync_hubmap_should_keep_the_slice_when_the_allowlist_is_empty(
     mock_db, mocker, monkeypatch
 ):

@@ -1034,6 +1034,12 @@ async def _sync_encode(task: SyncTask) -> None:
 #: lock turns stale, so the stream's own teardown fits inside the lock.
 _STALE_MARGIN = timedelta(minutes=5)
 
+#: The least time the HuBMAP file stream is allowed to start with. The
+#: stream's slice is cleared at its first committed batch, so a deadline that
+#: expires mid-walk leaves a truncated slice; refusing to start with less than
+#: this keeps the previous slice instead. A full walk takes one to two minutes.
+_MIN_STREAM_SECONDS = 300
+
 
 async def _stale_safe_deadline(budget_seconds: int) -> float:
     """Event-loop deadline for a sync's network work, clamped to the lock.
@@ -1167,6 +1173,20 @@ async def sync_hubmap(task: SyncTask) -> None:
                     src.get("file_uuid") if isinstance(src, dict) else None,
                 )
             return None
+
+    # The stream's slice is cleared at its first committed batch, so a
+    # deadline that expires mid-walk leaves a truncated slice. Refuse here,
+    # before the lock and before any clear, unless enough of the deadline is
+    # left for the walk -- the previous slice is then kept untouched.
+    remaining = deadline - asyncio.get_running_loop().time()
+    floor = min(_MIN_STREAM_SECONDS, sync_budget_seconds() / 2)
+    logger.info("HuBMAP file stream: %.0f s of the sync's deadline remain", remaining)
+    if remaining < floor:
+        raise RuntimeError(
+            f"HuBMAP sync: only {max(remaining, 0):.0f} s of its deadline remain, "
+            f"less than the {floor:.0f} s the file stream needs; refusing to "
+            "start it, so the existing HuBMAP slice is kept"
+        )
 
     try:
         async with locks.CutoverLock("hubmap"):
