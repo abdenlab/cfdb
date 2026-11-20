@@ -1057,21 +1057,23 @@ async def _enrich_hubmap_files(dataset_metadata: dict[str, dict]) -> None:
     )
 
 
-async def _ingest_encode_rows(
+async def _ingest_rows(
     task: SyncTask,
+    submission: str,
     label: str,
     rows,
     transform,
-    compression_counts: Counter[str | None],
-    annotation_type_counts: Counter[str],
     counts_by_phase: dict[str, int],
     stale_filter: dict,
+    tally=None,
 ) -> None:
-    """Transform and batch-insert one ENCODE metadata stream.
+    """Transform and batch-insert one upstream metadata stream.
 
-    Shared by the experiment and annotation phases so both use the same
-    batching, the same skip-on-None handling, and contribute to the same
-    corpus-wide tallies.
+    Shared by the ENCODE phases and the HuBMAP loader so every REST-API
+    ingest uses the same batching, the same skip-on-None handling, and the
+    same deferred stale-clearing -- the detach-before-await, cancellation,
+    and finally-flush semantics below are subtle enough that forking them
+    per DCC would be how they diverge.
 
     The row count is reported by mutating ``counts_by_phase`` rather than by
     returning, and a partial batch left buffered by a dead stream is flushed
@@ -1081,9 +1083,10 @@ async def _ingest_encode_rows(
     does. Reporting by return meant a failed phase contributed nothing to
     the caller's total even though its completed batches were already
     committed, so the sync under-reported the corpus by up to everything
-    that phase had loaded, while the tallies below (mutated per row, not per
-    batch) over-reported it by the discarded partial batch. Three numbers in
-    one log block that disagreed with each other and with the database.
+    that phase had loaded, while the caller's tallies (mutated per row, not
+    per batch) over-reported it by the discarded partial batch. Three
+    numbers in one log block that disagreed with each other and with the
+    database.
 
     The *clean-path* flush is deliberately not in that ``finally``. A
     ``finally`` runs whether or not an exception is in flight, so suppressing
@@ -1094,15 +1097,24 @@ async def _ingest_encode_rows(
 
     Args:
         task: Sync task whose ``progress`` is updated per batch.
-        label: Names this stream in progress and log lines.
-        rows: Async iterable of TSV row dicts.
+        submission: DCC whose slice of ``files`` this stream loads. Scopes
+            the stale clear and names the stream in progress and log lines.
+        label: Names this stream alongside ``submission``, so with several
+            streams per sync a progress or timeout message identifies which
+            one it came from.
+        rows: Async iterable of upstream row/document dicts.
         transform: Row -> document callable; None means skip the row.
-        compression_counts: Mutated with each document's compression term.
-        annotation_type_counts: Mutated with each document's annotation type.
         counts_by_phase: Mutated with this phase's committed row count, on
             the failure path as well as the success path.
-        stale_filter: Selects the slice of ``files`` this phase owns, deleted
-            once replacement rows are in hand. See ``clear_stale_once``.
+        stale_filter: Selects the slice of ``files`` this phase owns within
+            the submission, deleted once replacement rows are in hand. An
+            empty dict means the whole submission. See ``clear_stale_once``.
+        tally: Optional callable invoked with each transformed document
+            before it is buffered, so a caller can maintain corpus-wide
+            distributions without this function knowing their shape. Like
+            the row count, it runs per row rather than per batch, so a
+            mid-flight death leaves it ahead of the database by the
+            discarded partial batch.
     """
     batch: list[dict] = []
     count = 0
@@ -1112,7 +1124,7 @@ async def _ingest_encode_rows(
         """Delete the slice this phase owns, once, before its first write.
 
         Deferred to the first batch rather than run before the stream opens.
-        The known ENCODE failures -- a 504 while the portal assembles the
+        The known upstream failures -- a 504 while a portal assembles the
         response, an exhausted download budget -- strike before any row
         arrives, and clearing up front would delete the slice and then have
         nothing to put back, serving an empty one until the next successful
@@ -1125,10 +1137,13 @@ async def _ingest_encode_rows(
             return
         stale_cleared = True
         deleted = await api.db.files.delete_many(
-            {"submission": "encode", **stale_filter}
+            {"submission": submission, **stale_filter}
         )
         logger.info(
-            "ENCODE %s: cleared %d stale files", label, deleted.deleted_count
+            "%s %s: cleared %d stale files",
+            submission.upper(),
+            label,
+            deleted.deleted_count,
         )
 
     async def commit(pending: list[dict]) -> None:
@@ -1147,20 +1162,16 @@ async def _ingest_encode_rows(
         # The stream owns an aiohttp session inside its own ``async with``,
         # released only when the generator is finalized -- left to the
         # garbage collector that is neither prompt nor guaranteed in a
-        # long-lived API process, and the annotation fan-out turned one
-        # stream per sync into N+1.
+        # long-lived API process, and the ENCODE annotation fan-out turned
+        # one stream per sync into N+1.
         async with aclosing(rows):
             async for row in rows:
                 doc = transform(row)
                 if doc is None:
                     continue
 
-                compression_counts[doc.get("compression_format")] += 1
-                annotation_type = (
-                    doc.get("extra", {}).get("encode", {}).get("annotation_type")
-                )
-                if annotation_type:
-                    annotation_type_counts[annotation_type] += 1
+                if tally is not None:
+                    tally(doc)
 
                 batch.append(doc)
                 count += 1
@@ -1175,12 +1186,16 @@ async def _ingest_encode_rows(
                 if len(batch) >= BATCH_SIZE:
                     pending, batch = batch, []
                     await commit(pending)
-                    task.progress = f"Inserted {count} ENCODE {label} files..."
+                    task.progress = (
+                        f"{submission.upper()} {label}: inserted "
+                        f"{count} files..."
+                    )
                     logger.info(task.progress)
 
         # The stream drained without error, so its result is authoritative
-        # even when it is empty: clear here too, or a type ENCODE stopped
-        # publishing would keep serving last sync's rows indefinitely.
+        # even when it is empty: clear here too, or a type the upstream
+        # stopped publishing would keep serving last sync's rows
+        # indefinitely.
         await clear_stale_once()
 
         # The clean-path flush: inside the ``try``, so a sink failure with no
@@ -1209,12 +1224,15 @@ async def _ingest_encode_rows(
             except Exception:
                 # Never let the flush replace the exception that caused it.
                 logger.exception(
-                    "ENCODE %s: failed to commit the final %d-row batch",
+                    "%s %s: failed to commit the final %d-row batch",
+                    submission.upper(),
                     label,
                     len(batch),
                 )
         counts_by_phase[label] = count
-        logger.info(f"ENCODE {label} ingest complete: {count} files")
+        logger.info(
+            f"{submission.upper()} {label} ingest complete: {count} files"
+        )
 
 
 async def _sync_encode(task: SyncTask) -> None:
@@ -1344,17 +1362,26 @@ async def _sync_encode(task: SyncTask) -> None:
                 )
             )
 
+        def tally(doc: dict) -> None:
+            """Maintain the ENCODE-specific corpus-wide distributions."""
+            compression_counts[doc.get("compression_format")] += 1
+            annotation_type = (
+                doc.get("extra", {}).get("encode", {}).get("annotation_type")
+            )
+            if annotation_type:
+                annotation_type_counts[annotation_type] += 1
+
         for label, open_stream, transform, stale_filter in phases:
             try:
-                await _ingest_encode_rows(
+                await _ingest_rows(
                     task,
+                    "encode",
                     label,
                     open_stream(),
                     transform,
-                    compression_counts,
-                    annotation_type_counts,
                     counts_by_phase,
                     stale_filter,
+                    tally=tally,
                 )
             except Exception as exc:
                 # Deliberately broad: the point is that no failure mode of

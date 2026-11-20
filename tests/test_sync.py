@@ -1580,7 +1580,7 @@ class TestSyncEncodeAnnotationPhases(_EncodeSyncTestBase):
         mocker.patch.object(
             encode_module, "fetch_encode_metadata", lambda deadline=None: _async_iter(rows)
         )
-        # Spied, not asserted on by argument: _ingest_encode_rows clears the
+        # Spied, not asserted on by argument: _ingest_rows clears the
         # same list it hands to insert_many, so a recorded call reads back
         # empty.
         spy = mocker.spy(mock_db.files, "insert_many")
