@@ -153,6 +153,8 @@ async def _sync_dccs(task: SyncTask) -> None:
             # Branch on DCC type
             if dcc_type == "rest_api" and dcc == "encode":
                 await _sync_encode(task)
+            elif dcc_type == "rest_api" and dcc == "hubmap":
+                await _sync_hubmap(task)
             else:
                 await _sync_c2m2_zip(task, data_path, downloads_path)
         except Exception as exc:
@@ -289,16 +291,6 @@ async def _sync_c2m2_zip(
         logger.info(task.progress)
         await _stamp_4dn_file_accessions()
         await _enrich_4dn_collections()
-    elif dcc == "hubmap":
-        task.current_step = "enriching_collections"
-        task.progress = "Enriching HuBMAP collections and subjects from Search API..."
-        logger.info(task.progress)
-        dataset_metadata = await _enrich_hubmap_collections_and_subjects()
-
-        task.current_step = "pruning"
-        task.progress = "Pruning non-public HuBMAP files..."
-        logger.info(task.progress)
-        await _prune_non_public_hubmap_raw_records(dataset_metadata)
 
     # Step 7: Materialize files collection for this DCC
     task.current_step = "materializing"
@@ -313,11 +305,6 @@ async def _sync_c2m2_zip(
         task.progress = "Enriching 4DN files from portal API..."
         logger.info(task.progress)
         await _enrich_4dn_api_metadata()
-    elif dcc == "hubmap":
-        task.current_step = "enriching"
-        task.progress = "Enriching HuBMAP files from Search API..."
-        logger.info(task.progress)
-        await _enrich_hubmap_files(dataset_metadata)
 
 
 async def _set_accession_ids(collection, stamps: list, label: str) -> int:
@@ -637,423 +624,6 @@ async def _enrich_4dn_collections() -> None:
     logger.info(
         f"4DN collection enrichment: matched {matched} collections, "
         f"updated {total_modified}"
-    )
-
-
-async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
-    """Enrich HuBMAP collections and subjects with metadata from the Search API.
-
-    Performs a single bulk fetch of all HuBMAP datasets, then:
-    1. Stores dataset-level metadata on collection.extra.hubmap
-    2. Stores donor demographics on subject.extra.hubmap
-    """
-    from pymongo import UpdateOne
-
-    from cfdb.services.hubmap import fetch_dataset_metadata_bulk
-
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
-    # Single bulk fetch for all datasets
-    dataset_metadata = await fetch_dataset_metadata_bulk()
-    logger.info(f"HuBMAP enrichment: {len(dataset_metadata)} dataset entries fetched")
-
-    # --- Collection enrichment ---
-    collection_ops = []
-    cursor = api.db.collection.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "persistent_id": 1},
-    )
-    async for doc in cursor:
-        persistent_id = doc.get("persistent_id", "")
-        meta = dataset_metadata.get(persistent_id)
-        if not meta:
-            continue
-
-        update_set: dict = {}
-
-        # Promoted to Collection top-level
-        dataset_type = meta.get("dataset_type")
-        if dataset_type is not None:
-            update_set["experiment_type"] = dataset_type
-        analyte_class = meta.get("analyte_class")
-        if analyte_class is not None:
-            update_set["analyte_class"] = analyte_class
-
-        # HuBMAP-specific fields stay nested on extra.hubmap
-        hubmap_extra: dict = {}
-        for key in (
-            "pipeline",
-            "processing",
-            "group_name",
-            "visualization",
-            "vitessce_hints",
-            "metadata",
-        ):
-            val = meta.get(key)
-            if val is not None:
-                hubmap_extra[key] = val
-
-        if hubmap_extra:
-            update_set["extra.hubmap"] = hubmap_extra
-
-        if update_set:
-            collection_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": update_set})
-            )
-
-    if collection_ops:
-        total_modified = 0
-        for i in range(0, len(collection_ops), BATCH_SIZE):
-            batch = collection_ops[i : i + BATCH_SIZE]
-            result = await api.db.collection.bulk_write(batch, ordered=False)
-            total_modified += result.modified_count
-        logger.info(f"HuBMAP collection enrichment: updated {total_modified} collections")
-    else:
-        logger.warning("HuBMAP collection enrichment: no updates to apply")
-
-    # --- Subject enrichment ---
-    # Build donor_uuid -> donor_metadata lookup from the bulk fetch
-    donor_lookup: dict[str, dict] = {}
-    for meta in dataset_metadata.values():
-        donor_uuid = meta.get("donor_uuid")
-        donor_metadata = meta.get("donor_metadata")
-        if donor_uuid and donor_metadata:
-            donor_lookup[donor_uuid] = donor_metadata
-
-    if not donor_lookup:
-        logger.info("HuBMAP subject enrichment: no donor metadata available")
-        return dataset_metadata
-
-    # Match subjects by local_id containing the donor UUID (HuBMAP C2M2 uses
-    # donor UUID as part of the subject local_id)
-    subject_ops = []
-    cursor = api.db.subject.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "local_id": 1},
-    )
-    async for doc in cursor:
-        local_id = doc.get("local_id", "")
-        # Try to match donor UUID in the subject local_id
-        matched_donor = None
-        for donor_uuid, donor_meta in donor_lookup.items():
-            if donor_uuid in local_id:
-                matched_donor = donor_meta
-                break
-
-        if not matched_donor:
-            continue
-
-        extra: dict = {}
-        for key in (
-            "age_value",
-            "age_unit",
-            "body_mass_index_value",
-            "body_mass_index_unit",
-            "cause_of_death",
-            "death_event",
-            "mechanism_of_injury",
-            "height_value",
-            "height_unit",
-            "weight_value",
-            "weight_unit",
-        ):
-            val = matched_donor.get(key)
-            if val is not None:
-                # HuBMAP returns single-element lists for some fields
-                if isinstance(val, list) and len(val) == 1:
-                    val = val[0]
-                extra[key] = val
-
-        # String list fields
-        for key in ("sex", "race"):
-            val = matched_donor.get(key)
-            if val is not None:
-                if isinstance(val, list) and len(val) == 1:
-                    val = val[0]
-                extra[key] = val
-
-        for key in ("medical_history", "social_history"):
-            val = matched_donor.get(key)
-            if isinstance(val, list) and val:
-                extra[key] = val
-
-        if extra:
-            subject_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": {"extra.hubmap": extra}})
-            )
-
-    if subject_ops:
-        total_modified = 0
-        for i in range(0, len(subject_ops), BATCH_SIZE):
-            batch = subject_ops[i : i + BATCH_SIZE]
-            result = await api.db.subject.bulk_write(batch, ordered=False)
-            total_modified += result.modified_count
-        logger.info(f"HuBMAP subject enrichment: updated {total_modified} subjects")
-    else:
-        logger.warning("HuBMAP subject enrichment: no updates to apply")
-
-    return dataset_metadata
-
-
-async def _prune_non_public_hubmap_raw_records(
-    dataset_metadata: dict[str, dict],
-) -> None:
-    """Remove non-public HuBMAP records from raw C2M2 tables before materialization.
-
-    Deletes ``file_in_collection`` links and orphaned ``file`` rows for any
-    dataset whose ``data_access_level`` is not ``"public"``.  Datasets with a
-    missing access level are treated as non-public (conservative default).
-    """
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
-    # 1. Identify non-public DOIs
-    non_public_dois = [
-        doi
-        for doi, meta in dataset_metadata.items()
-        if meta.get("data_access_level") != "public"
-    ]
-
-    if not non_public_dois:
-        logger.info("HuBMAP pruning: all datasets are public, nothing to prune")
-        return
-
-    logger.info(
-        f"HuBMAP pruning: {len(non_public_dois)} non-public datasets identified"
-    )
-
-    # 2. Find matching raw collection records
-    collection_keys: list[dict] = []
-    cursor = api.db.collection.find(
-        {
-            "submission": "hubmap",
-            "persistent_id": {"$in": non_public_dois},
-        },
-        {"id_namespace": 1, "local_id": 1},
-    )
-    async for doc in cursor:
-        collection_keys.append(
-            {
-                "id_namespace": doc["id_namespace"],
-                "local_id": doc["local_id"],
-            }
-        )
-
-    if not collection_keys:
-        logger.info("HuBMAP pruning: no raw collection records match non-public DOIs")
-        return
-
-    # 3. Collect potentially-orphaned file keys from file_in_collection
-    or_filter = [
-        {
-            "collection_id_namespace": ck["id_namespace"],
-            "collection_local_id": ck["local_id"],
-        }
-        for ck in collection_keys
-    ]
-
-    candidate_file_keys: set[tuple[str, str]] = set()
-    cursor = api.db.file_in_collection.find(
-        {"$or": or_filter},
-        {"file_id_namespace": 1, "file_local_id": 1},
-    )
-    async for doc in cursor:
-        candidate_file_keys.add(
-            (doc["file_id_namespace"], doc["file_local_id"])
-        )
-
-    # 4. Delete non-public file_in_collection links
-    fic_result = await api.db.file_in_collection.delete_many({"$or": or_filter})
-    logger.info(
-        f"HuBMAP pruning: deleted {fic_result.deleted_count} file_in_collection links"
-    )
-
-    # 4b. Delete files matched to a non-public dataset via the persistent_id
-    # (DOI) fallback join. HuBMAP's C2M2 export never populates
-    # file_in_collection (confirmed empty on every sync), so the
-    # materializer falls back to matching file.persistent_id against
-    # collection.persistent_id (see materialize/src/main.rs, "Fallback:
-    # look up collection by persistent_id"). Step 4 above is blind to that
-    # join, so without this a file whose own persistent_id names a
-    # non-public dataset survives pruning and gets the blanket
-    # data_access_level=public stamp below regardless of its true access
-    # level -- confirmed to leak files registered under dbGaP
-    # controlled-access studies.
-    doi_result = await api.db.file.delete_many(
-        {"submission": "hubmap", "persistent_id": {"$in": non_public_dois}}
-    )
-    logger.info(
-        f"HuBMAP pruning: deleted {doi_result.deleted_count} file records via "
-        "persistent_id (DOI) fallback match"
-    )
-
-    # 5. Find which candidate files still have links (shared with a public collection)
-    if candidate_file_keys:
-        still_linked: set[tuple[str, str]] = set()
-        file_or_filter = [
-            {"file_id_namespace": ns, "file_local_id": lid}
-            for ns, lid in candidate_file_keys
-        ]
-        cursor = api.db.file_in_collection.find(
-            {"$or": file_or_filter},
-            {"file_id_namespace": 1, "file_local_id": 1},
-        )
-        async for doc in cursor:
-            still_linked.add(
-                (doc["file_id_namespace"], doc["file_local_id"])
-            )
-
-        orphaned = candidate_file_keys - still_linked
-
-        # 6. Delete truly orphaned files
-        if orphaned:
-            orphan_filter = [
-                {"id_namespace": ns, "local_id": lid}
-                for ns, lid in orphaned
-            ]
-            file_result = await api.db.file.delete_many({"$or": orphan_filter})
-            logger.info(
-                f"HuBMAP pruning: deleted {file_result.deleted_count} orphaned file records"
-            )
-        else:
-            logger.info("HuBMAP pruning: no orphaned file records to delete")
-    else:
-        logger.info("HuBMAP pruning: no file_in_collection links found for non-public collections")
-
-
-async def _enrich_hubmap_files(dataset_metadata: dict[str, dict]) -> None:
-    """Enrich materialized HuBMAP files with metadata from the Search API.
-
-    Stores ``genome_assembly``, ``is_data_product``, and ``rel_path`` on
-    ``extra``, then stamps all HuBMAP files as ``data_access_level = "public"``
-    (non-public records were already pruned before materialization).
-    """
-    from pymongo import UpdateOne
-
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
-    # Build DOI -> file-level lookup
-    doi_file_info: dict[str, dict] = {}
-    for doi_url, meta in dataset_metadata.items():
-        info: dict = {}
-
-        genome_assembly = meta.get("genome_assembly")
-        if genome_assembly:
-            info["genome_assembly"] = genome_assembly
-
-        # Build filename -> file metadata lookup from files array
-        files_list = meta.get("files", [])
-        file_lookup: dict[str, dict] = {}
-        for f in files_list:
-            rel_path = f.get("rel_path")
-            if rel_path:
-                entry = {"rel_path": rel_path}
-                is_data_product = f.get("is_data_product")
-                if is_data_product is not None:
-                    entry["is_data_product"] = is_data_product
-                # Use the basename as key for matching with C2M2 filename
-                basename = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
-                file_lookup[basename] = entry
-        if file_lookup:
-            info["file_lookup"] = file_lookup
-
-        if info:
-            doi_file_info[doi_url] = info
-
-    if not doi_file_info:
-        logger.warning("HuBMAP file enrichment: no dataset metadata available")
-        # Still stamp all HuBMAP files as public
-        await api.db.files.update_many(
-            {"submission": "hubmap"},
-            {"$set": {"data_access_level": "public"}},
-        )
-        return
-
-    # Get DOI URLs for all HuBMAP collections (to map files to datasets)
-    collection_doi_map: dict[str, str] = {}  # (id_namespace, local_id) key -> doi_url
-    cursor = api.db.collection.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "id_namespace": 1, "local_id": 1, "persistent_id": 1},
-    )
-    async for doc in cursor:
-        persistent_id = doc.get("persistent_id", "")
-        if persistent_id in doi_file_info:
-            key = f"{doc.get('id_namespace', '')}|{doc.get('local_id', '')}"
-            collection_doi_map[key] = persistent_id
-
-    logger.info(
-        f"HuBMAP file enrichment: {len(collection_doi_map)} collections matched to datasets"
-    )
-
-    # Iterate materialized files and build updates
-    operations = []
-    cursor = api.db.files.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "filename": 1, "collections": 1},
-    )
-    async for doc in cursor:
-        # Find matching dataset via collection DOI
-        collections = doc.get("collections", [])
-        matched_info = None
-        for coll in collections:
-            if isinstance(coll, dict):
-                key = f"{coll.get('id_namespace', '')}|{coll.get('local_id', '')}"
-            else:
-                continue
-            doi_url = collection_doi_map.get(key)
-            if doi_url:
-                matched_info = doi_file_info.get(doi_url)
-                if matched_info:
-                    break
-
-        if not matched_info:
-            continue
-
-        update: dict = {}
-
-        # Promoted field
-        genome_assembly = matched_info.get("genome_assembly")
-        if genome_assembly:
-            update["genome_assembly"] = genome_assembly
-
-        # Try to match by filename to get per-file metadata
-        filename = doc.get("filename", "")
-        file_lookup = matched_info.get("file_lookup", {})
-        if filename and filename in file_lookup:
-            file_meta = file_lookup[filename]
-            rel_path = file_meta.get("rel_path")
-            if rel_path:
-                update["extra.hubmap.rel_path"] = rel_path
-            is_data_product = file_meta.get("is_data_product")
-            if is_data_product is not None:
-                update["extra.hubmap.is_data_product"] = is_data_product
-
-        if update:
-            operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
-
-    if not operations:
-        logger.warning("HuBMAP file enrichment: no updates to apply")
-        # Still stamp all HuBMAP files as public
-        await api.db.files.update_many(
-            {"submission": "hubmap"},
-            {"$set": {"data_access_level": "public"}},
-        )
-        return
-
-    total_modified = 0
-    for i in range(0, len(operations), BATCH_SIZE):
-        batch = operations[i : i + BATCH_SIZE]
-        result = await api.db.files.bulk_write(batch, ordered=False)
-        total_modified += result.modified_count
-
-    logger.info(f"HuBMAP file enrichment: updated {total_modified} files")
-
-    # All surviving HuBMAP files are public (non-public pruned before materialization)
-    await api.db.files.update_many(
-        {"submission": "hubmap"},
-        {"$set": {"data_access_level": "public"}},
     )
 
 
@@ -1442,6 +1012,146 @@ async def _sync_encode(task: SyncTask) -> None:
             f"({failed_labels}); {count} files were loaded from the phases "
             "that succeeded"
         ) from failures[0][1]
+
+
+async def _sync_hubmap(task: SyncTask) -> None:
+    """
+    Sync HuBMAP data from the files search API.
+
+    Like ENCODE, HuBMAP documents are pre-materialized directly into the
+    files collection -- no C2M2 zip download, no TSV load, and no Rust
+    materializer run. Dataset-level context (donor demographics, pipeline,
+    genome assembly) and the organ-to-UBERON map are prefetched before the
+    file stream opens, so every document is emitted fully populated in one
+    insert pass and no post-load enrichment or pruning stages exist. The
+    index itself holds only public files, which is what retired the pruning
+    pass.
+
+    A single stream loads the whole submission, so there is no per-phase
+    isolation: any failure propagates and is recorded as this DCC's failure
+    by ``_sync_dccs``, while ``_ingest_rows``'s deferred clear ensures a
+    fetch that dies before delivering rows leaves the previous corpus being
+    served rather than empty.
+    """
+    from cfdb.services.hubmap import (
+        build_hubmap_dcc_record,
+        fetch_dataset_metadata_bulk,
+        fetch_file_metadata,
+        fetch_organ_map,
+        file_extensions_from_env,
+        transform_file_to_cfdb,
+    )
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    counts_by_phase: dict[str, int] = {}
+    # One counter for everything the transform wants observed -- the
+    # per-extension document distribution, skip reasons, and unmapped organ
+    # codes -- logged as distributions below rather than a line per file.
+    stats: Counter[str] = Counter()
+
+    async with locks.CutoverLock("hubmap"):
+        # Step 1: Clear existing raw HuBMAP data. ``files`` is deliberately
+        # not cleared here: ``_ingest_rows`` clears that slice once
+        # replacement rows are in hand, so a fetch that fails before
+        # delivering any leaves the previous corpus being served rather
+        # than empty. The raw C2M2 collections (file, collection, subject,
+        # ...) are cleared outright -- nothing reloads them anymore.
+        task.current_step = "clearing"
+        task.progress = "Clearing existing HuBMAP data..."
+        logger.info(task.progress)
+        await _clear_dcc_data_async("hubmap", skip_collections={"files"})
+
+        # Step 2: Upsert DCC record
+        task.current_step = "dcc_record"
+        task.progress = "Creating HuBMAP DCC record..."
+        logger.info(task.progress)
+        await api.db.dcc.update_one(
+            {"submission": "hubmap"},
+            {"$set": build_hubmap_dcc_record()},
+            upsert=True,
+        )
+
+        # Step 3: Prefetch the dataset-level context the files index does
+        # not carry, plus the organ-to-UBERON map. ~10k datasets held in
+        # memory -- small against the file stream they enrich, and what
+        # makes the single-pass join possible.
+        task.current_step = "fetching"
+        task.progress = "Fetching HuBMAP dataset metadata..."
+        logger.info(task.progress)
+
+        dataset_metadata = await fetch_dataset_metadata_bulk()
+        donor_lookup = {
+            meta["donor_uuid"]: meta["donor_metadata"]
+            for meta in dataset_metadata.values()
+            if meta.get("donor_uuid") and meta.get("donor_metadata")
+        }
+        organ_map = await fetch_organ_map()
+
+        extensions = file_extensions_from_env()
+        logger.info(
+            "HuBMAP file ingest: extension allowlist %s", list(extensions)
+        )
+
+        # Step 4: Stream, transform, and insert in one pass.
+        task.current_step = "loading"
+        task.progress = "Loading HuBMAP files from the files search API..."
+        logger.info(task.progress)
+
+        def transform(src: dict) -> Optional[dict]:
+            return transform_file_to_cfdb(
+                src,
+                dataset_metadata=dataset_metadata,
+                donor_lookup=donor_lookup,
+                organ_map=organ_map,
+                stats=stats,
+            )
+
+        await _ingest_rows(
+            task,
+            "hubmap",
+            "files index",
+            fetch_file_metadata(extensions),
+            transform,
+            counts_by_phase,
+            # One stream owns the whole submission, so its slice is the
+            # whole submission.
+            stale_filter={},
+        )
+
+    # HuBMAP writes straight into the materialized collection and never runs
+    # the materializer, which is the only other creator of files indexes --
+    # same reasoning as the ENCODE path above.
+    await ensure_indexes(api.db, materialized_files_index_specs())
+
+    count = counts_by_phase.get("files index", 0)
+    task.progress = f"HuBMAP sync complete: {count} files"
+    logger.info(task.progress)
+    logger.info(
+        "HuBMAP extension distribution: %s",
+        {
+            key.removeprefix("extension:"): n
+            for key, n in stats.most_common()
+            if key.startswith("extension:")
+        },
+    )
+    skipped = stats.get("skipped:incomplete", 0)
+    if skipped:
+        logger.warning(
+            f"HuBMAP ingest: skipped {skipped} documents missing file_uuid, "
+            "rel_path, or dataset_uuid"
+        )
+    unmapped = {
+        key.removeprefix("unmapped_organ:"): n
+        for key, n in stats.items()
+        if key.startswith("unmapped_organ:")
+    }
+    if unmapped:
+        logger.warning(
+            f"HuBMAP ingest: organ codes with no UBERON mapping {unmapped}; "
+            "those anatomy terms were omitted"
+        )
 
 
 async def _materialize_files(submission: str) -> None:

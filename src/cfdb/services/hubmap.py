@@ -1,101 +1,204 @@
-"""HuBMAP Search API integration for dataset metadata enrichment.
+"""HuBMAP files search API client and CFDB transformation service.
 
-Fetches dataset, donor, and file metadata from the HuBMAP Search API
-(Elasticsearch-backed) to enrich C2M2-materialized documents. Three
-enrichment targets run during sync: collections and subjects
-(pre-materialization) and files (post-materialization).
+Builds CFDB file documents directly from HuBMAP's file-grain search index,
+following the precedent ENCODE set in :mod:`cfdb.services.encode`. One index
+document is one file; every document in the index is public, so no pruning
+pass exists. Dataset-level context the files index does not carry — donor
+demographics, pipeline, genome assembly — is prefetched once from the
+dataset-level index into an in-memory map keyed by ``dataset_uuid`` and
+joined during transformation, so documents land fully populated in a single
+insert pass with no post-load enrichment.
 
 API URLs
 --------
-Bulk dataset search (search_after pagination):
+File search (search_after pagination, one document per file):
+  https://search.api.hubmapconsortium.org/v3/files/search
+
+Dataset search (search_after pagination, one document per dataset):
   https://search.api.hubmapconsortium.org/v3/portal/search
 
-Entity Matching
----------------
-Collection    persistent_id matches doi_url
-Subject       local_id contains donor uuid
-File          matched via collection doi_url → dataset, then filename
+Organ code -> UBERON (one request per sync):
+  https://ontology.api.hubmapconsortium.org/organs?application_context=HUBMAP
 
-Field Mapping (HuBMAP Search API → CFDB)
-------------------------------------------
+Field Mapping (HuBMAP files search API -> CFDB)
+-----------------------------------------------
 
-File (post-materialization)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-data_access_level                       → data_access_level
-ingest_metadata.workflow_description    → genome_assembly (regex-derived)
+File
+~~~~
+file_uuid                               -> local_id (HuBMAP issues no file
+                                           accessions; accession_id stays null)
+rel_path (basename)                     -> filename
+size                                    -> size_in_bytes (stored as int64)
+md5_checksum                            -> md5
+sha256_checksum                         -> sha256
+filename (compression suffix stripped)  -> file_format (EDAM-mapped)
+filename                                -> compression_format (suffix-derived,
+                                           shared with the ENCODE derivation)
+assets URL (dataset_uuid + rel_path)    -> access_url
+data_access_level                       -> data_access_level
+dataset_status                          -> status
+dataset workflow_description            -> genome_assembly (regex-derived,
+                                           joined from the dataset index)
 
 Enriched File
 ~~~~~~~~~~~~~
-files[].rel_path                        → extra.hubmap.rel_path
-files[].is_data_product                 → extra.hubmap.is_data_product
+rel_path                                -> extra.hubmap.rel_path
+is_data_product ("True"/"False" string) -> extra.hubmap.is_data_product
+dataset workflow_description            -> extra.hubmap.genome_assembly
 
-Collection (pre-materialization)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-dataset_type                            → collections[].experiment_type
-analyte_class                           → collections[].analyte_class
+Collection (one per file, from its parent dataset)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+dataset_uuid                            -> collections[].local_id
+dataset_hubmap_id                       -> collections[].name
+portal dataset URL                      -> collections[].persistent_id
+dataset_type                            -> collections[].experiment_type
+analyte_class                           -> collections[].analyte_class
+organs[] (code -> UBERON via UBKG)      -> collections[].anatomy
 
-Enriched Collection
-~~~~~~~~~~~~~~~~~~~
-pipeline                                → collections[].extra.hubmap.pipeline
-processing                              → collections[].extra.hubmap.processing
-group_name                              → collections[].extra.hubmap.group_name
-visualization                           → collections[].extra.hubmap.visualization
-vitessce-hints                          → collections[].extra.hubmap.vitessce_hints
-metadata                                → collections[].extra.hubmap.metadata
+Enriched Collection (dataset index join)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+pipeline                                -> collections[].extra.hubmap.pipeline
+processing                              -> collections[].extra.hubmap.processing
+group_name                              -> collections[].extra.hubmap.group_name
+visualization                           -> collections[].extra.hubmap.visualization
+vitessce-hints                          -> collections[].extra.hubmap.vitessce_hints
+metadata                                -> collections[].extra.hubmap.metadata
+dataset_status                          -> collections[].extra.hubmap.dataset_status
 
-Enriched Subject (pre-materialization, from donor.mapped_metadata)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-sex                                     → subjects[].extra.hubmap.sex
-race                                    → subjects[].extra.hubmap.race
-age_value                               → subjects[].extra.hubmap.age_value
-age_unit                                → subjects[].extra.hubmap.age_unit
-height_value                            → subjects[].extra.hubmap.height_value
-height_unit                             → subjects[].extra.hubmap.height_unit
-weight_value                            → subjects[].extra.hubmap.weight_value
-weight_unit                             → subjects[].extra.hubmap.weight_unit
-body_mass_index_value                   → subjects[].extra.hubmap.body_mass_index_value
-body_mass_index_unit                    → subjects[].extra.hubmap.body_mass_index_unit
-cause_of_death                          → subjects[].extra.hubmap.cause_of_death
-death_event                             → subjects[].extra.hubmap.death_event
-mechanism_of_injury                     → subjects[].extra.hubmap.mechanism_of_injury
-medical_history                         → subjects[].extra.hubmap.medical_history
-social_history                          → subjects[].extra.hubmap.social_history
+Subject
+~~~~~~~
+donors[].uuid                           -> collections[].subjects[].local_id
+(HuBMAP is human-only)                  -> collections[].subjects[].taxonomy
+
+Enriched Subject (dataset index join, from donor.mapped_metadata)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sex                                     -> subjects[].extra.hubmap.sex
+race                                    -> subjects[].extra.hubmap.race
+age_value                               -> subjects[].extra.hubmap.age_value
+age_unit                                -> subjects[].extra.hubmap.age_unit
+height_value                            -> subjects[].extra.hubmap.height_value
+height_unit                             -> subjects[].extra.hubmap.height_unit
+weight_value                            -> subjects[].extra.hubmap.weight_value
+weight_unit                             -> subjects[].extra.hubmap.weight_unit
+body_mass_index_value                   -> subjects[].extra.hubmap.body_mass_index_value
+body_mass_index_unit                    -> subjects[].extra.hubmap.body_mass_index_unit
+cause_of_death                          -> subjects[].extra.hubmap.cause_of_death
+death_event                             -> subjects[].extra.hubmap.death_event
+mechanism_of_injury                     -> subjects[].extra.hubmap.mechanism_of_injury
+medical_history                         -> subjects[].extra.hubmap.medical_history
+social_history                          -> subjects[].extra.hubmap.social_history
+
+DCC
+~~~
+Static / config-derived:                   dcc.id, dcc.dcc_name,
+                                           dcc.dcc_abbreviation,
+                                           dcc.dcc_description,
+                                           dcc.contact_email, dcc.contact_name,
+                                           dcc.dcc_url, dcc.project_id_namespace,
+                                           dcc.project_local_id
 """
 
 import asyncio
 import logging
+import os
 import re
-from typing import Optional
+from collections import Counter
+from typing import AsyncGenerator, Optional
+from urllib.parse import quote
 
 import aiohttp
 
 from cfdb.dcc_registry import get_dcc_config
+from cfdb.services.encode import (
+    COMPRESSION_SUFFIX_TO_EDAM,
+    UNMAPPABLE_COMPRESSION_SUFFIXES,
+    derive_compression_format,
+)
+from cfdb.services.ontology_mappings import get_file_format, get_taxonomy
 
 logger = logging.getLogger(__name__)
 
 # Rate limit: max 10 requests/second → 100ms between requests
 _REQUEST_INTERVAL = 0.1
 
-# Fields to request from the HuBMAP Search API for enrichment
-_BULK_SOURCE_FIELDS = [
-    "doi_url",
-    "dataset_type",
-    "pipeline",
-    "processing",
-    "group_name",
-    "analyte_class",
-    "visualization",
-    "vitessce-hints",
-    "metadata",
-    "data_access_level",
-    "files",
-    "donor.mapped_metadata",
-    "donor.uuid",
-    "ingest_metadata.workflow_description",
-]
+ASSETS_BASE_URL = "https://assets.hubmapconsortium.org"
+PORTAL_DATASET_URL = "https://portal.hubmapconsortium.org/browse/dataset/{uuid}"
+UBKG_ORGANS_URL = (
+    "https://ontology.api.hubmapconsortium.org/organs?application_context=HUBMAP"
+)
+
+#: Environment variable overriding which file extensions are ingested, and
+#: the allowlist applied when it is unset. An allowlist rather than a filter
+#: retrofitted later: the files index holds 9.9M documents and 98% of them
+#: are ``.tif`` microscopy tiles the API cannot serve meaningfully, so
+#: ingesting the extension space wholesale would grow the corpus ~11x with
+#: dead weight. The default is the genomics + tabular tail of the live
+#: distribution, ~53k files.
+_FILE_EXTENSIONS_ENV = "HUBMAP_FILE_EXTENSIONS"
+_FILE_EXTENSIONS_DEFAULT: tuple[str, ...] = (
+    ".h5ad",
+    ".h5mu",
+    ".h5",
+    ".hdf5",
+    ".bcf",
+    ".gz",
+    ".mtx",
+    ".arrow",
+    ".parquet",
+    ".bed",
+    ".narrowpeak",
+    ".bam",
+    ".sf",
+    ".snap",
+    ".csv",
+    ".tsv",
+)
 
 
-_GENOME_ASSEMBLY_RE = re.compile(r"\b(GRCh38|hg38|GRCh37|hg19|GRCm39|mm10)\b", re.IGNORECASE)
+def file_extensions_from_env() -> tuple[str, ...]:
+    """Resolve the file-extension allowlist to ingest.
+
+    Reads a comma-separated ``HUBMAP_FILE_EXTENSIONS``, stripping each entry,
+    lower-casing it, prefixing a missing leading dot, and dropping blanks —
+    so ``h5ad, .BCF`` and ``.h5ad,.bcf`` configure the same thing, and what
+    is sent to the search API matches the index's dot-prefixed
+    ``file_extension`` values exactly. An unset variable yields the default
+    allowlist; a variable set to an empty (or all-blank) value yields an
+    empty tuple, which ingests nothing — the same explicit-empty semantics
+    as ``ENCODE_ANNOTATION_TYPES``, and warned about for the same reason:
+    empty values arrive by accident routinely, and a silently empty corpus
+    shows up only as an absence.
+
+    Repeats are collapsed, first occurrence winning, so a duplicated token
+    cannot widen the server-side ``terms`` filter or reorder the logged
+    allowlist.
+    """
+    raw = os.getenv(_FILE_EXTENSIONS_ENV)
+    if raw is None:
+        return _FILE_EXTENSIONS_DEFAULT
+
+    entries = (entry.strip().lower() for entry in raw.split(","))
+    normalized = (
+        entry if entry.startswith(".") else f".{entry}"
+        for entry in entries
+        if entry
+    )
+    allowlist = tuple(dict.fromkeys(normalized))
+
+    if not allowlist:
+        logger.warning(
+            "%s is set but empty: no HuBMAP files will be ingested. Unset "
+            "it entirely to restore the default allowlist (%s).",
+            _FILE_EXTENSIONS_ENV,
+            ", ".join(_FILE_EXTENSIONS_DEFAULT),
+        )
+
+    return allowlist
+
+
+_GENOME_ASSEMBLY_RE = re.compile(
+    r"\b(GRCh38|hg38|GRCh37|hg19|GRCm39|mm10)\b", re.IGNORECASE
+)
 
 # Normalize variant names to canonical assembly identifiers
 _ASSEMBLY_ALIASES = {
@@ -117,19 +220,81 @@ def extract_genome_assembly(workflow_description: str) -> Optional[str]:
     return None
 
 
+# Compression suffixes stripped before mapping a filename's extension to a
+# file format: the named EDAM-expressible wrappers plus the ones no EDAM term
+# covers. Longest first so ``.gzip`` is never half-stripped as ``.gz``'s
+# shorter cousin. ``.zip`` is excluded deliberately — a ZIP holds many
+# members with many formats, so the name under it describes an archive
+# member, not the file.
+_STRIPPABLE_COMPRESSION_SUFFIXES: tuple[str, ...] = tuple(
+    sorted(
+        (
+            suffix
+            for suffix in (
+                *COMPRESSION_SUFFIX_TO_EDAM,
+                *UNMAPPABLE_COMPRESSION_SUFFIXES,
+            )
+            if suffix != ".zip"
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def derive_file_format(filename: str) -> Optional[dict]:
+    """Map a filename to an EDAM file-format term.
+
+    The files index's ``file_extension`` names the outermost suffix, which
+    for a ``.fastq.gz`` is the compression wrapper rather than the format —
+    so the derivation strips one known compression suffix from the filename
+    first, then maps whatever extension remains through the shared
+    EDAM table. ``None`` when no extension remains or none maps.
+    """
+    base = filename.lower().rsplit("/", 1)[-1]
+    for suffix in _STRIPPABLE_COMPRESSION_SUFFIXES:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    if "." not in base:
+        return None
+    return get_file_format(base.rsplit(".", 1)[-1])
+
+
+# Fields to request from the dataset-level index. Only what the files index
+# cannot supply: per-dataset processing context, donor demographics, and the
+# free-text workflow description the genome assembly is extracted from.
+_DATASET_SOURCE_FIELDS = [
+    "uuid",
+    "pipeline",
+    "processing",
+    "group_name",
+    "visualization",
+    "vitessce-hints",
+    "metadata",
+    "donor.mapped_metadata",
+    "donor.uuid",
+    "ingest_metadata.workflow_description",
+]
+
+
 async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
     """
-    Fetch all published HuBMAP dataset metadata from the Search API.
+    Fetch all HuBMAP dataset metadata from the dataset-level search index.
 
-    Uses Elasticsearch ``search_after`` pagination to iterate all published
-    datasets in batches of 1000.  Returns a dict keyed by ``doi_url`` so
-    callers can match to C2M2 collection ``persistent_id``.
+    Uses Elasticsearch ``search_after`` pagination to iterate all datasets in
+    batches of 1000. Returns a dict keyed by dataset ``uuid`` so the file
+    transformation can join on the ``dataset_uuid`` every files-index
+    document carries.
+
+    An HTTP or network error raises rather than returning the partial map:
+    the loader clears the HuBMAP slice before reloading, so a silently
+    partial dataset map would mean silently under-enriched documents.
 
     Returns:
-        {doi_url: {dataset_type, pipeline, processing, group_name,
-                    analyte_class, visualization, vitessce_hints, metadata,
-                    data_access_level, files, donor_metadata,
-                    genome_assembly}}
+        {dataset_uuid: {pipeline, processing, group_name, visualization,
+                        vitessce_hints, metadata, donor_uuid, donor_metadata,
+                        genome_assembly}}
     """
     config = get_dcc_config("hubmap")
     api_base = config["api_base"]
@@ -142,16 +307,9 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
     async with aiohttp.ClientSession() as session:
         while True:
             query: dict = {
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"term": {"entity_type.keyword": "Dataset"}},
-                            {"exists": {"field": "doi_url"}},
-                        ]
-                    }
-                },
+                "query": {"term": {"entity_type.keyword": "Dataset"}},
                 "size": page_size,
-                "_source": _BULK_SOURCE_FIELDS,
+                "_source": _DATASET_SOURCE_FIELDS,
                 "sort": [{"_id": "asc"}],
             }
 
@@ -166,16 +324,16 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as response:
                     if response.status != 200:
-                        logger.error(
-                            f"HuBMAP Search API error: HTTP {response.status}"
+                        raise RuntimeError(
+                            f"HuBMAP dataset search API error: "
+                            f"HTTP {response.status}"
                         )
-                        break
 
                     data = await response.json()
 
             except aiohttp.ClientError as e:
-                logger.error(f"HuBMAP Search API network error: {e}")
-                break
+                logger.error(f"HuBMAP dataset search API network error: {e}")
+                raise
 
             await asyncio.sleep(_REQUEST_INTERVAL)
 
@@ -185,22 +343,13 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
 
             for hit in hits:
                 src = hit.get("_source", {})
-                doi_url = src.get("doi_url")
-                if not doi_url:
+                uuid = src.get("uuid")
+                if not uuid:
                     continue
 
                 entry: dict = {}
 
-                # Dataset-level fields
-                for key in (
-                    "dataset_type",
-                    "pipeline",
-                    "processing",
-                    "group_name",
-                    "analyte_class",
-                    "visualization",
-                    "data_access_level",
-                ):
+                for key in ("pipeline", "processing", "group_name", "visualization"):
                     val = src.get(key)
                     if val is not None:
                         entry[key] = val
@@ -213,11 +362,6 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
                 metadata = src.get("metadata")
                 if metadata:
                     entry["metadata"] = metadata
-
-                # File listings
-                files = src.get("files")
-                if files:
-                    entry["files"] = files
 
                 # Donor demographics
                 donor = src.get("donor") or {}
@@ -236,8 +380,7 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
                     if assembly:
                         entry["genome_assembly"] = assembly
 
-                if entry:
-                    results[doi_url] = entry
+                results[uuid] = entry
 
             # Prepare next page
             search_after = hits[-1].get("sort")
@@ -246,8 +389,428 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
 
             if len(results) % 5000 < page_size:
                 logger.info(
-                    f"HuBMAP bulk fetch: {len(results)} datasets fetched so far"
+                    f"HuBMAP dataset fetch: {len(results)} datasets fetched so far"
                 )
 
-    logger.info(f"HuBMAP bulk fetch: {len(results)} total datasets fetched")
+    logger.info(f"HuBMAP dataset fetch: {len(results)} total datasets fetched")
     return results
+
+
+# Fields to request from the files index — the whole per-file surface the
+# transformation maps.
+_FILE_SOURCE_FIELDS = [
+    "file_uuid",
+    "rel_path",
+    "file_extension",
+    "size",
+    "md5_checksum",
+    "sha256_checksum",
+    "data_access_level",
+    "is_data_product",
+    "dataset_uuid",
+    "dataset_hubmap_id",
+    "dataset_type",
+    "dataset_status",
+    "analyte_class",
+    "donors",
+    "organs",
+]
+
+
+async def fetch_file_metadata(
+    extensions: tuple[str, ...],
+) -> AsyncGenerator[dict, None]:
+    """
+    Stream file documents from the HuBMAP files search index.
+
+    Uses ``search_after`` pagination on ``file_uuid.keyword`` in batches of
+    1000. When ``extensions`` is non-empty, the allowlist is applied
+    server-side as a ``terms`` filter on ``file_extension.keyword``, so the
+    excluded 9.7M microscopy tiles never cross the wire. An empty allowlist
+    yields nothing — the explicit-empty configuration documented on
+    :func:`file_extensions_from_env`.
+
+    Errors raise rather than ending the stream early, for the same reason
+    :func:`fetch_dataset_metadata_bulk` raises: a partial stream behind a
+    clear-before-reload would silently shrink the corpus.
+
+    Yields:
+        The ``_source`` dict of each matching file document.
+    """
+    if not extensions:
+        return
+
+    config = get_dcc_config("hubmap")
+    api_base = config["api_base"]
+    search_url = f"{api_base}/files/search"
+
+    page_size = 1000
+    search_after: Optional[list] = None
+    total = 0
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            query: dict = {
+                "query": {"terms": {"file_extension.keyword": list(extensions)}},
+                "size": page_size,
+                "_source": _FILE_SOURCE_FIELDS,
+                "sort": [{"file_uuid.keyword": "asc"}],
+            }
+
+            if search_after is not None:
+                query["search_after"] = search_after
+
+            try:
+                async with session.post(
+                    search_url,
+                    json=query,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as response:
+                    if response.status != 200:
+                        raise RuntimeError(
+                            f"HuBMAP files search API error: "
+                            f"HTTP {response.status}"
+                        )
+
+                    data = await response.json()
+
+            except aiohttp.ClientError as e:
+                logger.error(f"HuBMAP files search API network error: {e}")
+                raise
+
+            await asyncio.sleep(_REQUEST_INTERVAL)
+
+            hits = data.get("hits", {}).get("hits", [])
+            if not hits:
+                break
+
+            for hit in hits:
+                yield hit.get("_source", {})
+                total += 1
+
+            if total % 10000 < page_size:
+                logger.info(f"HuBMAP file fetch: {total} files fetched so far")
+
+            # Prepare next page
+            search_after = hits[-1].get("sort")
+            if not search_after:
+                break
+
+    logger.info(f"HuBMAP file fetch: {total} total files fetched")
+
+
+async def fetch_organ_map() -> dict[str, dict]:
+    """
+    Fetch the HuBMAP organ-code → UBERON mapping from the UBKG ontology API.
+
+    One small request per sync. Returns ``{rui_code: {"id": uberon_id,
+    "name": term}}`` for every organ carrying both a code and a UBERON id.
+    Failure degrades rather than aborts — anatomy is enrichment, not
+    identity, so a UBKG outage costs the anatomy terms of one sync, not the
+    corpus — and returns an empty map with a warning.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                UBKG_ORGANS_URL,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as response:
+                if response.status != 200:
+                    logger.warning(
+                        f"UBKG organs API error: HTTP {response.status}; "
+                        "HuBMAP collections will carry no anatomy terms "
+                        "this sync"
+                    )
+                    return {}
+                organs = await response.json()
+    except aiohttp.ClientError as e:
+        logger.warning(
+            f"UBKG organs API network error: {e}; HuBMAP collections will "
+            "carry no anatomy terms this sync"
+        )
+        return {}
+
+    organ_map: dict[str, dict] = {}
+    for organ in organs:
+        code = organ.get("rui_code")
+        uberon = organ.get("organ_uberon")
+        if code and uberon:
+            organ_map[code] = {"id": uberon, "name": organ.get("term") or code}
+
+    logger.info(f"UBKG organs: {len(organ_map)} organ codes mapped to UBERON")
+    return organ_map
+
+
+# Scalar demographics HuBMAP returns as single-element lists; unwrapped to
+# the scalar on the way in.
+_DONOR_SCALAR_FIELDS = (
+    "age_value",
+    "age_unit",
+    "sex",
+    "race",
+    "body_mass_index_value",
+    "body_mass_index_unit",
+    "cause_of_death",
+    "death_event",
+    "mechanism_of_injury",
+    "height_value",
+    "height_unit",
+    "weight_value",
+    "weight_unit",
+)
+
+# Genuinely multi-valued demographics, kept as lists.
+_DONOR_LIST_FIELDS = ("medical_history", "social_history")
+
+
+def _donor_extra(donor_metadata: dict) -> dict:
+    """Shape one donor's ``mapped_metadata`` into ``subjects[].extra.hubmap``."""
+    extra: dict = {}
+    for key in _DONOR_SCALAR_FIELDS:
+        val = donor_metadata.get(key)
+        if val is None:
+            continue
+        if isinstance(val, list) and len(val) == 1:
+            val = val[0]
+        extra[key] = val
+
+    for key in _DONOR_LIST_FIELDS:
+        val = donor_metadata.get(key)
+        if isinstance(val, list) and val:
+            extra[key] = val
+
+    return extra
+
+
+def _parse_flag(value: object) -> Optional[bool]:
+    """Parse one of the files index's stringly-typed booleans.
+
+    The index serializes ``is_data_product`` as the strings ``"True"`` and
+    ``"False"``, so a plain truthiness test would read ``"False"`` as true.
+    Anything that is neither spelling yields ``None`` -- an unrecognized
+    value is unknown, and reporting it as ``False`` would fabricate a fact.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return {"true": True, "false": False}.get(value.strip().lower())
+    return None
+
+
+def _dcc_fields() -> dict:
+    """The static HuBMAP DCC fields, shared by the inline file-document copy
+    and the ``dcc`` collection record."""
+    config = get_dcc_config("hubmap")
+    id_namespace = config["id_namespace"]
+
+    return {
+        "id": "cfde_registry_dcc:hubmap",
+        "dcc_name": "HuBMAP",
+        "dcc_abbreviation": "HuBMAP",
+        "dcc_description": (
+            "The Human BioMolecular Atlas Program (HuBMAP) is an NIH Common "
+            "Fund initiative developing an open, global atlas of the human "
+            "body at the cellular level."
+        ),
+        "contact_email": "help@hubmapconsortium.org",
+        "contact_name": "HuBMAP Help Desk",
+        "dcc_url": "https://hubmapconsortium.org",
+        "project_id_namespace": id_namespace,
+        "project_local_id": "HuBMAP",
+    }
+
+
+def build_hubmap_dcc_record() -> dict:
+    """
+    Build DCC collection record for HuBMAP.
+
+    Returns:
+        DCC document for insertion into dcc collection
+    """
+    return {"submission": "hubmap", **_dcc_fields()}
+
+
+def transform_file_to_cfdb(
+    src: dict,
+    *,
+    dataset_metadata: dict[str, dict],
+    donor_lookup: dict[str, dict],
+    organ_map: dict[str, dict],
+    stats: Counter | None = None,
+) -> Optional[dict]:
+    """
+    Transform one files-index document into a CFDB file document.
+
+    Args:
+        src: The ``_source`` dict of a files-index document, as yielded by
+            :func:`fetch_file_metadata`.
+        dataset_metadata: Dataset-level context keyed by dataset uuid, from
+            :func:`fetch_dataset_metadata_bulk`. A missing dataset degrades
+            the document (no demographics, pipeline, or assembly) rather
+            than dropping it.
+        donor_lookup: Donor demographics keyed by donor uuid, built from
+            ``dataset_metadata`` by the caller.
+        organ_map: Organ-code → UBERON mapping from :func:`fetch_organ_map`.
+            An unmapped code skips that anatomy term rather than fabricating
+            an id.
+        stats: Optional counter the transform reports into — per-extension
+            document tallies, skip reasons, and unmapped organ codes — so
+            the sync can log one distribution instead of a line per file.
+
+    Returns:
+        CFDB-compatible dict for insertion into the files collection, or
+        None for a document missing the fields that make it addressable
+        (``file_uuid``, ``rel_path``, ``dataset_uuid``).
+    """
+    config = get_dcc_config("hubmap")
+    id_namespace = config["id_namespace"]
+
+    file_uuid = src.get("file_uuid")
+    rel_path = src.get("rel_path")
+    dataset_uuid = src.get("dataset_uuid")
+    if not file_uuid or not rel_path or not dataset_uuid:
+        if stats is not None:
+            stats["skipped:incomplete"] += 1
+        logger.warning(
+            "Skipping HuBMAP file document missing file_uuid, rel_path, or "
+            f"dataset_uuid (file_uuid={file_uuid!r})"
+        )
+        return None
+
+    filename = rel_path.rsplit("/", 1)[-1]
+
+    try:
+        size_in_bytes = int(src["size"])
+    except (KeyError, TypeError, ValueError):
+        size_in_bytes = None
+
+    dataset_meta = dataset_metadata.get(dataset_uuid) or {}
+
+    doc: dict = {
+        "submission": "hubmap",
+        "id_namespace": id_namespace,
+        "local_id": file_uuid,
+        # HuBMAP issues no file accessions (#102); explicit so the field is
+        # queryably null rather than merely absent.
+        "accession_id": None,
+        "filename": filename,
+        "size_in_bytes": size_in_bytes,
+        "md5": src.get("md5_checksum") or None,
+        "sha256": src.get("sha256_checksum") or None,
+        "access_url": (
+            f"{ASSETS_BASE_URL}/{dataset_uuid}/{quote(rel_path, safe='/')}"
+        ),
+        "status": src.get("dataset_status"),
+        "data_access_level": src.get("data_access_level"),
+    }
+
+    file_format = derive_file_format(filename)
+    if file_format:
+        doc["file_format"] = file_format
+
+    # Same absent-when-undetermined contract as the ENCODE derivation; see
+    # derive_compression_format.
+    compression_format = derive_compression_format(filename)
+    if compression_format is not None:
+        doc["compression_format"] = compression_format
+
+    extra_hubmap: dict = {"rel_path": rel_path}
+
+    is_data_product = _parse_flag(src.get("is_data_product"))
+    if is_data_product is not None:
+        extra_hubmap["is_data_product"] = is_data_product
+
+    genome_assembly = dataset_meta.get("genome_assembly")
+    if genome_assembly:
+        doc["genome_assembly"] = genome_assembly
+        extra_hubmap["genome_assembly"] = genome_assembly
+
+    doc["extra"] = {"hubmap": extra_hubmap}
+
+    # --- Subjects, from the file's donors joined to dataset demographics ---
+    taxonomy = get_taxonomy("Homo sapiens")
+    subjects = []
+    # The index repeats a donor once per contributing tissue block -- one
+    # live file lists the same uuid 26 times -- so dedupe, as for organs.
+    seen_donors: set[str] = set()
+    for donor in src.get("donors") or []:
+        donor_uuid = (donor or {}).get("uuid")
+        if not donor_uuid or donor_uuid in seen_donors:
+            continue
+        seen_donors.add(donor_uuid)
+        subject: dict = {
+            "id_namespace": id_namespace,
+            "local_id": donor_uuid,
+            "project_id_namespace": id_namespace,
+            "project_local_id": "HuBMAP",
+        }
+        if taxonomy:
+            subject["taxonomy"] = taxonomy
+        donor_metadata = donor_lookup.get(donor_uuid)
+        if donor_metadata:
+            donor_extra = _donor_extra(donor_metadata)
+            if donor_extra:
+                subject["extra"] = {"hubmap": donor_extra}
+        subjects.append(subject)
+
+    # --- Anatomy, from the file's organs through the UBKG mapping ---
+    anatomy = []
+    seen_codes: set[str] = set()
+    for organ in src.get("organs") or []:
+        code = (organ or {}).get("code")
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        term = organ_map.get(code)
+        if not term:
+            if stats is not None:
+                stats[f"unmapped_organ:{code}"] += 1
+            continue
+        anatomy.append({"id": term["id"], "name": organ.get("label") or term["name"]})
+
+    # --- Collection, one per file: its parent dataset ---
+    collection: dict = {
+        "id_namespace": id_namespace,
+        "local_id": dataset_uuid,
+        "name": src.get("dataset_hubmap_id") or dataset_uuid,
+        "persistent_id": PORTAL_DATASET_URL.format(uuid=dataset_uuid),
+        "biosamples": [],
+        "subjects": subjects,
+    }
+    if anatomy:
+        collection["anatomy"] = anatomy
+
+    dataset_type = src.get("dataset_type")
+    if dataset_type:
+        collection["experiment_type"] = dataset_type
+    analyte_class = src.get("analyte_class")
+    if analyte_class:
+        collection["analyte_class"] = analyte_class
+
+    collection_extra: dict = {}
+    for key in (
+        "pipeline",
+        "processing",
+        "group_name",
+        "visualization",
+        "vitessce_hints",
+        "metadata",
+    ):
+        val = dataset_meta.get(key)
+        if val is not None:
+            collection_extra[key] = val
+    dataset_status = src.get("dataset_status")
+    if dataset_status:
+        collection_extra["dataset_status"] = dataset_status
+    if collection_extra:
+        collection["extra"] = {"hubmap": collection_extra}
+
+    doc["collections"] = [collection]
+
+    doc["dcc"] = _dcc_fields()
+
+    if stats is not None:
+        stats[f"extension:{src.get('file_extension')}"] += 1
+
+    return doc
