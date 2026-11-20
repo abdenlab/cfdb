@@ -1099,6 +1099,7 @@ async def sync_hubmap(task: SyncTask) -> None:
     in place -- the same outcome an empty ``ENCODE_ANNOTATION_TYPES`` has
     for ENCODE's annotation phases.
     """
+    from cfdb.models import FileMetadataModel
     from cfdb.services.hubmap import (
         build_donor_lookup,
         build_hubmap_dcc_record,
@@ -1157,14 +1158,20 @@ async def sync_hubmap(task: SyncTask) -> None:
     def transform(src: dict) -> Optional[dict]:
         # One malformed upstream document costs that document, not the
         # sync: an exception here would otherwise abort the stream after
-        # the stale clear and leave a partial slice.
+        # the stale clear and leave a partial slice. The model check is part
+        # of the same guard -- a document that transforms but does not
+        # validate (an upstream field that changed type) would otherwise be
+        # stored, and every API page holding it would then fail to build.
         try:
-            return transform_file_to_cfdb(
+            doc = transform_file_to_cfdb(
                 src,
                 dataset_metadata=dataset_metadata,
                 donor_lookup=donor_lookup,
                 stats=stats,
             )
+            if doc is not None:
+                FileMetadataModel(**doc)
+            return doc
         except Exception:
             stats["skipped:malformed"] += 1
             if stats["skipped:malformed"] <= 5:
@@ -1270,7 +1277,10 @@ async def sync_hubmap(task: SyncTask) -> None:
         )
     malformed = stats.get("skipped:malformed", 0)
     if malformed:
-        logger.warning(f"HuBMAP ingest: skipped {malformed} malformed documents")
+        logger.warning(
+            f"HuBMAP ingest: skipped {malformed} documents that failed to "
+            "transform or to validate"
+        )
     unjoined = {
         key: stats[key] for key in ("unjoined_dataset", "unjoined_donor") if stats[key]
     }

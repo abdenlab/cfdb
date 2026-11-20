@@ -902,6 +902,48 @@ async def test_sync_hubmap_should_skip_a_malformed_document(
     assert loaded == ["good"]
 
 
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_skip_a_document_that_fails_model_validation(
+    mock_db, mocker
+):
+    """Test a document that transforms but would not validate is not stored.
+
+    The API builds the model for every document on a page, so one stored
+    document of the wrong shape would fail every page that holds it.
+
+    Given:
+        A dataset whose donor reports two races -- which the transform
+        stores as a list where the model expects one string -- referenced
+        by one file, followed by a file whose dataset is well-formed.
+    When:
+        sync_hubmap runs.
+    Then:
+        Only the well-formed file should be inserted.
+    """
+    # Arrange
+    dataset_metadata = {
+        "ds-bad": {"donors": {"donor-2": {"race": ["White", "Asian"]}}},
+        "ds-uuid-1": {},
+    }
+    bad = _hubmap_file_doc(
+        file_uuid="bad",
+        dataset_uuid="ds-bad",
+        donors=[{"entity_type": "Donor", "uuid": "donor-2"}],
+    )
+    _patch_hubmap_fetches(
+        mocker,
+        _async_iter([bad, _hubmap_file_doc(file_uuid="good")]),
+        dataset_metadata=dataset_metadata,
+    )
+
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    loaded = [d["local_id"] for d in mock_db.files.docs if d["submission"] == "hubmap"]
+    assert loaded == ["good"]
+
+
 async def _seed_sync_lock(mock_db, *, started_ago, heartbeat_ago=None):
     """Write an active sync lock started (and optionally heartbeated) so long ago."""
     fields = {"active": True, "started_at": datetime.utcnow() - started_ago}
