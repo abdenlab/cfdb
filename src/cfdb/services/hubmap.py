@@ -454,7 +454,8 @@ async def fetch_dataset_metadata_bulk(
     Each page is retried on transient failure (see ``_search_page``); a
     failure that outlasts the retries raises rather than returning the
     partial map, since a silently partial map would mean silently
-    under-enriched documents.
+    under-enriched documents. For the same reason the first page asks for
+    an exact total, and a walk that ends with fewer datasets than it raises.
 
     Args:
         deadline: Event-loop clock reading by which the whole fetch must
@@ -474,6 +475,8 @@ async def fetch_dataset_metadata_bulk(
     results: dict[str, dict] = {}
     page_size = 1000
     search_after: Optional[list] = None
+    seen = 0
+    expected: Optional[int] = None
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -486,10 +489,15 @@ async def fetch_dataset_metadata_bulk(
 
             if search_after is not None:
                 query["search_after"] = search_after
+            else:
+                query["track_total_hits"] = True
 
-            hits, _ = await _search_page(
+            hits, total = await _search_page(
                 session, search_url, query, "dataset", deadline=deadline
             )
+            if search_after is None:
+                expected = total
+            seen += len(hits)
 
             await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
 
@@ -560,6 +568,11 @@ async def fetch_dataset_metadata_bulk(
                     f"HuBMAP dataset fetch: {len(results)} datasets fetched so far"
                 )
 
+    if expected is not None and seen < expected:
+        raise RuntimeError(
+            f"HuBMAP dataset walk ended short: {seen} of the {expected} "
+            "datasets the index reported on its first page"
+        )
     logger.info(f"HuBMAP dataset fetch: {len(results)} total datasets fetched")
     return results
 

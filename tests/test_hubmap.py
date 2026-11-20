@@ -1459,6 +1459,47 @@ async def test_fetch_dataset_metadata_bulk_should_key_results_by_uuid(
 
 
 @pytest.mark.asyncio
+async def test_fetch_dataset_metadata_bulk_should_raise_when_the_walk_ends_short(
+    mocker,
+):
+    """Test a dataset walk that delivers less than the index reported is refused.
+
+    A partial map would load documents with silently missing dataset
+    context, so the walk is held to the total it was promised.
+
+    Given:
+        A first page reporting an exact total of 3 datasets but carrying
+        2, after which the index serves nothing more.
+    When:
+        fetch_dataset_metadata_bulk drains the index.
+    Then:
+        It should raise naming the shortfall, having asked for an exact
+        total on the first page.
+    """
+    # Arrange
+    first = {
+        "hits": {
+            "total": {"value": 3, "relation": "eq"},
+            "hits": [
+                {"_source": {"uuid": "ds-1"}, "sort": ["ds-1"]},
+                {"_source": {"uuid": "ds-2"}, "sort": ["ds-2"]},
+            ],
+        }
+    }
+    session = _SearchSession(pages=[first])
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    with pytest.raises(RuntimeError, match="2 of the 3"):
+        await fetch_dataset_metadata_bulk()
+
+    # Assert
+    assert session.post_bodies[0]["track_total_hits"] is True
+
+
+@pytest.mark.asyncio
 async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(mocker, no_backoff):
     """Test a partial dataset map is refused rather than returned.
 
