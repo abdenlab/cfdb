@@ -1,12 +1,11 @@
 """Tests for the sync service: dispatch, per-DCC loaders, and enrichment.
 
-These tests drive the module's private per-DCC functions (``_sync_dccs``,
-``_sync_encode``, ``_sync_hubmap``, ...) directly. That is a deliberate,
-module-wide exception to the test guide's rule against referencing private
-functions: the only public entry point, ``start_sync``, schedules the run
-as a detached background task and returns before it does any work, so no
-public seam exists to drive a loader through and observe what it wrote.
-New loaders follow the same convention rather than forking it.
+The older tests here drive the module's private per-DCC functions
+(``_sync_dccs``, ``_sync_encode``, ...) directly; that convention predates
+the test guide's rule against referencing private functions and is left as
+it is rather than rewritten in passing. New loaders do not extend it: the
+HuBMAP loader is public (``sync_hubmap``) and its tests are module-level
+functions that drive it through that public name.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from cfdb.services.sync import (
     _stamp_4dn_file_accessions,
     _sync_dccs,
     _sync_encode,
-    _sync_hubmap,
+    sync_hubmap,
 )
 from cfdb.indexes import data_index_specs, materialized_files_index_specs
 from tests.conftest import FakeDB
@@ -226,7 +225,7 @@ class TestSyncDccsFailureIsolation:
             sync_module, "_sync_c2m2_zip", mocker.AsyncMock()
         )
         hubmap_sync = mocker.patch.object(
-            sync_module, "_sync_hubmap", mocker.AsyncMock()
+            sync_module, "sync_hubmap", mocker.AsyncMock()
         )
         mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
         mocker.patch.object(
@@ -266,7 +265,7 @@ class TestSyncDccsFailureIsolation:
             "_sync_encode",
             mocker.AsyncMock(side_effect=RuntimeError("encode died")),
         )
-        mocker.patch.object(sync_module, "_sync_hubmap", mocker.AsyncMock())
+        mocker.patch.object(sync_module, "sync_hubmap", mocker.AsyncMock())
         ensure_mock = mocker.patch.object(
             sync_module, "ensure_indexes", mocker.AsyncMock()
         )
@@ -303,7 +302,7 @@ class TestSyncDccsFailureIsolation:
             "_sync_encode",
             mocker.AsyncMock(side_effect=RuntimeError("encode died")),
         )
-        mocker.patch.object(sync_module, "_sync_hubmap", mocker.AsyncMock())
+        mocker.patch.object(sync_module, "sync_hubmap", mocker.AsyncMock())
         mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
         coverage = mocker.patch.object(
             sync_module, "_log_accession_coverage", mocker.AsyncMock()
@@ -339,7 +338,7 @@ class TestSyncDccsFailureIsolation:
             sync_module, "_sync_encode", mocker.AsyncMock(side_effect=first)
         )
         mocker.patch.object(
-            sync_module, "_sync_hubmap", mocker.AsyncMock(side_effect=second)
+            sync_module, "sync_hubmap", mocker.AsyncMock(side_effect=second)
         )
         mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
         mocker.patch.object(
@@ -380,7 +379,7 @@ class TestSyncDccsFailureIsolation:
             mocker.AsyncMock(side_effect=asyncio.CancelledError()),
         )
         hubmap_sync = mocker.patch.object(
-            sync_module, "_sync_hubmap", mocker.AsyncMock()
+            sync_module, "sync_hubmap", mocker.AsyncMock()
         )
         mocker.patch.object(sync_module, "ensure_indexes", mocker.AsyncMock())
         task = SyncTask(id="t1", dcc_names=["encode", "hubmap"])
@@ -393,8 +392,7 @@ class TestSyncDccsFailureIsolation:
 
 
 # ---------------------------------------------------------------------------
-# _sync_hubmap -- driven directly under the module docstring's recorded
-# exception for private per-DCC loaders, like _sync_encode above.
+# sync_hubmap
 # ---------------------------------------------------------------------------
 
 
@@ -423,7 +421,7 @@ def _hubmap_file_doc(**overrides) -> dict:
 
 
 def _patch_hubmap_fetches(mocker, file_docs, dataset_metadata=None):
-    """Point the two network boundaries of _sync_hubmap at fixed data.
+    """Point the two network boundaries of sync_hubmap at fixed data.
 
     The dataset map defaults to one entry for the fixture's dataset: an
     empty map is refused by the sync, so a test wanting that has to say so.
@@ -444,497 +442,506 @@ def _patch_hubmap_fetches(mocker, file_docs, dataset_metadata=None):
     )
 
 
-class TestSyncHubmap:
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_insert_fully_populated_documents(
-        self, mock_db, mocker
-    ):
-        """Test the single-pass load joins everything into one document.
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_insert_fully_populated_documents(
+    mock_db, mocker
+):
+    """Test the single-pass load joins everything into one document.
 
-        HuBMAP writes the files collection directly with no post-load
-        enrichment, so this pipeline is the only writer of dataset context,
-        donor demographics, and anatomy for that DCC.
+    HuBMAP writes the files collection directly with no post-load
+    enrichment, so this pipeline is the only writer of dataset context,
+    donor demographics, and anatomy for that DCC.
 
-        Given:
-            One files-index document whose dataset carries pipeline context,
-            donor demographics, and a mappable organ code.
-        When:
-            _sync_hubmap runs the fetch-transform-insert pipeline.
-        Then:
-            The inserted document should carry the file fields, the joined
-            dataset and donor metadata, the UBERON anatomy term, and the
-            DCC record should be upserted.
-        """
-        # Arrange
-        dataset_metadata = {
-            "ds-uuid-1": {
-                "pipeline": "Salmon",
-                "processing": "processed",
-                "genome_assembly": "GRCh38",
-                "donor_uuid": "donor-1",
-                "donor_metadata": {
-                    "sex": ["Female"],
-                    "age_value": [67.0],
-                    "medical_history": ["Diabetes"],
-                },
-            }
-        }
-        _patch_hubmap_fetches(
-            mocker,
-            _async_iter([_hubmap_file_doc()]),
-            dataset_metadata=dataset_metadata,
-        )
-
-        # Act
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        doc = next(d for d in mock_db.files.docs if d["submission"] == "hubmap")
-        assert doc["local_id"] == "abc123"
-        assert doc["accession_id"] is None
-        assert doc["filename"] == "secondary_analysis.h5ad"
-        assert doc["size_in_bytes"] == 5529765
-        assert isinstance(doc["size_in_bytes"], int)
-        assert doc["md5"] == "0b05f823fd4b3cc86204366c6f71eae9"
-        assert doc["sha256"].startswith("f51518c924f3")
-        assert doc["access_url"] == (
-            "https://assets.hubmapconsortium.org/ds-uuid-1/"
-            "processed/expr%20matrix/secondary_analysis.h5ad"
-        )
-        assert doc["status"] == "Published"
-        assert doc["data_access_level"] == "public"
-        assert doc["genome_assembly"] == "GRCh38"
-        assert doc["file_format"]["name"] == "HDF5"
-        assert doc["extra"]["hubmap"]["rel_path"] == (
-            "processed/expr matrix/secondary_analysis.h5ad"
-        )
-        collection = doc["collections"][0]
-        assert collection["local_id"] == "ds-uuid-1"
-        assert collection["name"] == "HBM339.XXWC.842"
-        assert collection["experiment_type"] == "RNAseq"
-        assert collection["analyte_class"] == "RNA"
-        assert collection["anatomy"] == [
-            {"id": "UBERON:0002370", "name": "thymus"}
-        ]
-        assert collection["extra"]["hubmap"]["pipeline"] == "Salmon"
-        assert collection["extra"]["hubmap"]["dataset_status"] == "Published"
-        subject = collection["subjects"][0]
-        assert subject["local_id"] == "donor-1"
-        assert subject["extra"]["hubmap"]["sex"] == "Female"
-        assert subject["extra"]["hubmap"]["age_value"] == 67.0
-        assert subject["extra"]["hubmap"]["medical_history"] == ["Diabetes"]
-        dcc_doc = next(
-            d for d in mock_db.dcc.docs if d["submission"] == "hubmap"
-        )
-        assert dcc_doc["dcc_abbreviation"] == "HuBMAP"
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_replace_only_the_hubmap_slice(
-        self, mock_db, mocker
-    ):
-        """Test the stale clear is scoped to the submission being reloaded.
-
-        Given:
-            A files collection holding a stale HuBMAP document and a 4DN
-            document, and a stream delivering one replacement file.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The stale HuBMAP document should be gone, the replacement
-            present, and the 4DN document untouched.
-        """
-        # Arrange
-        mock_db.files.docs.extend(
-            [
-                {"submission": "hubmap", "local_id": "stale-1"},
-                {"submission": "4dn", "local_id": "keep-1"},
-            ]
-        )
-        _patch_hubmap_fetches(mocker, _async_iter([_hubmap_file_doc()]))
-
-        # Act
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        ids = {(d["submission"], d["local_id"]) for d in mock_db.files.docs}
-        assert ("hubmap", "stale-1") not in ids
-        assert ("hubmap", "abc123") in ids
-        assert ("4dn", "keep-1") in ids
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_keep_previous_corpus_when_fetch_dies_early(
-        self, mock_db, mocker
-    ):
-        """Test a fetch that fails before delivering rows clears nothing.
-
-        The deferred stale clear exists for exactly this shape: an upstream
-        failure before the first row would otherwise empty the slice with
-        nothing to put back.
-
-        Given:
-            A files collection holding a HuBMAP document and a file stream
-            that raises before yielding anything.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The error should propagate and the previous HuBMAP document
-            should still be served.
-        """
-        # Arrange
-        mock_db.files.docs.append(
-            {"submission": "hubmap", "local_id": "previous-1"}
-        )
-        _patch_hubmap_fetches(
-            mocker, _async_raise(RuntimeError("files index down"))
-        )
-
-        # Act & assert
-        with pytest.raises(RuntimeError, match="files index down"):
-            await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        assert mock_db.files.docs == [
-            {"submission": "hubmap", "local_id": "previous-1"}
-        ]
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_ensure_materialized_files_indexes(
-        self, mock_db, mocker
-    ):
-        """Test the load ends by ensuring the files collection indexes.
-
-        HuBMAP writes straight into the materialized collection and never
-        runs the materializer, the only other creator of files indexes, so
-        skipping this leaves accession and submission lookups scanning.
-
-        Given:
-            A sync whose stream delivers one file document.
-        When:
-            _sync_hubmap runs.
-        Then:
-            It should ensure the materialized files index specs once.
-        """
-        # Arrange
-        _patch_hubmap_fetches(mocker, _async_iter([_hubmap_file_doc()]))
-        ensure_mock = mocker.patch.object(
-            sync_module, "ensure_indexes", mocker.AsyncMock()
-        )
-
-        # Act
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        ensure_mock.assert_awaited_once()
-        specs = ensure_mock.await_args.args[1]
-        assert [spec.name for spec in specs] == [
-            spec.name for spec in materialized_files_index_specs()
-        ]
-
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_ensure_indexes_when_the_stream_fails(
-        self, mock_db, mocker
-    ):
-        """Test a failed load still leaves its slice indexed.
-
-        A stream that dies mid-load has already committed rows; leaving
-        them unindexed would make every lookup against the partial slice a
-        full scan until the next successful sync.
-
-        Given:
-            A file stream that delivers one document and then raises.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The failure should propagate and the materialized files indexes
-            should still be ensured.
-        """
-        # Arrange
-        _patch_hubmap_fetches(
-            mocker,
-            _async_iter_then_raise(
-                [_hubmap_file_doc()], RuntimeError("files index reset")
-            ),
-        )
-        ensure_mock = mocker.patch.object(
-            sync_module, "ensure_indexes", mocker.AsyncMock()
-        )
-
-        # Act
-        with pytest.raises(RuntimeError, match="files index reset"):
-            await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        ensure_mock.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_prefetch_outside_the_cutover_lock(
-        self, mock_db, mocker
-    ):
-        """Test the network prefetch does not hold the read surface hostage.
-
-        The cutover lock blocks every API request, and the dataset and
-        organ prefetches touch no database state, so running them under
-        the lock would only lengthen the outage.
-
-        Given:
-            A dataset fetch that records whether the cutover lock is active
-            when it runs.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The fetch should not observe an active cutover lock, while the
-            file stream that follows should.
-        """
-        # Arrange
-        observed: list[bool] = []
-
-        async def lock_active() -> bool:
-            lock = await mock_db[locks.LOCKS_COLLECTION].find_one(
-                {"_id": locks.CUTOVER_LOCK_ID}
-            )
-            return bool(lock and lock.get("active"))
-
-        async def fetch_datasets(**kwargs):
-            observed.append(await lock_active())
-            return {"ds-uuid-1": {}}
-
-        async def stream_files():
-            # The control: the stream runs under the lock, so a fake that
-            # never recorded the lock would fail here instead of passing
-            # vacuously above.
-            observed.append(await lock_active())
-            yield _hubmap_file_doc()
-
-        _patch_hubmap_fetches(mocker, stream_files())
-        mocker.patch.object(
-            hubmap_module,
-            "fetch_dataset_metadata_bulk",
-            mocker.AsyncMock(side_effect=fetch_datasets),
-        )
-
-        # Act
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        assert observed == [False, True]
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_bound_the_file_stream_with_a_deadline(
-        self, mock_db, mocker, monkeypatch
-    ):
-        """Test the in-lock stream carries the configured budget.
-
-        The stream runs under the cutover lock, so an unbounded one could
-        outlive the sync lock's stale threshold and admit a second sync.
-
-        Given:
-            HUBMAP_SYNC_TIMEOUT_SECONDS set to 120 and a file stream that
-            records the deadline it was opened with.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The stream should be opened with a deadline about 120 seconds
-            ahead on the event-loop clock.
-        """
-        # Arrange
-        monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "120")
-        opened: dict = {}
-
-        def open_stream(extensions, *, deadline=None):
-            opened["deadline"] = deadline
-            return _async_iter([_hubmap_file_doc()])
-
-        _patch_hubmap_fetches(mocker, _async_iter([]))
-        mocker.patch.object(hubmap_module, "fetch_file_metadata", open_stream)
-        loop = asyncio.get_running_loop()
-
-        # Act
-        before = loop.time()
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        assert before + 119 <= opened["deadline"] <= loop.time() + 120
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_keep_the_slice_when_the_stream_yields_nothing(
-        self, mock_db, mocker
-    ):
-        """Test an empty upstream walk is refused rather than obeyed.
-
-        A mapping change on the index, or an allowlist matching nothing,
-        returns a well-formed empty page; obeying it would delete the
-        whole submission over what is almost certainly a fault.
-
-        Given:
-            A files collection holding a HuBMAP document and a file stream
-            that drains cleanly without yielding anything.
-        When:
-            _sync_hubmap runs.
-        Then:
-            It should raise, and the HuBMAP document should still be
-            served.
-        """
-        # Arrange
-        mock_db.files.docs.append(
-            {"submission": "hubmap", "local_id": "previous-1"}
-        )
-        _patch_hubmap_fetches(mocker, _async_iter([]))
-
-        # Act
-        with pytest.raises(RuntimeError, match="yielded no rows"):
-            await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        assert mock_db.files.docs == [
-            {"submission": "hubmap", "local_id": "previous-1"}
-        ]
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_refuse_an_empty_dataset_map(
-        self, mock_db, mocker
-    ):
-        """Test an empty dataset index fails the sync before anything clears.
-
-        Loading against an empty map would write every file without its
-        dataset context or donor demographics and report success.
-
-        Given:
-            A files collection holding a HuBMAP document and a dataset fetch
-            that returns no datasets.
-        When:
-            _sync_hubmap runs.
-        Then:
-            It should raise naming the empty index, and the HuBMAP document
-            should still be served.
-        """
-        # Arrange
-        mock_db.files.docs.append(
-            {"submission": "hubmap", "local_id": "previous-1"}
-        )
-        _patch_hubmap_fetches(
-            mocker, _async_iter([_hubmap_file_doc()]), dataset_metadata={}
-        )
-
-        # Act
-        with pytest.raises(RuntimeError, match="no datasets"):
-            await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        assert mock_db.files.docs == [
-            {"submission": "hubmap", "local_id": "previous-1"}
-        ]
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_skip_a_malformed_document(
-        self, mock_db, mocker
-    ):
-        """Test one malformed upstream document costs only that document.
-
-        Given:
-            A file stream carrying a document whose donors are bare strings,
-            followed by a well-formed document.
-        When:
-            _sync_hubmap runs.
-        Then:
-            It should complete, inserting only the well-formed document.
-        """
-        # Arrange
-        malformed = _hubmap_file_doc(file_uuid="bad", donors=["donor-uuid"])
-        _patch_hubmap_fetches(
-            mocker, _async_iter([malformed, _hubmap_file_doc(file_uuid="good")])
-        )
-
-        # Act
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        loaded = [d["local_id"] for d in mock_db.files.docs if d["submission"] == "hubmap"]
-        assert loaded == ["good"]
-
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_end_its_deadline_before_the_sync_lock_goes_stale(
-        self, mock_db, mocker, monkeypatch
-    ):
-        """Test the budget is clamped to what is left of the sync lock.
-
-        The sync lock's staleness counts from the start of the whole run,
-        and HuBMAP runs last; a budget counted from HuBMAP's own start
-        could outlive the lock and admit a second, clearing sync.
-
-        Given:
-            A sync lock that started 50 minutes ago, a 1800 s HuBMAP budget,
-            and a file stream that records the deadline it was opened with.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The deadline should fall about 5 minutes out -- the hour, less
-            the 50 minutes spent and a 5 minute margin -- not 30.
-        """
-        # Arrange
-        monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "1800")
-        await mock_db[locks.LOCKS_COLLECTION].update_one(
-            {"_id": locks.SYNC_LOCK_ID},
-            {
-                "$set": {
-                    "active": True,
-                    "started_at": datetime.utcnow() - timedelta(minutes=50),
-                }
+    Given:
+        One files-index document whose dataset carries pipeline context,
+        donor demographics, and a mappable organ code.
+    When:
+        sync_hubmap runs the fetch-transform-insert pipeline.
+    Then:
+        The inserted document should carry the file fields, the joined
+        dataset and donor metadata, the UBERON anatomy term, and the
+        DCC record should be upserted.
+    """
+    # Arrange
+    dataset_metadata = {
+        "ds-uuid-1": {
+            "pipeline": "Salmon",
+            "processing": "processed",
+            "genome_assembly": "GRCh38",
+            "donor_uuid": "donor-1",
+            "donor_metadata": {
+                "sex": ["Female"],
+                "age_value": [67.0],
+                "medical_history": ["Diabetes"],
             },
-            upsert=True,
-        )
-        opened: dict = {}
+        }
+    }
+    _patch_hubmap_fetches(
+        mocker,
+        _async_iter([_hubmap_file_doc()]),
+        dataset_metadata=dataset_metadata,
+    )
 
-        def open_stream(extensions, *, deadline=None):
-            opened["deadline"] = deadline
-            return _async_iter([_hubmap_file_doc()])
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
 
-        _patch_hubmap_fetches(mocker, _async_iter([]))
-        mocker.patch.object(hubmap_module, "fetch_file_metadata", open_stream)
-        loop = asyncio.get_running_loop()
+    # Assert
+    doc = next(d for d in mock_db.files.docs if d["submission"] == "hubmap")
+    assert doc["local_id"] == "abc123"
+    assert doc["accession_id"] is None
+    assert doc["filename"] == "secondary_analysis.h5ad"
+    assert doc["size_in_bytes"] == 5529765
+    assert isinstance(doc["size_in_bytes"], int)
+    assert doc["md5"] == "0b05f823fd4b3cc86204366c6f71eae9"
+    assert doc["sha256"].startswith("f51518c924f3")
+    assert doc["access_url"] == (
+        "https://assets.hubmapconsortium.org/ds-uuid-1/"
+        "processed/expr%20matrix/secondary_analysis.h5ad"
+    )
+    assert doc["status"] == "Published"
+    assert doc["data_access_level"] == "public"
+    assert doc["genome_assembly"] == "GRCh38"
+    assert doc["file_format"]["name"] == "HDF5"
+    assert doc["extra"]["hubmap"]["rel_path"] == (
+        "processed/expr matrix/secondary_analysis.h5ad"
+    )
+    collection = doc["collections"][0]
+    assert collection["local_id"] == "ds-uuid-1"
+    assert collection["name"] == "HBM339.XXWC.842"
+    assert collection["experiment_type"] == "RNAseq"
+    assert collection["analyte_class"] == "RNA"
+    assert collection["anatomy"] == [
+        {"id": "UBERON:0002370", "name": "thymus"}
+    ]
+    assert collection["extra"]["hubmap"]["pipeline"] == "Salmon"
+    assert collection["extra"]["hubmap"]["dataset_status"] == "Published"
+    subject = collection["subjects"][0]
+    assert subject["local_id"] == "donor-1"
+    assert subject["extra"]["hubmap"]["sex"] == "Female"
+    assert subject["extra"]["hubmap"]["age_value"] == 67.0
+    assert subject["extra"]["hubmap"]["medical_history"] == ["Diabetes"]
+    dcc_doc = next(
+        d for d in mock_db.dcc.docs if d["submission"] == "hubmap"
+    )
+    assert dcc_doc["dcc_abbreviation"] == "HuBMAP"
 
-        # Act
-        before = loop.time()
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
 
-        # Assert
-        assert before + 290 <= opened["deadline"] <= loop.time() + 300
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_replace_only_the_hubmap_slice(
+    mock_db, mocker
+):
+    """Test the stale clear is scoped to the submission being reloaded.
 
-    @pytest.mark.asyncio
-    async def test__sync_hubmap_should_keep_the_slice_when_the_allowlist_is_empty(
-        self, mock_db, mocker, monkeypatch
-    ):
-        """Test an empty allowlist is a no-op, not a purge.
-
-        An empty value arrives by accident routinely; draining an empty
-        stream would read as an authoritative empty result and delete the
-        whole HuBMAP slice.
-
-        Given:
-            A files collection holding a HuBMAP document and
-            HUBMAP_FILE_EXTENSIONS set to an empty value.
-        When:
-            _sync_hubmap runs.
-        Then:
-            The HuBMAP document should remain and no upstream fetch should
-            be made.
-        """
-        # Arrange
-        monkeypatch.setenv("HUBMAP_FILE_EXTENSIONS", "")
-        mock_db.files.docs.append(
-            {"submission": "hubmap", "local_id": "previous-1"}
-        )
-        fetch_datasets = mocker.patch.object(
-            hubmap_module, "fetch_dataset_metadata_bulk", mocker.AsyncMock()
-        )
-
-        # Act
-        await _sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
-
-        # Assert
-        assert mock_db.files.docs == [
-            {"submission": "hubmap", "local_id": "previous-1"}
+    Given:
+        A files collection holding a stale HuBMAP document and a 4DN
+        document, and a stream delivering one replacement file.
+    When:
+        sync_hubmap runs.
+    Then:
+        The stale HuBMAP document should be gone, the replacement
+        present, and the 4DN document untouched.
+    """
+    # Arrange
+    mock_db.files.docs.extend(
+        [
+            {"submission": "hubmap", "local_id": "stale-1"},
+            {"submission": "4dn", "local_id": "keep-1"},
         ]
-        fetch_datasets.assert_not_awaited()
+    )
+    _patch_hubmap_fetches(mocker, _async_iter([_hubmap_file_doc()]))
+
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    ids = {(d["submission"], d["local_id"]) for d in mock_db.files.docs}
+    assert ("hubmap", "stale-1") not in ids
+    assert ("hubmap", "abc123") in ids
+    assert ("4dn", "keep-1") in ids
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_keep_previous_corpus_when_fetch_dies_early(
+    mock_db, mocker
+):
+    """Test a fetch that fails before delivering rows clears nothing.
+
+    The deferred stale clear exists for exactly this shape: an upstream
+    failure before the first row would otherwise empty the slice with
+    nothing to put back.
+
+    Given:
+        A files collection holding a HuBMAP document and a file stream
+        that raises before yielding anything.
+    When:
+        sync_hubmap runs.
+    Then:
+        The error should propagate and the previous HuBMAP document
+        should still be served.
+    """
+    # Arrange
+    mock_db.files.docs.append(
+        {"submission": "hubmap", "local_id": "previous-1"}
+    )
+    _patch_hubmap_fetches(
+        mocker, _async_raise(RuntimeError("files index down"))
+    )
+
+    # Act & assert
+    with pytest.raises(RuntimeError, match="files index down"):
+        await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    assert mock_db.files.docs == [
+        {"submission": "hubmap", "local_id": "previous-1"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_ensure_materialized_files_indexes(
+    mock_db, mocker
+):
+    """Test the load ends by ensuring the files collection indexes.
+
+    HuBMAP writes straight into the materialized collection and never
+    runs the materializer, the only other creator of files indexes, so
+    skipping this leaves accession and submission lookups scanning.
+
+    Given:
+        A sync whose stream delivers one file document.
+    When:
+        sync_hubmap runs.
+    Then:
+        It should ensure the materialized files index specs once.
+    """
+    # Arrange
+    _patch_hubmap_fetches(mocker, _async_iter([_hubmap_file_doc()]))
+    ensure_mock = mocker.patch.object(
+        sync_module, "ensure_indexes", mocker.AsyncMock()
+    )
+
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    ensure_mock.assert_awaited_once()
+    specs = ensure_mock.await_args.args[1]
+    assert [spec.name for spec in specs] == [
+        spec.name for spec in materialized_files_index_specs()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_ensure_indexes_when_the_stream_fails(
+    mock_db, mocker
+):
+    """Test a failed load still leaves its slice indexed.
+
+    A stream that dies mid-load has already committed rows; leaving
+    them unindexed would make every lookup against the partial slice a
+    full scan until the next successful sync.
+
+    Given:
+        A file stream that delivers one document and then raises.
+    When:
+        sync_hubmap runs.
+    Then:
+        The failure should propagate and the materialized files indexes
+        should still be ensured.
+    """
+    # Arrange
+    _patch_hubmap_fetches(
+        mocker,
+        _async_iter_then_raise(
+            [_hubmap_file_doc()], RuntimeError("files index reset")
+        ),
+    )
+    ensure_mock = mocker.patch.object(
+        sync_module, "ensure_indexes", mocker.AsyncMock()
+    )
+
+    # Act
+    with pytest.raises(RuntimeError, match="files index reset"):
+        await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    ensure_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_prefetch_outside_the_cutover_lock(
+    mock_db, mocker
+):
+    """Test the network prefetch does not hold the read surface hostage.
+
+    The cutover lock blocks every API request, and the dataset and
+    organ prefetches touch no database state, so running them under
+    the lock would only lengthen the outage.
+
+    Given:
+        A dataset fetch that records whether the cutover lock is active
+        when it runs.
+    When:
+        sync_hubmap runs.
+    Then:
+        The fetch should not observe an active cutover lock, while the
+        file stream that follows should.
+    """
+    # Arrange
+    observed: list[bool] = []
+
+    async def lock_active() -> bool:
+        lock = await mock_db[locks.LOCKS_COLLECTION].find_one(
+            {"_id": locks.CUTOVER_LOCK_ID}
+        )
+        return bool(lock and lock.get("active"))
+
+    async def fetch_datasets(**kwargs):
+        observed.append(await lock_active())
+        return {"ds-uuid-1": {}}
+
+    async def stream_files():
+        # The control: the stream runs under the lock, so a fake that
+        # never recorded the lock would fail here instead of passing
+        # vacuously above.
+        observed.append(await lock_active())
+        yield _hubmap_file_doc()
+
+    _patch_hubmap_fetches(mocker, stream_files())
+    mocker.patch.object(
+        hubmap_module,
+        "fetch_dataset_metadata_bulk",
+        mocker.AsyncMock(side_effect=fetch_datasets),
+    )
+
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert observed == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_bound_the_file_stream_with_a_deadline(
+    mock_db, mocker, monkeypatch
+):
+    """Test the in-lock stream carries the configured budget.
+
+    The stream runs under the cutover lock, so an unbounded one could
+    outlive the sync lock's stale threshold and admit a second sync.
+
+    Given:
+        HUBMAP_SYNC_TIMEOUT_SECONDS set to 120 and a file stream that
+        records the deadline it was opened with.
+    When:
+        sync_hubmap runs.
+    Then:
+        The stream should be opened with a deadline about 120 seconds
+        ahead on the event-loop clock.
+    """
+    # Arrange
+    monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "120")
+    opened: dict = {}
+
+    def open_stream(extensions, *, deadline=None):
+        opened["deadline"] = deadline
+        return _async_iter([_hubmap_file_doc()])
+
+    _patch_hubmap_fetches(mocker, _async_iter([]))
+    mocker.patch.object(hubmap_module, "fetch_file_metadata", open_stream)
+    loop = asyncio.get_running_loop()
+
+    # Act
+    before = loop.time()
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert before + 119 <= opened["deadline"] <= loop.time() + 120
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_keep_the_slice_when_the_stream_yields_nothing(
+    mock_db, mocker
+):
+    """Test an empty upstream walk is refused rather than obeyed.
+
+    A mapping change on the index, or an allowlist matching nothing,
+    returns a well-formed empty page; obeying it would delete the
+    whole submission over what is almost certainly a fault.
+
+    Given:
+        A files collection holding a HuBMAP document and a file stream
+        that drains cleanly without yielding anything.
+    When:
+        sync_hubmap runs.
+    Then:
+        It should raise, and the HuBMAP document should still be
+        served.
+    """
+    # Arrange
+    mock_db.files.docs.append(
+        {"submission": "hubmap", "local_id": "previous-1"}
+    )
+    _patch_hubmap_fetches(mocker, _async_iter([]))
+
+    # Act
+    with pytest.raises(RuntimeError, match="yielded no rows"):
+        await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert mock_db.files.docs == [
+        {"submission": "hubmap", "local_id": "previous-1"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_refuse_an_empty_dataset_map(
+    mock_db, mocker
+):
+    """Test an empty dataset index fails the sync before anything clears.
+
+    Loading against an empty map would write every file without its
+    dataset context or donor demographics and report success.
+
+    Given:
+        A files collection holding a HuBMAP document and a dataset fetch
+        that returns no datasets.
+    When:
+        sync_hubmap runs.
+    Then:
+        It should raise naming the empty index, and the HuBMAP document
+        should still be served.
+    """
+    # Arrange
+    mock_db.files.docs.append(
+        {"submission": "hubmap", "local_id": "previous-1"}
+    )
+    _patch_hubmap_fetches(
+        mocker, _async_iter([_hubmap_file_doc()]), dataset_metadata={}
+    )
+
+    # Act
+    with pytest.raises(RuntimeError, match="no datasets"):
+        await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert mock_db.files.docs == [
+        {"submission": "hubmap", "local_id": "previous-1"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_skip_a_malformed_document(
+    mock_db, mocker
+):
+    """Test one malformed upstream document costs only that document.
+
+    Given:
+        A file stream carrying a document whose donors are bare strings,
+        followed by a well-formed document.
+    When:
+        sync_hubmap runs.
+    Then:
+        It should complete, inserting only the well-formed document.
+    """
+    # Arrange
+    malformed = _hubmap_file_doc(file_uuid="bad", donors=["donor-uuid"])
+    _patch_hubmap_fetches(
+        mocker, _async_iter([malformed, _hubmap_file_doc(file_uuid="good")])
+    )
+
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    loaded = [d["local_id"] for d in mock_db.files.docs if d["submission"] == "hubmap"]
+    assert loaded == ["good"]
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_end_its_deadline_before_the_sync_lock_goes_stale(
+    mock_db, mocker, monkeypatch
+):
+    """Test the budget is clamped to what is left of the sync lock.
+
+    The sync lock's staleness counts from the start of the whole run,
+    and HuBMAP runs last; a budget counted from HuBMAP's own start
+    could outlive the lock and admit a second, clearing sync.
+
+    Given:
+        A sync lock that started 50 minutes ago, a 1800 s HuBMAP budget,
+        and a file stream that records the deadline it was opened with.
+    When:
+        sync_hubmap runs.
+    Then:
+        The deadline should fall about 5 minutes out -- the hour, less
+        the 50 minutes spent and a 5 minute margin -- not 30.
+    """
+    # Arrange
+    monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "1800")
+    await mock_db[locks.LOCKS_COLLECTION].update_one(
+        {"_id": locks.SYNC_LOCK_ID},
+        {
+            "$set": {
+                "active": True,
+                "started_at": datetime.utcnow() - timedelta(minutes=50),
+            }
+        },
+        upsert=True,
+    )
+    opened: dict = {}
+
+    def open_stream(extensions, *, deadline=None):
+        opened["deadline"] = deadline
+        return _async_iter([_hubmap_file_doc()])
+
+    _patch_hubmap_fetches(mocker, _async_iter([]))
+    mocker.patch.object(hubmap_module, "fetch_file_metadata", open_stream)
+    loop = asyncio.get_running_loop()
+
+    # Act
+    before = loop.time()
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert before + 290 <= opened["deadline"] <= loop.time() + 300
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_keep_the_slice_when_the_allowlist_is_empty(
+    mock_db, mocker, monkeypatch
+):
+    """Test an empty allowlist is a no-op, not a purge.
+
+    An empty value arrives by accident routinely; draining an empty
+    stream would read as an authoritative empty result and delete the
+    whole HuBMAP slice.
+
+    Given:
+        A files collection holding a HuBMAP document and
+        HUBMAP_FILE_EXTENSIONS set to an empty value.
+    When:
+        sync_hubmap runs.
+    Then:
+        The HuBMAP document should remain and no upstream fetch should
+        be made.
+    """
+    # Arrange
+    monkeypatch.setenv("HUBMAP_FILE_EXTENSIONS", "")
+    mock_db.files.docs.append(
+        {"submission": "hubmap", "local_id": "previous-1"}
+    )
+    fetch_datasets = mocker.patch.object(
+        hubmap_module, "fetch_dataset_metadata_bulk", mocker.AsyncMock()
+    )
+
+    # Act
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert mock_db.files.docs == [
+        {"submission": "hubmap", "local_id": "previous-1"}
+    ]
+    fetch_datasets.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -154,7 +154,7 @@ async def _sync_dccs(task: SyncTask) -> None:
             if dcc_type == "rest_api" and dcc == "encode":
                 await _sync_encode(task)
             elif dcc_type == "rest_api" and dcc == "hubmap":
-                await _sync_hubmap(task)
+                await sync_hubmap(task)
             else:
                 await _sync_c2m2_zip(task, data_path, downloads_path)
         except Exception as exc:
@@ -1056,7 +1056,7 @@ async def _stale_safe_deadline(budget_seconds: int) -> float:
     return deadline
 
 
-async def _sync_hubmap(task: SyncTask) -> None:
+async def sync_hubmap(task: SyncTask) -> None:
     """
     Sync HuBMAP data from the files search API.
 
