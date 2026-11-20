@@ -215,7 +215,7 @@ async def stream_file(
                 )
                 logger.info(f"Streaming HTTPS file: {drs_object.name}")
 
-                return stream_upstream_url(
+                return await stream_upstream_url(
                     download_url,
                     drs_object.size,
                     drs_object.name or "file",
@@ -361,7 +361,7 @@ async def _stream_direct_url(
         media_type = "text/plain"
 
     try:
-        return stream_upstream_url(
+        return await stream_upstream_url(
             download_url,
             file_size,
             filename,

@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse
 from wool.runtime.routine.task import do_dispatch
 
 from cfdb import api
-from cfdb.api.routers import data as data_module
 from cfdb.api.routers.data import stream_file, stream_file_status
 from cfdb.services import drs, locks
 from cfdb.services.ontology_mappings import get_file_format
@@ -58,6 +57,23 @@ def _make_file_doc(*, access_level: str = "public") -> dict:
     }
 
 
+def _fake_upstream(chunks=(), error=None):
+    """Stand in for ``drs.stream_from_url`` at the network boundary.
+
+    Yields ``chunks``, or raises ``error`` before the first byte -- which
+    is where the real stream raises an upstream 403/404/5xx, after
+    following redirects and reading the status.
+    """
+
+    async def stream(url, range_header=None):
+        if error is not None:
+            raise error
+        for chunk in chunks:
+            yield chunk
+
+    return stream
+
+
 class TestStreamFile:
     @pytest.mark.asyncio
     async def test_non_public_file_returns_403(self, mock_db, mocker):
@@ -69,7 +85,7 @@ class TestStreamFile:
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
 
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [_make_file_doc(access_level="consortium")]
+        mock_db.files.docs = [_make_file_doc(access_level="consortium")]
 
         with pytest.raises(HTTPException) as exc_info:
             await stream_file("hubmap", "file-1", _make_request(), range=None)
@@ -87,31 +103,34 @@ class TestStreamFile:
         routing HuBMAP through DRS resolution answered 400 for every file.
 
         Given:
-            A public HuBMAP h5ad document carrying an assets access_url and
-            no workflow subsystem.
+            A public HuBMAP h5ad document carrying an assets access_url, no
+            workflow subsystem, and an upstream serving two chunks.
         When:
-            stream_file is called for it.
+            stream_file is called for it and the body is read.
         Then:
-            It should stream the assets URL directly and never consult DRS.
+            It should answer 200 with the upstream bytes fetched from the
+            assets URL, and never consult DRS.
         """
         # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
         mocker.patch.object(api, "processor_registry", None)
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [_make_file_doc()]
+        mock_db.files.docs = [_make_file_doc()]
         fetch_drs = mocker.patch.object(drs, "fetch_drs_object")
-        stream = mocker.patch.object(
-            data_module, "stream_upstream_url", return_value="streamed"
+        upstream = mocker.patch.object(
+            drs, "stream_from_url", side_effect=_fake_upstream([b"ab", b"cd"])
         )
 
         # Act
         response = await stream_file(
             "hubmap", "file-1", _make_request(), range=None
         )
+        body = b"".join([chunk async for chunk in response.body_iterator])
 
         # Assert
-        assert response == "streamed"
-        assert stream.call_args.args[0] == HUBMAP_ASSETS_URL
+        assert response.status_code == 200
+        assert body == b"abcd"
+        assert upstream.call_args.args[0] == HUBMAP_ASSETS_URL
         fetch_drs.assert_not_called()
 
     @pytest.mark.asyncio
@@ -124,7 +143,7 @@ class TestStreamFile:
             A public HuBMAP BED document carrying an assets access_url, a
             registered processor for it, and raw=True.
         When:
-            stream_file is called for it.
+            stream_file is called for it and the body is read.
         Then:
             It should skip the workflow and stream the assets URL directly.
         """
@@ -140,21 +159,66 @@ class TestStreamFile:
             md5=FIXTURE_MD5,
         )
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [doc]
+        mock_db.files.docs = [doc]
         fetch_drs = mocker.patch.object(drs, "fetch_drs_object")
-        stream = mocker.patch.object(
-            data_module, "stream_upstream_url", return_value="streamed"
+        upstream = mocker.patch.object(
+            drs, "stream_from_url", side_effect=_fake_upstream([b"chr1\t1\t2\n"])
         )
 
         # Act
         response = await stream_file(
             "hubmap", "file-1", _make_request(), range=None, raw=True
         )
+        body = b"".join([chunk async for chunk in response.body_iterator])
 
         # Assert
-        assert response == "streamed"
-        assert stream.call_args.args[0] == bed_url
+        assert body == b"chr1\t1\t2\n"
+        assert upstream.call_args.args[0] == bed_url
         fetch_drs.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("upstream_error", "expected_status"),
+        [
+            (drs.DRSForbidden("upstream 403"), 403),
+            (drs.DRSNotFound("upstream 404"), 404),
+            (drs.DRSUpstreamError("upstream 500"), 502),
+            (drs.DRSTimeout("upstream timed out"), 504),
+        ],
+    )
+    async def test_stream_file_should_raise_the_upstream_status_before_streaming(
+        self, mock_db, mocker, upstream_error, expected_status
+    ):
+        """Test an upstream refusal becomes its status, not a cut-off 200.
+
+        Starlette sends the status line before it iterates a streaming
+        body, so an upstream error discovered inside the body could only
+        ever reach the client as a truncated download.
+
+        Given:
+            A public HuBMAP document whose assets URL answers with an
+            upstream error before its first byte.
+        When:
+            stream_file is called for it.
+        Then:
+            It should raise the mapped HTTP status instead of returning a
+            response.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", None)
+        mock_db.dcc.docs = [_make_dcc_doc()]
+        mock_db.files.docs = [_make_file_doc()]
+        mocker.patch.object(
+            drs, "stream_from_url", side_effect=_fake_upstream(error=upstream_error)
+        )
+
+        # Act
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_file("hubmap", "file-1", _make_request(), range=None)
+
+        # Assert
+        assert exc_info.value.status_code == expected_status
 
     @pytest.mark.asyncio
     async def test_stream_file_should_raise_502_when_direct_url_disallowed(
@@ -172,7 +236,7 @@ class TestStreamFile:
         When:
             stream_file is called for it.
         Then:
-            It should raise a 502 without streaming anything.
+            It should raise a 502 without opening an upstream request.
         """
         # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
@@ -180,8 +244,8 @@ class TestStreamFile:
         doc = _make_file_doc()
         doc["access_url"] = "https://attacker.example/secondary_analysis.h5ad"
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [doc]
-        stream = mocker.patch.object(data_module, "stream_upstream_url")
+        mock_db.files.docs = [doc]
+        upstream = mocker.patch.object(drs, "stream_from_url")
 
         # Act
         with pytest.raises(HTTPException) as exc_info:
@@ -189,7 +253,7 @@ class TestStreamFile:
 
         # Assert
         assert exc_info.value.status_code == 502
-        stream.assert_not_called()
+        upstream.assert_not_called()
 
 
 class TestStreamFileWorkflowPath:
@@ -616,7 +680,7 @@ class TestStreamFileWorkflowPath:
         mocker.patch.object(api, "executor", object())
 
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [_make_file_doc(access_level="protected")]
+        mock_db.files.docs = [_make_file_doc(access_level="protected")]
 
         # Act & assert
         with pytest.raises(HTTPException) as exc_info:
@@ -843,7 +907,7 @@ class TestStreamFileStatus:
         # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [_make_file_doc(access_level="consortium")]
+        mock_db.files.docs = [_make_file_doc(access_level="consortium")]
 
         # Act & assert
         with pytest.raises(HTTPException) as exc_info:
@@ -1192,6 +1256,7 @@ class TestStreamFileMetadataReduction:
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
         mocker.patch.object(api, "processor_registry", None)
         mock_db.file.docs = [_make_encode_file_doc()]
+        mocker.patch.object(drs, "stream_from_url", _fake_upstream([b"x"]))
 
         # Act
         with caplog.at_level(logging.INFO, logger="cfdb.api.routers.data"):
@@ -1223,7 +1288,7 @@ class TestStreamFileMetadataReduction:
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
         mocker.patch.object(api, "processor_registry", None)
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [_make_file_doc(access_level="consortium")]
+        mock_db.files.docs = [_make_file_doc(access_level="consortium")]
 
         # Act
         with (
@@ -1310,6 +1375,7 @@ class TestStreamFileMetadataReduction:
         else:
             doc["filename"] = filename
         mock_db.file.docs = [doc]
+        mocker.patch.object(drs, "stream_from_url", _fake_upstream([b"x"]))
 
         # Act
         response = await stream_file(

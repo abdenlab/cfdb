@@ -372,7 +372,7 @@ async def _try_serve_fourdn_sidecar(
 
     logger.info(f"Streaming 4DN sidecar: {filename} from {download_url}")
 
-    return stream_upstream_url(
+    return await stream_upstream_url(
         download_url, file_size, filename, request, range_header
     )
 
