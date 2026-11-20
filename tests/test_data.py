@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from wool.runtime.routine.task import do_dispatch
 
 from cfdb import api
+from cfdb.api.routers import data as data_module
 from cfdb.api.routers.data import stream_file, stream_file_status
 from cfdb.services import drs, locks
 from cfdb.services.ontology_mappings import get_file_format
@@ -33,16 +34,25 @@ def _make_request(method: str = "GET"):
 def _make_dcc_doc() -> dict:
     return {
         "dcc_abbreviation": "HuBMAP",
-        "project_id_namespace": "tag:hubmapconsortium.org,2023:",
+        "project_id_namespace": "https://hubmapconsortium.org",
     }
 
 
+#: The assets URL the files-index loader writes for ``_make_file_doc``.
+HUBMAP_ASSETS_URL = (
+    "https://assets.hubmapconsortium.org/ds-uuid-1/"
+    "processed/secondary_analysis.h5ad"
+)
+
+
 def _make_file_doc(*, access_level: str = "public") -> dict:
+    """Build a HuBMAP file document in the shape the files-index loader writes."""
     return {
-        "id_namespace": "tag:hubmapconsortium.org,2023:",
+        "id_namespace": "https://hubmapconsortium.org",
         "local_id": "file-1",
-        "filename": "data.bam",
-        "access_url": "drs://drs.hubmapconsortium.org/abc",
+        "filename": "secondary_analysis.h5ad",
+        "size_in_bytes": 5529765,
+        "access_url": HUBMAP_ASSETS_URL,
         "data_access_level": access_level,
         "submission": "hubmap",
     }
@@ -68,27 +78,118 @@ class TestStreamFile:
         assert "consortium" in exc_info.value.detail
 
     @pytest.mark.asyncio
-    async def test_public_file_proceeds_past_access_check(self, mock_db, mocker):
+    async def test_stream_file_should_stream_a_hubmap_assets_url_directly(
+        self, mock_db, mocker
+    ):
+        """Test a public HuBMAP file streams from its assets URL.
+
+        The loader stores an https assets URL rather than a drs:// URI, so
+        routing HuBMAP through DRS resolution answered 400 for every file.
+
+        Given:
+            A public HuBMAP h5ad document carrying an assets access_url and
+            no workflow subsystem.
+        When:
+            stream_file is called for it.
+        Then:
+            It should stream the assets URL directly and never consult DRS.
         """
-        GIVEN a public HuBMAP file in the database
-        WHEN stream_file is called
-        THEN the access check passes (no 403) and execution continues to DRS
-        """
+        # Arrange
         mocker.patch.object(locks, "wait_for_cutover", return_value=None)
-
+        mocker.patch.object(api, "processor_registry", None)
         mock_db.dcc.docs = [_make_dcc_doc()]
-        mock_db.file.docs = [_make_file_doc(access_level="public")]
-
-        # Let it fail at DRS resolution (proves it passed the access check)
-        mocker.patch.object(
-            drs, "fetch_drs_object", side_effect=Exception("DRS unavailable")
+        mock_db.file.docs = [_make_file_doc()]
+        fetch_drs = mocker.patch.object(drs, "fetch_drs_object")
+        stream = mocker.patch.object(
+            data_module, "stream_upstream_url", return_value="streamed"
         )
 
+        # Act
+        response = await stream_file(
+            "hubmap", "file-1", _make_request(), range=None
+        )
+
+        # Assert
+        assert response == "streamed"
+        assert stream.call_args.args[0] == HUBMAP_ASSETS_URL
+        fetch_drs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_file_should_stream_a_hubmap_assets_url_when_raw(
+        self, mock_db, mocker
+    ):
+        """Test a raw request for a processable HuBMAP file streams upstream.
+
+        Given:
+            A public HuBMAP BED document carrying an assets access_url, a
+            registered processor for it, and raw=True.
+        When:
+            stream_file is called for it.
+        Then:
+            It should skip the workflow and stream the assets URL directly.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", default_registry())
+        bed_url = "https://assets.hubmapconsortium.org/ds-uuid-1/peaks.bed"
+        doc = _make_file_doc()
+        doc.update(
+            filename="peaks.bed",
+            access_url=bed_url,
+            file_format=get_file_format("bed"),
+            md5=FIXTURE_MD5,
+        )
+        mock_db.dcc.docs = [_make_dcc_doc()]
+        mock_db.file.docs = [doc]
+        fetch_drs = mocker.patch.object(drs, "fetch_drs_object")
+        stream = mocker.patch.object(
+            data_module, "stream_upstream_url", return_value="streamed"
+        )
+
+        # Act
+        response = await stream_file(
+            "hubmap", "file-1", _make_request(), range=None, raw=True
+        )
+
+        # Assert
+        assert response == "streamed"
+        assert stream.call_args.args[0] == bed_url
+        fetch_drs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_file_should_raise_502_when_direct_url_disallowed(
+        self, mock_db, mocker
+    ):
+        """Test a direct URL outside the allowlist is refused up front.
+
+        The URL comes from the database, so it is untrusted; refusing it
+        before the response starts gives a clean status rather than a
+        stream that fails after its headers were sent.
+
+        Given:
+            A public HuBMAP document whose access_url names a host outside
+            the outbound allowlist.
+        When:
+            stream_file is called for it.
+        Then:
+            It should raise a 502 without streaming anything.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+        mocker.patch.object(api, "processor_registry", None)
+        doc = _make_file_doc()
+        doc["access_url"] = "https://attacker.example/secondary_analysis.h5ad"
+        mock_db.dcc.docs = [_make_dcc_doc()]
+        mock_db.file.docs = [doc]
+        stream = mocker.patch.object(data_module, "stream_upstream_url")
+
+        # Act
         with pytest.raises(HTTPException) as exc_info:
             await stream_file("hubmap", "file-1", _make_request(), range=None)
 
-        # Should fail at DRS, not at access control
-        assert exc_info.value.status_code != 403
+        # Assert
+        assert exc_info.value.status_code == 502
+        stream.assert_not_called()
 
 
 class TestStreamFileWorkflowPath:
