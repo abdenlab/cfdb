@@ -492,7 +492,11 @@ LEFT JOIN file_extra_hubmap AS xh
 
 -- The file x collection x biosample x subject grain -- "which files came from
 -- heart tissue". Explicitly a fan-out view: a file row repeats once per
--- biosample/subject path, so never SUM(size_in_bytes) over it.
+-- biosample/subject path, so never SUM(size_in_bytes) over it. Biosample-
+-- grained by design: a collection with no biosamples (all of HuBMAP, whose
+-- anatomy and donors hang off the collection) yields file x collection rows
+-- with NULL anatomy and subject; collection_anatomy and
+-- subject_in_collection carry those.
 CREATE VIEW v_file_biosample AS
 SELECT
     f.submission,

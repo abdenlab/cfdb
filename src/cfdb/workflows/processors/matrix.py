@@ -220,9 +220,9 @@ class MatrixTilesetProcessor(Processor):
             return
         size = file_meta.get("size_in_bytes")
         if isinstance(size, str):
-            # 4DN and HuBMAP load size_in_bytes as a string through the
-            # C2M2 TSV path (the README's BigInt note), and 4DN is the
-            # only DCC whose contact maps reach this processor — an
+            # 4DN loads size_in_bytes as a string through the C2M2 TSV
+            # path (the README's BigInt note), and 4DN is the only DCC
+            # whose contact maps reach this processor — an
             # int-only check leaves the cap inert for exactly the corpus
             # it exists to bound.
             try:

@@ -97,7 +97,7 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 | `make api-tiles` | Build and start the API container **with matrix tile serving enabled**, on a cache volume shared with the worker (local dev; see [Serving tiles locally](#serving-tiles-locally)) |
 | `make worker-tiles` | Start a containerized LAN worker pool on that same cache volume |
 | `make materialize-files` | Manually materialize all file metadata (usually done via sync) |
-| `make materialize-dcc DCC=hubmap` | Materialize a single DCC |
+| `make materialize-dcc DCC=4dn` | Materialize a single DCC. Only C2M2 DCCs (4DN) are materialized: ENCODE and HuBMAP write the `files` collection directly from their APIs and have no raw tables to rebuild from, so materializing either deletes its documents and writes none back |
 | `make schema` | Regenerate the checked-in `schema.graphql` from the Strawberry schema |
 | `make certs` | Generate TLS certificates for production |
 | `make mongodb-prod` | Start MongoDB with TLS/X.509 authentication |
@@ -579,7 +579,7 @@ Anatomy, FileFormat, DataType, and AssayType share an identical schema: `id` (st
 | AssayType | OBI (Ontology for Biomedical Investigations) |
 | NcbiTaxonomy | NCBI Taxonomy Database |
 
-Every `id` above resolves in its source ontology except the minted `FileFormat` tokens. EDAM has no term for a few formats cfdb ingests — `bedpe` and `bigInteract` at present — and aliasing them onto the nearest EDAM term would make each indistinguishable from the format it was aliased to, so a `cfdb:` token is minted instead. A client resolving `file_format.id` against EDAM should skip ids carrying that prefix rather than treat them as resolvable.
+Every `id` above resolves in its source ontology except the minted `FileFormat` tokens. EDAM has no term for a few formats cfdb ingests — `bedpe`, `bigInteract`, `arrow` and `parquet` at present — and aliasing them onto the nearest EDAM term would make each indistinguishable from the format it was aliased to, so a `cfdb:` token is minted instead. A client resolving `file_format.id` against EDAM should skip ids carrying that prefix rather than treat them as resolvable.
 
 #### Subject
 
@@ -1179,7 +1179,7 @@ Trigger a sync of C2M2 datapackages from DCCs. Requires API key authentication.
 
 - **Single sync at a time** - Concurrent requests return `409 Conflict`
 - **Background execution** - Returns immediately with `202 Accepted` while sync runs in the background
-- **Materialization** - After loading each DCC's data, the Rust materializer creates the denormalized `files` collection with all joins pre-computed
+- **Materialization** - After loading a C2M2 DCC's data (4DN), the Rust materializer creates the denormalized `files` collection with all joins pre-computed; ENCODE and HuBMAP build their `files` documents directly from their APIs, already denormalized
 - **Database cutover** - During the clear/load phase, API requests are briefly blocked to ensure data consistency
 
 **Headers:**
@@ -1261,7 +1261,7 @@ cfdb dump duckdb cfdb.duckdb -s 4dn -s encode --to-parquet ./parquet
 - `--to-parquet` - Also `EXPORT DATABASE` every table as Parquet into this directory
 - `--force` - Overwrite the output file if it exists
 
-**Schema.** The schema of record is [`src/cfdb/dump/schema.sql`](src/cfdb/dump/schema.sql) — a checked-in artifact in the same spirit as `schema.graphql`, versioned by its `schema_version` header and designed in [#123](https://github.com/abdenlab/cfdb/issues/123). The tables mirror C2M2 where C2M2 has a table (`file`, `collection`, `biosample`, `subject`, and the six junctions, all keyed by natural `(id_namespace, local_id)` composites, with `submission` as a non-key column on every entity); enrichment with a cross-consortium slot lives in promoted common columns (`genome_assembly`, `output_type`, `experiment_type`, `analyte_class`, …); the per-consortium residue lives in 1:1 `*_extra_*` extension tables, which omit verbatim-promoted fields but keep any field whose promotion is derived rather than verbatim (`replicate_info` survives because the replicate columns are regex-extracted from it). Three views carry the joins analysts would otherwise retype: `v_file` (one row per file with term names and extension columns inlined), `v_file_biosample` (the file × collection × biosample × subject fan-out grain), and `v_subject_demographics` (sex/race/age coalesced across the C2M2 columns and HuBMAP's enrichment, with a `*_source` column per value so provenance survives the coalesce).
+**Schema.** The schema of record is [`src/cfdb/dump/schema.sql`](src/cfdb/dump/schema.sql) — a checked-in artifact in the same spirit as `schema.graphql`, versioned by its `schema_version` header and designed in [#123](https://github.com/abdenlab/cfdb/issues/123). The tables mirror C2M2 where C2M2 has a table (`file`, `collection`, `biosample`, `subject`, and the six junctions, all keyed by natural `(id_namespace, local_id)` composites, with `submission` as a non-key column on every entity); enrichment with a cross-consortium slot lives in promoted common columns (`genome_assembly`, `output_type`, `experiment_type`, `analyte_class`, …); the per-consortium residue lives in 1:1 `*_extra_*` extension tables, which omit verbatim-promoted fields but keep any field whose promotion is derived rather than verbatim (`replicate_info` survives because the replicate columns are regex-extracted from it). Three views carry the joins analysts would otherwise retype: `v_file` (one row per file with term names and extension columns inlined), `v_file_biosample` (the file × collection × biosample × subject fan-out grain; a collection with no biosamples — all of HuBMAP, which attaches anatomy and donors to the collection — contributes file × collection rows with NULL anatomy and subject, so read those from `collection_anatomy` and `subject_in_collection`), and `v_subject_demographics` (sex/race/age coalesced across the C2M2 columns and HuBMAP's enrichment, with a `*_source` column per value so provenance survives the coalesce).
 
 **Common-column mapping.** Each promoted column and the upstream field that fills it, per consortium. A column populated by one consortium today is still a common column, not a 4DN or ENCODE column: it names a slot any consortium could fill, which is what makes the next DCC's ingest a mapping exercise rather than a schema change.
 
