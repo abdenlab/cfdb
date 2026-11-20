@@ -148,6 +148,9 @@ async def _sync_dccs(task: SyncTask) -> None:
     for dcc in task.dcc_names:
         task.current_dcc = dcc
         dcc_type = get_dcc_type(dcc)
+        # Each DCC starts the sync lock's stale clock afresh, so a loader
+        # late in a long run is not starved of the hour by the ones before.
+        await locks.heartbeat_sync_lock(task.id)
 
         try:
             # Branch on DCC type
@@ -1036,21 +1039,19 @@ async def _stale_safe_deadline(budget_seconds: int) -> float:
     """Event-loop deadline for a sync's network work, clamped to the lock.
 
     ``budget_seconds`` from now, or the moment the sync lock would turn
-    stale less ``_STALE_MARGIN``, whichever comes first. The sync lock's
-    staleness is measured from its ``started_at``, set once for the whole
-    multi-DCC run, and DCCs run in sorted order -- so a loader late in a
-    long run can start with little of the hour left, and a budget counted
-    from its own start would let it outlive the lock and admit a second,
-    clearing sync. Clamping fails that loader's fetch instead, which its
-    deferred clear survives. With no sync lock held (a direct call), only
-    the budget applies.
+    stale less ``_STALE_MARGIN``, whichever comes first. Staleness counts
+    from the lock's last heartbeat, which ``_sync_dccs`` refreshes as each
+    DCC starts, so the clamp normally leaves the whole budget; it binds only
+    when the budget itself would outlive the lock, or when no heartbeat has
+    been recorded since a long run began. With no sync lock held (a direct
+    call), only the budget applies.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget_seconds
     lock = await locks.get_current_sync_task()
-    started_at = (lock or {}).get("started_at")
-    if isinstance(started_at, datetime):
-        stale_at = started_at + locks.STALE_LOCK_THRESHOLD - _STALE_MARGIN
+    alive_at = locks.sync_lock_alive_at(lock) if lock else None
+    if isinstance(alive_at, datetime):
+        stale_at = alive_at + locks.STALE_LOCK_THRESHOLD - _STALE_MARGIN
         remaining = (stale_at - datetime.utcnow()).total_seconds()
         deadline = min(deadline, loop.time() + remaining)
     return deadline

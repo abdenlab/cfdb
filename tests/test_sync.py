@@ -33,6 +33,7 @@ from cfdb.services.sync import (
     _stamp_4dn_file_accessions,
     _sync_dccs,
     _sync_encode,
+    start_sync,
     sync_hubmap,
 )
 from cfdb.indexes import data_index_specs, materialized_files_index_specs
@@ -389,6 +390,50 @@ class TestSyncDccsFailureIsolation:
             await _sync_dccs(task)
 
         hubmap_sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_sync_should_heartbeat_the_sync_lock_as_each_dcc_starts(
+    mock_db, mocker
+):
+    """Test each DCC restarts the sync lock's stale clock.
+
+    Staleness counts from the last heartbeat, so a loader late in a long
+    run keeps the whole hour rather than what the earlier ones left.
+
+    Given:
+        A sync started for HuBMAP whose lock heartbeat is rewound an hour
+        before the run begins, and a HuBMAP loader that records the lock's
+        heartbeat when it is called.
+    When:
+        The sync runs to completion.
+    Then:
+        The loader should see a heartbeat refreshed after the rewind.
+    """
+    # Arrange
+    seen: dict = {}
+
+    async def record_heartbeat(task):
+        lock = await mock_db[locks.LOCKS_COLLECTION].find_one(
+            {"_id": locks.SYNC_LOCK_ID}
+        )
+        seen["heartbeat_at"] = lock["heartbeat_at"]
+
+    mocker.patch.object(
+        sync_module, "sync_hubmap", mocker.AsyncMock(side_effect=record_heartbeat)
+    )
+    rewound = datetime.utcnow() - timedelta(hours=1)
+
+    # Act
+    task = await start_sync("t-heartbeat", ["hubmap"])
+    await mock_db[locks.LOCKS_COLLECTION].update_one(
+        {"_id": locks.SYNC_LOCK_ID}, {"$set": {"heartbeat_at": rewound}}
+    )
+    while task.completed_at is None:
+        await asyncio.sleep(0)
+
+    # Assert
+    assert seen["heartbeat_at"] > rewound + timedelta(minutes=59)
 
 
 # ---------------------------------------------------------------------------
@@ -857,45 +902,50 @@ async def test_sync_hubmap_should_skip_a_malformed_document(
     assert loaded == ["good"]
 
 
+async def _seed_sync_lock(mock_db, *, started_ago, heartbeat_ago=None):
+    """Write an active sync lock started (and optionally heartbeated) so long ago."""
+    fields = {"active": True, "started_at": datetime.utcnow() - started_ago}
+    if heartbeat_ago is not None:
+        fields["heartbeat_at"] = datetime.utcnow() - heartbeat_ago
+    await mock_db[locks.LOCKS_COLLECTION].update_one(
+        {"_id": locks.SYNC_LOCK_ID}, {"$set": fields}, upsert=True
+    )
+
+
+def _recording_stream(opened: dict):
+    """A fetch_file_metadata stand-in recording the deadline it was opened with."""
+
+    def open_stream(extensions, *, deadline=None):
+        opened["deadline"] = deadline
+        return _async_iter([_hubmap_file_doc()])
+
+    return open_stream
+
+
 @pytest.mark.asyncio
 async def test_sync_hubmap_should_end_its_deadline_before_the_sync_lock_goes_stale(
     mock_db, mocker, monkeypatch
 ):
     """Test the budget is clamped to what is left of the sync lock.
 
-    The sync lock's staleness counts from the start of the whole run,
-    and HuBMAP runs last; a budget counted from HuBMAP's own start
-    could outlive the lock and admit a second, clearing sync.
+    A budget that would outlive the sync lock would let a second,
+    clearing sync be admitted while this one is still writing.
 
     Given:
-        A sync lock that started 50 minutes ago, a 1800 s HuBMAP budget,
-        and a file stream that records the deadline it was opened with.
+        A sync lock last alive 40 minutes ago, a 1800 s HuBMAP budget, and
+        a file stream that records the deadline it was opened with.
     When:
         sync_hubmap runs.
     Then:
-        The deadline should fall about 5 minutes out -- the hour, less
-        the 50 minutes spent and a 5 minute margin -- not 30.
+        The deadline should fall about 15 minutes out -- the hour, less the
+        40 minutes spent and a 5 minute margin -- not 30.
     """
     # Arrange
     monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "1800")
-    await mock_db[locks.LOCKS_COLLECTION].update_one(
-        {"_id": locks.SYNC_LOCK_ID},
-        {
-            "$set": {
-                "active": True,
-                "started_at": datetime.utcnow() - timedelta(minutes=50),
-            }
-        },
-        upsert=True,
-    )
+    await _seed_sync_lock(mock_db, started_ago=timedelta(minutes=40))
     opened: dict = {}
-
-    def open_stream(extensions, *, deadline=None):
-        opened["deadline"] = deadline
-        return _async_iter([_hubmap_file_doc()])
-
     _patch_hubmap_fetches(mocker, _async_iter([]))
-    mocker.patch.object(hubmap_module, "fetch_file_metadata", open_stream)
+    mocker.patch.object(hubmap_module, "fetch_file_metadata", _recording_stream(opened))
     loop = asyncio.get_running_loop()
 
     # Act
@@ -903,7 +953,42 @@ async def test_sync_hubmap_should_end_its_deadline_before_the_sync_lock_goes_sta
     await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
 
     # Assert
-    assert before + 290 <= opened["deadline"] <= loop.time() + 300
+    assert before + 890 <= opened["deadline"] <= loop.time() + 900
+
+
+@pytest.mark.asyncio
+async def test_sync_hubmap_should_count_the_lock_clock_from_its_heartbeat(
+    mock_db, mocker, monkeypatch
+):
+    """Test a recent heartbeat gives HuBMAP its whole budget.
+
+    The sync lock's stale clock restarts at each DCC's heartbeat, so a
+    loader late in a long run is not starved by the ones before it.
+
+    Given:
+        A sync lock started 58 minutes ago but heartbeated just now, and a
+        1800 s HuBMAP budget.
+    When:
+        sync_hubmap runs.
+    Then:
+        The file stream should be opened with the full 1800 s deadline.
+    """
+    # Arrange
+    monkeypatch.setenv("HUBMAP_SYNC_TIMEOUT_SECONDS", "1800")
+    await _seed_sync_lock(
+        mock_db, started_ago=timedelta(minutes=58), heartbeat_ago=timedelta(0)
+    )
+    opened: dict = {}
+    _patch_hubmap_fetches(mocker, _async_iter([]))
+    mocker.patch.object(hubmap_module, "fetch_file_metadata", _recording_stream(opened))
+    loop = asyncio.get_running_loop()
+
+    # Act
+    before = loop.time()
+    await sync_hubmap(SyncTask(id="t1", dcc_names=["hubmap"]))
+
+    # Assert
+    assert before + 1790 <= opened["deadline"] <= loop.time() + 1800
 
 
 @pytest.mark.asyncio
