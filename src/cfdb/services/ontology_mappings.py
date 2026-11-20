@@ -313,13 +313,13 @@ HUBMAP_ORGAN_TO_UBERON = {
     "LU": {"id": "UBERON:0001223", "name": "left ureter"},
     "LV": {"id": "UBERON:0002107", "name": "liver"},
     "LY": {"id": "UBERON:0000029", "name": "lymph node"},
-    "MB": {"id": "UBERON:2001553", "name": "manubrium"},
+    "MB": {"id": "UBERON:0002205", "name": "manubrium of sternum"},  # Manubrium: UBKG gives UBERON:2001553, a teleost term
     "MH": {"id": "UBERON:0000165", "name": "mouth"},
     "ML": {"id": "UBERON:0001911", "name": "mammary gland"},  # Mammary Gland (Left): side-neutral parent; UBKG gives FMA here
     "MR": {"id": "UBERON:0001911", "name": "mammary gland"},  # Mammary Gland (Right): side-neutral parent; UBKG gives FMA here
     "PA": {"id": "UBERON:0001264", "name": "pancreas"},
     "PL": {"id": "UBERON:0001987", "name": "placenta"},
-    "PR": {"id": "UBERON:0000079", "name": "male reproductive system"},  # Prostate: UBKG's mapping, kept verbatim
+    "PR": {"id": "UBERON:0002367", "name": "prostate gland"},  # Prostate: UBKG gives UBERON:0000079, the whole male reproductive system
     "PV": {"id": "UBERON:0001270", "name": "bony pelvis"},
     "RB": {"id": "UBERON:0002177", "name": "right main bronchus"},
     "RE": {"id": "UBERON:0004549", "name": "right eye"},

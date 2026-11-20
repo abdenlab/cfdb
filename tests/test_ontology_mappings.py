@@ -495,3 +495,32 @@ def test_hubmap_organ_to_uberon_should_map_fma_only_lateral_organs_to_their_pare
 
     # Assert
     assert ids == {parent}
+
+
+@pytest.mark.parametrize(
+    ("code", "uberon_id", "name"),
+    [
+        ("MB", "UBERON:0002205", "manubrium of sternum"),
+        ("PR", "UBERON:0002367", "prostate gland"),
+    ],
+)
+def test_hubmap_organ_to_uberon_should_correct_ubkg_where_its_term_is_wrong(
+    code, uberon_id, name
+):
+    """Test the codes whose UBKG term names the wrong anatomy are corrected.
+
+    UBKG maps the manubrium to a teleost term and the prostate to the whole
+    male reproductive system; the table holds the human organ instead.
+
+    Given:
+        An organ code whose UBKG entry names the wrong UBERON term.
+    When:
+        The code is looked up in the table.
+    Then:
+        It should map to the human organ's UBERON id and label.
+    """
+    # Act
+    term = HUBMAP_ORGAN_TO_UBERON[code]
+
+    # Assert
+    assert term == {"id": uberon_id, "name": name}
