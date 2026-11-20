@@ -38,6 +38,7 @@ FILE_FORMAT_TO_EDAM = {
     "bed broadpeak": {"id": "format:3614", "name": "BroadPeak"},
     # Variant formats
     "vcf": {"id": "format:3016", "name": "VCF"},
+    "bcf": {"id": "format:3020", "name": "BCF"},
     # Annotation formats
     "gtf": {"id": "format:2306", "name": "GTF"},
     "gff": {"id": "format:1975", "name": "GFF"},
@@ -85,6 +86,17 @@ FILE_FORMAT_TO_EDAM = {
     "csfasta": {"id": "format:1929", "name": "FASTA"},  # color-space FASTA (SOLiD)
     "csqual": {"id": "format:2330", "name": "Plain text"},  # color-space quality scores
     "h5ad": {"id": "format:3590", "name": "HDF5"},  # AnnData HDF5 format
+    "h5mu": {"id": "format:3590", "name": "HDF5"},  # MuData HDF5 format
+    "h5": {"id": "format:3590", "name": "HDF5"},
+    "snap": {"id": "format:3590", "name": "HDF5"},  # SnapATAC cell matrix, HDF5-based
+    "mtx": {"id": "format:3916", "name": "MTX"},  # Matrix Market exchange
+    "sf": {"id": "format:3475", "name": "TSV"},  # salmon quant.sf, tab-separated
+    # EDAM has neither an Arrow nor a Parquet term (OLS4 returns nothing for
+    # either), and aliasing columnar binaries onto a text or HDF5 term would
+    # misdescribe them to every consumer that trusts the id, so the tokens
+    # are minted — same reasoning as "bedpe" above.
+    "arrow": {"id": f"{MINTED_FORMAT_PREFIX}arrow", "name": "Arrow"},
+    "parquet": {"id": f"{MINTED_FORMAT_PREFIX}parquet", "name": "Parquet"},
 }
 
 # ENCODE output_type to EDAM data CV terms
