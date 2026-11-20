@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+
 import aiohttp
 import pytest
-from hypothesis import given, settings
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from cfdb.models import FileMetadataModel
@@ -76,6 +79,8 @@ class _FakeJsonResponse:
         return False
 
     async def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
         return self._payload
 
 
@@ -86,12 +91,18 @@ class _SearchSession:
     server-side extension filter are both observable. Once the configured
     pages run out, an empty page is served, which is how the real index
     ends a ``search_after`` walk.
+
+    ``failures`` are served first, one per request, without consuming a
+    page: an int is answered as that HTTP status, an exception is raised,
+    and a dict is answered as a 200 carrying that body. That is what lets
+    a test fail one attempt at a page and then serve the same page.
     """
 
-    def __init__(self, pages=None, status=200, error=None):
+    def __init__(self, pages=None, status=200, error=None, failures=None):
         self._pages = list(pages or [])
         self._status = status
         self._error = error
+        self._failures = list(failures or [])
         self.post_bodies: list[dict] = []
         self.post_urls: list[str] = []
 
@@ -104,6 +115,13 @@ class _SearchSession:
     def post(self, url, json=None, **kwargs):
         self.post_urls.append(url)
         self.post_bodies.append(json)
+        if self._failures:
+            failure = self._failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            if isinstance(failure, int):
+                return _FakeJsonResponse(failure, {})
+            return _FakeJsonResponse(200, failure)
         if self._error is not None:
             raise self._error
         if self._pages:
@@ -145,6 +163,17 @@ def _page(*sources: dict, sort_key: str = "file_uuid") -> dict:
     }
 
 
+@pytest.fixture
+def no_backoff(mocker):
+    """Make the fetchers' retry backoff and rate-limit pauses instant.
+
+    Returns the mock, so a test can count the pauses it took.
+    """
+    return mocker.patch.object(
+        hubmap_module.asyncio, "sleep", mocker.AsyncMock()
+    )
+
+
 def test_file_extensions_from_env_should_return_default_when_unset(
     monkeypatch
 ):
@@ -167,6 +196,29 @@ def test_file_extensions_from_env_should_return_default_when_unset(
     assert allowlist
     assert ".h5ad" in allowlist
     assert all(ext.startswith(".") for ext in allowlist)
+
+
+def test_file_extensions_from_env_should_exclude_bcf_by_default(monkeypatch):
+    """Test the default allowlist leaves out HuBMAP's .bcf files.
+
+    Every .bcf in the index is a CODEX raw-acquisition sidecar, not binary
+    VCF, so ingesting them would label microscope files as variant calls.
+
+    Given:
+        No HUBMAP_FILE_EXTENSIONS in the environment.
+    When:
+        file_extensions_from_env resolves the allowlist.
+    Then:
+        It should not include .bcf.
+    """
+    # Arrange
+    monkeypatch.delenv(EXTENSIONS_ENV, raising=False)
+
+    # Act
+    allowlist = file_extensions_from_env()
+
+    # Assert
+    assert ".bcf" not in allowlist
 
 
 def test_file_extensions_from_env_should_normalize_case_and_missing_dots(
@@ -256,8 +308,12 @@ def test_file_extensions_from_env_should_collapse_repeats_keeping_order(
         max_size=8,
     )
 )
+@settings(
+    max_examples=50,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
 def test_file_extensions_from_env_should_emit_index_shaped_entries(
-    entries
+    entries, mocker
 ):
     """Test every resolved entry matches the index's value shape.
 
@@ -268,15 +324,11 @@ def test_file_extensions_from_env_should_emit_index_shaped_entries(
     Then:
         Every entry should be lower-cased, dot-prefixed, and unique.
     """
-    import os
-
     # Arrange
-    os.environ[EXTENSIONS_ENV] = ",".join(entries)
-    try:
-        # Act
-        allowlist = file_extensions_from_env()
-    finally:
-        del os.environ[EXTENSIONS_ENV]
+    mocker.patch.dict(os.environ, {EXTENSIONS_ENV: ",".join(entries)})
+
+    # Act
+    allowlist = file_extensions_from_env()
 
     # Assert
     assert all(ext.startswith(".") and ext == ext.lower() for ext in allowlist)
@@ -556,14 +608,15 @@ def test_transform_file_to_cfdb_should_map_organs_through_the_organ_map(
     When:
         transform_file_to_cfdb runs.
     Then:
-        The collection should carry exactly one UBERON term named by
-        the document's label, and the unmapped code should be counted.
+        The collection should carry exactly one UBERON term, named by
+        the UBKG term rather than the document's drifting label, and
+        the unmapped code should be counted.
     """
     from collections import Counter
 
     # Arrange
     organs = [
-        {"code": "TH", "label": "Thymus"},
+        {"code": "TH", "label": "Thymus (Lobe)"},
         {"code": "TH", "label": "Thymus"},
         {"code": "ZZ", "label": "Mystery"},
     ]
@@ -866,9 +919,8 @@ async def test_fetch_file_metadata_should_filter_extensions_server_side(
     [doc async for doc in fetch_file_metadata((".h5ad", ".bcf"))]
 
     # Assert
-    assert session.post_bodies[0]["query"] == {
-        "terms": {"file_extension.keyword": [".h5ad", ".bcf"]}
-    }
+    filters = session.post_bodies[0]["query"]["bool"]["filter"]
+    assert {"terms": {"file_extension.keyword": [".h5ad", ".bcf"]}} in filters
 
 
 @pytest.mark.asyncio
@@ -898,7 +950,7 @@ async def test_fetch_file_metadata_should_yield_nothing_when_allowlist_empty(
 
 
 @pytest.mark.asyncio
-async def test_fetch_file_metadata_should_raise_on_http_error(mocker):
+async def test_fetch_file_metadata_should_raise_on_http_error(mocker, no_backoff):
     """Test an upstream error fails the stream instead of truncating it.
 
     The loader clears before reloading, so a stream that quietly ended
@@ -909,7 +961,8 @@ async def test_fetch_file_metadata_should_raise_on_http_error(mocker):
     When:
         fetch_file_metadata is drained.
     Then:
-        It should raise rather than end the stream.
+        It should retry the page, then raise rather than end the
+        stream.
     """
     # Arrange
     session = _SearchSession(status=503)
@@ -917,9 +970,12 @@ async def test_fetch_file_metadata_should_raise_on_http_error(mocker):
         hubmap_module.aiohttp, "ClientSession", return_value=session
     )
 
-    # Act & assert
+    # Act
     with pytest.raises(RuntimeError, match="HTTP 503"):
         [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert len(session.post_bodies) == 3
 
 
 @pytest.mark.asyncio
@@ -952,9 +1008,7 @@ async def test_fetch_file_metadata_should_request_is_data_product(
 
 
 @pytest.mark.asyncio
-async def test_fetch_file_metadata_should_raise_on_network_error(
-    mocker
-):
+async def test_fetch_file_metadata_should_raise_on_network_error(mocker, no_backoff):
     """Test a dropped connection fails the stream instead of ending it.
 
     Given:
@@ -962,7 +1016,8 @@ async def test_fetch_file_metadata_should_raise_on_network_error(
     When:
         fetch_file_metadata is drained.
     Then:
-        The client error should propagate.
+        The client error should propagate once the page's retries
+        are spent.
     """
     # Arrange
     session = _SearchSession(error=aiohttp.ClientError("reset"))
@@ -970,9 +1025,12 @@ async def test_fetch_file_metadata_should_raise_on_network_error(
         hubmap_module.aiohttp, "ClientSession", return_value=session
     )
 
-    # Act & assert
+    # Act
     with pytest.raises(aiohttp.ClientError, match="reset"):
         [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert len(session.post_bodies) == 3
 
 
 @pytest.mark.asyncio
@@ -1005,6 +1063,170 @@ async def test_fetch_file_metadata_should_stop_when_a_page_has_no_sort(
     # Assert
     assert len(docs) == 1
     assert len(session.post_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_filter_to_public_files(mocker):
+    """Test the query admits only public files.
+
+    The retired pruning pass relied on the index holding only public
+    files; the filter makes that an invariant rather than an assumption.
+
+    Given:
+        An allowlist.
+    When:
+        fetch_file_metadata issues its first request.
+    Then:
+        The body should filter on data_access_level public.
+    """
+    # Arrange
+    session = _SearchSession()
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    filters = session.post_bodies[0]["query"]["bool"]["filter"]
+    assert {"term": {"data_access_level.keyword": "public"}} in filters
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_retry_a_page_that_failed_transiently(
+    mocker, no_backoff
+):
+    """Test one transient failure costs a retry, not the sync.
+
+    Given:
+        A files endpoint that answers HTTP 503 once and then serves a page
+        of two documents.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should yield both documents, having re-sent the identical
+        first-page request.
+    """
+    # Arrange
+    session = _SearchSession(
+        pages=[_page(_file_doc(file_uuid="aaa"), _file_doc(file_uuid="bbb"))],
+        failures=[503],
+    )
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    docs = [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert [doc["file_uuid"] for doc in docs] == ["aaa", "bbb"]
+    assert session.post_bodies[0] == session.post_bodies[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (
+            {"_shards": {"failed": 1}, "hits": {"hits": []}},
+            "failed shard",
+        ),
+        ({"timed_out": True, "hits": {"hits": []}}, "timed out upstream"),
+        ({}, "no hits envelope"),
+    ],
+)
+async def test_fetch_file_metadata_should_raise_when_every_attempt_is_partial(
+    mocker, no_backoff, failure, message
+):
+    """Test a partial or malformed 200 is refused rather than walked past.
+
+    Elasticsearch answers 200 with whatever healthy shards returned, and a
+    body with no hits envelope would read as end-of-stream -- on the first
+    page, a cleared corpus with nothing loaded.
+
+    Given:
+        A files endpoint whose every answer is a failed-shard, timed-out,
+        or envelope-less 200.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should raise naming the defect, after retrying the page.
+    """
+    # Arrange
+    session = _SearchSession(failures=[failure] * 3)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    with pytest.raises(RuntimeError, match=message):
+        [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert len(session.post_bodies) == 3
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_raise_at_once_on_a_client_error_status(
+    mocker, no_backoff
+):
+    """Test a request the server refuses outright is not retried.
+
+    Given:
+        A files endpoint answering HTTP 400.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should raise after a single request.
+    """
+    # Arrange
+    session = _SearchSession(failures=[400])
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    with pytest.raises(RuntimeError, match="HTTP 400"):
+        [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert len(session.post_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_raise_when_the_deadline_has_passed(
+    mocker,
+):
+    """Test a spent budget is refused rather than turned into no timeout.
+
+    aiohttp reads a non-positive total as "no timeout", so passing the
+    exhausted remainder through would make the request unbounded.
+
+    Given:
+        A deadline already behind the event-loop clock.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should raise a timeout without issuing a request.
+    """
+    # Arrange
+    session = _SearchSession(pages=[_page(_file_doc())])
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+    deadline = asyncio.get_running_loop().time() - 1
+
+    # Act
+    with pytest.raises(asyncio.TimeoutError):
+        [
+            doc
+            async for doc in fetch_file_metadata((".h5ad",), deadline=deadline)
+        ]
+
+    # Assert
+    assert session.post_bodies == []
 
 
 @pytest.mark.asyncio
@@ -1051,9 +1273,7 @@ async def test_fetch_dataset_metadata_bulk_should_key_results_by_uuid(
 
 
 @pytest.mark.asyncio
-async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(
-    mocker
-):
+async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(mocker, no_backoff):
     """Test a partial dataset map is refused rather than returned.
 
     A silently partial map would mean silently under-enriched
@@ -1064,7 +1284,8 @@ async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(
     When:
         fetch_dataset_metadata_bulk runs.
     Then:
-        It should raise rather than return what it fetched so far.
+        It should retry the page, then raise rather than return what
+        it fetched so far.
     """
     # Arrange
     session = _SearchSession(status=502)
@@ -1072,9 +1293,12 @@ async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(
         hubmap_module.aiohttp, "ClientSession", return_value=session
     )
 
-    # Act & assert
+    # Act
     with pytest.raises(RuntimeError, match="HTTP 502"):
         await fetch_dataset_metadata_bulk()
+
+    # Assert
+    assert len(session.post_bodies) == 3
 
 
 @pytest.mark.asyncio
@@ -1115,9 +1339,7 @@ async def test_fetch_dataset_metadata_bulk_should_skip_hits_without_uuid(
 
 
 @pytest.mark.asyncio
-async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(
-    mocker
-):
+async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(mocker, no_backoff):
     """Test a dropped connection refuses the partial map.
 
     Given:
@@ -1125,7 +1347,8 @@ async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(
     When:
         fetch_dataset_metadata_bulk runs.
     Then:
-        The client error should propagate.
+        The client error should propagate once the page's retries
+        are spent.
     """
     # Arrange
     session = _SearchSession(error=aiohttp.ClientError("reset"))
@@ -1133,9 +1356,12 @@ async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(
         hubmap_module.aiohttp, "ClientSession", return_value=session
     )
 
-    # Act & assert
+    # Act
     with pytest.raises(aiohttp.ClientError, match="reset"):
         await fetch_dataset_metadata_bulk()
+
+    # Assert
+    assert len(session.post_bodies) == 3
 
 
 @pytest.mark.asyncio
@@ -1252,6 +1478,113 @@ async def test_fetch_organ_map_should_return_empty_and_warn_on_http_error(
     # Assert
     assert organ_map == {}
     assert any("HTTP 500" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fetch_organ_map_should_fall_back_to_the_category_uberon_term(
+    mocker,
+):
+    """Test a lateral organ's FMA id is replaced by its UBERON parent.
+
+    UBKG puts FMA ids in organ_uberon for the left/right knee, mammary
+    gland and tonsil, while their side-neutral category carries UBERON.
+
+    Given:
+        A UBKG entry whose organ_uberon is FMA and whose category carries a
+        UBERON id.
+    When:
+        fetch_organ_map runs.
+    Then:
+        The code should map to the category's UBERON id and term.
+    """
+    # Arrange
+    payload = [
+        {
+            "rui_code": "RN",
+            "term": "Knee (Right)",
+            "organ_uberon": "FMA:24977",
+            "category": {"organ_uberon": "UBERON:0001465", "term": "Knee"},
+        }
+    ]
+    session = _OrganSession(payload=payload)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    organ_map = await fetch_organ_map()
+
+    # Assert
+    assert organ_map == {"RN": {"id": "UBERON:0001465", "name": "Knee"}}
+
+
+@pytest.mark.asyncio
+async def test_fetch_organ_map_should_omit_a_code_with_no_uberon_term(mocker):
+    """Test a code with no UBERON term anywhere is left unmapped.
+
+    Left out of the map, the transform counts it as an unmapped organ
+    rather than storing a foreign id where the contract promises UBERON.
+
+    Given:
+        A UBKG entry with an FMA organ_uberon and no category.
+    When:
+        fetch_organ_map runs.
+    Then:
+        The code should be absent from the map.
+    """
+    # Arrange
+    payload = [{"rui_code": "LN", "term": "Knee", "organ_uberon": "FMA:24978"}]
+    session = _OrganSession(payload=payload)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    organ_map = await fetch_organ_map()
+
+    # Assert
+    assert organ_map == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_kwargs", "expected"),
+    [
+        ({"error": asyncio.TimeoutError()}, "TimeoutError"),
+        ({"payload": ValueError("bad json")}, "bad json"),
+        ({"payload": {"organs": []}}, "not a list"),
+    ],
+)
+async def test_fetch_organ_map_should_return_empty_and_warn_on_a_degraded_answer(
+    mocker, caplog, session_kwargs, expected
+):
+    """Test every failure shape degrades anatomy instead of failing the sync.
+
+    aiohttp raises a bare TimeoutError on an exceeded total, not a
+    ClientError, and a wrongly shaped body would otherwise fail on
+    iteration -- both escaped the contract the docstring states.
+
+    Given:
+        A UBKG request that times out, answers undecodable JSON, or
+        answers a JSON object instead of a list.
+    When:
+        fetch_organ_map runs.
+    Then:
+        It should return an empty map and log a warning describing it.
+    """
+    # Arrange
+    session = _OrganSession(**session_kwargs)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    with caplog.at_level("WARNING"):
+        organ_map = await fetch_organ_map()
+
+    # Assert
+    assert organ_map == {}
+    assert any(expected in record.message for record in caplog.records)
 
 
 def test_build_hubmap_dcc_record_should_carry_the_static_dcc_fields():

@@ -112,6 +112,7 @@ from cfdb.dcc_registry import get_dcc_config
 from cfdb.services.encode import (
     COMPRESSION_SUFFIX_TO_EDAM,
     UNMAPPABLE_COMPRESSION_SUFFIXES,
+    _timeout_from_env,
     derive_compression_format,
 )
 from cfdb.services.ontology_mappings import get_file_format, get_taxonomy
@@ -132,15 +133,17 @@ UBKG_ORGANS_URL = (
 #: retrofitted later: the files index holds 9.9M documents and 98% of them
 #: are ``.tif`` microscopy tiles the API cannot serve meaningfully, so
 #: ingesting the extension space wholesale would grow the corpus ~11x with
-#: dead weight. The default is the genomics + tabular tail of the live
-#: distribution, ~53k files.
+#: dead weight. The default is the genomics, tabular, and imaging-derived
+#: table tail of the live distribution, ~52k files.
 _FILE_EXTENSIONS_ENV = "HUBMAP_FILE_EXTENSIONS"
 _FILE_EXTENSIONS_DEFAULT: tuple[str, ...] = (
     ".h5ad",
     ".h5mu",
     ".h5",
     ".hdf5",
-    ".bcf",
+    # ".bcf" is deliberately absent: every .bcf in the index is a CODEX
+    # raw-acquisition sidecar (raw/Cyc1_reg1/1.bcf), not binary VCF, and
+    # ingesting them would label microscope files as variant calls.
     ".gz",
     ".mtx",
     ".arrow",
@@ -164,10 +167,11 @@ def file_extensions_from_env() -> tuple[str, ...]:
     is sent to the search API matches the index's dot-prefixed
     ``file_extension`` values exactly. An unset variable yields the default
     allowlist; a variable set to an empty (or all-blank) value yields an
-    empty tuple, which ingests nothing — the same explicit-empty semantics
-    as ``ENCODE_ANNOTATION_TYPES``, and warned about for the same reason:
-    empty values arrive by accident routinely, and a silently empty corpus
-    shows up only as an absence.
+    empty tuple, on which the sync skips HuBMAP and leaves the existing
+    slice in place — the same outcome an empty ``ENCODE_ANNOTATION_TYPES``
+    has for ENCODE's annotation phases — and which is warned about for the
+    same reason: empty values arrive by accident routinely, and a silently
+    skipped load shows up only as an absence.
 
     Repeats are collapsed, first occurrence winning, so a duplicated token
     cannot widen the server-side ``terms`` filter or reorder the logged
@@ -187,8 +191,9 @@ def file_extensions_from_env() -> tuple[str, ...]:
 
     if not allowlist:
         logger.warning(
-            "%s is set but empty: no HuBMAP files will be ingested. Unset "
-            "it entirely to restore the default allowlist (%s).",
+            "%s is set but empty: the HuBMAP sync will be skipped and the "
+            "existing HuBMAP slice left in place. Unset it entirely to "
+            "restore the default allowlist (%s).",
             _FILE_EXTENSIONS_ENV,
             ", ".join(_FILE_EXTENSIONS_DEFAULT),
         )
@@ -261,6 +266,147 @@ def derive_file_format(filename: str) -> Optional[dict]:
     return get_file_format(base.rsplit(".", 1)[-1])
 
 
+#: Per-request timeout for one search page, in seconds.
+_PAGE_TIMEOUT_SECONDS = 60
+
+#: Attempts per search page before the failure is raised, and the base of
+#: the linear backoff between them. A walk is ~54 sequential pages behind a
+#: deferred clear, so one transient 5xx would otherwise cost the sync after
+#: the old slice is gone; re-sending the same ``search_after`` page is
+#: idempotent, which is what makes retrying safe.
+_PAGE_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 2.0
+
+#: Upstream statuses worth retrying. Anything else is a request the server
+#: will refuse again, so it is raised at once.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+#: Environment variable bounding the HuBMAP files stream, and its default.
+#: The stream runs inside the cutover lock, which gates the whole read
+#: surface, so it gets one deadline -- the reasoning ENCODE's metadata
+#: budget records -- kept well under the sync lock's one-hour stale
+#: threshold so a slow upstream cannot admit a second, clearing sync.
+_SYNC_TIMEOUT_ENV = "HUBMAP_SYNC_TIMEOUT_SECONDS"
+_SYNC_TIMEOUT_DEFAULT_SECONDS = 1800
+
+
+def sync_budget_seconds() -> int:
+    """Resolve the HuBMAP files-stream budget, in seconds.
+
+    Read per call, like ENCODE's budget, so a malformed value fails the sync
+    that reads it rather than the import of this module.
+    """
+    return _timeout_from_env(_SYNC_TIMEOUT_ENV, _SYNC_TIMEOUT_DEFAULT_SECONDS)
+
+
+class _RetryablePageError(RuntimeError):
+    """A page failure that a fresh attempt at the same page may not repeat."""
+
+
+def _page_hits(data: object, label: str) -> list[dict]:
+    """Return a search response's hits, refusing a partial or malformed page.
+
+    Elasticsearch answers 200 with whatever the healthy shards returned when
+    a shard fails or the query times out, and the walk would then resume
+    past documents it never received. A body with no hits envelope is
+    refused too: read as an empty page it would end the walk, which on the
+    first page means clearing the corpus and loading nothing.
+    """
+    hits = data.get("hits") if isinstance(data, dict) else None
+    if not isinstance(hits, dict) or not isinstance(hits.get("hits"), list):
+        raise _RetryablePageError(
+            f"HuBMAP {label} search API returned a page with no hits envelope"
+        )
+    if data.get("timed_out"):
+        raise _RetryablePageError(
+            f"HuBMAP {label} search timed out upstream; the page is partial"
+        )
+    failed = (data.get("_shards") or {}).get("failed") or 0
+    if failed:
+        raise _RetryablePageError(
+            f"HuBMAP {label} search had {failed} failed shard(s); the page "
+            "is partial"
+        )
+    return hits["hits"]
+
+
+async def _search_page(
+    session: aiohttp.ClientSession,
+    url: str,
+    query: dict,
+    label: str,
+    *,
+    deadline: float | None = None,
+) -> list[dict]:
+    """POST one search page and return its hits, retrying transient failures.
+
+    Transport errors, timeouts, retryable statuses, and partial or malformed
+    pages are retried up to ``_PAGE_ATTEMPTS`` times with linear backoff;
+    the last failure is raised. A non-retryable status raises at once.
+
+    Args:
+        session: Open client session.
+        url: Search endpoint.
+        query: Elasticsearch request body, ``search_after`` included.
+        label: Names the index in log and error messages.
+        deadline: Event-loop clock reading by which the page must arrive.
+            Each attempt's timeout is clamped to what remains, and an
+            exhausted deadline raises ``asyncio.TimeoutError`` rather than
+            being retried -- aiohttp reads a non-positive total as "no
+            timeout", so passing a spent remainder through would turn the
+            budget into an unbounded request.
+    """
+    loop = asyncio.get_running_loop()
+    for attempt in range(1, _PAGE_ATTEMPTS + 1):
+        timeout = float(_PAGE_TIMEOUT_SECONDS)
+        if deadline is not None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"HuBMAP {label} fetch did not finish within the "
+                    f"{_SYNC_TIMEOUT_ENV} budget"
+                )
+            timeout = min(timeout, remaining)
+
+        try:
+            async with session.post(
+                url,
+                json=query,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as response:
+                if response.status != 200:
+                    message = (
+                        f"HuBMAP {label} search API error: "
+                        f"HTTP {response.status}"
+                    )
+                    if response.status in _RETRYABLE_STATUSES:
+                        raise _RetryablePageError(message)
+                    raise RuntimeError(message)
+                try:
+                    data = await response.json()
+                except ValueError as e:
+                    raise _RetryablePageError(
+                        f"HuBMAP {label} search API returned undecodable "
+                        f"JSON: {e}"
+                    ) from e
+            return _page_hits(data, label)
+        except (aiohttp.ClientError, asyncio.TimeoutError, _RetryablePageError) as e:
+            if attempt == _PAGE_ATTEMPTS:
+                logger.error(
+                    f"HuBMAP {label} search page failed after {attempt} "
+                    f"attempts: {e!r}"
+                )
+                raise
+            logger.warning(
+                f"HuBMAP {label} search page failed (attempt {attempt} of "
+                f"{_PAGE_ATTEMPTS}): {e!r}; retrying"
+            )
+            await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
 # Fields to request from the dataset-level index. Only what the files index
 # cannot supply: per-dataset processing context, donor demographics, and the
 # free-text workflow description the genome assembly is extracted from.
@@ -287,9 +433,10 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
     transformation can join on the ``dataset_uuid`` every files-index
     document carries.
 
-    An HTTP or network error raises rather than returning the partial map:
-    the loader clears the HuBMAP slice before reloading, so a silently
-    partial dataset map would mean silently under-enriched documents.
+    Each page is retried on transient failure (see ``_search_page``); a
+    failure that outlasts the retries raises rather than returning the
+    partial map, since a silently partial map would mean silently
+    under-enriched documents.
 
     Returns:
         {dataset_uuid: {pipeline, processing, group_name, visualization,
@@ -316,28 +463,10 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
             if search_after is not None:
                 query["search_after"] = search_after
 
-            try:
-                async with session.post(
-                    search_url,
-                    json=query,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"HuBMAP dataset search API error: "
-                            f"HTTP {response.status}"
-                        )
-
-                    data = await response.json()
-
-            except aiohttp.ClientError as e:
-                logger.error(f"HuBMAP dataset search API network error: {e}")
-                raise
+            hits = await _search_page(session, search_url, query, "dataset")
 
             await asyncio.sleep(_REQUEST_INTERVAL)
 
-            hits = data.get("hits", {}).get("hits", [])
             if not hits:
                 break
 
@@ -419,6 +548,8 @@ _FILE_SOURCE_FIELDS = [
 
 async def fetch_file_metadata(
     extensions: tuple[str, ...],
+    *,
+    deadline: float | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Stream file documents from the HuBMAP files search index.
@@ -426,13 +557,26 @@ async def fetch_file_metadata(
     Uses ``search_after`` pagination on ``file_uuid.keyword`` in batches of
     1000. When ``extensions`` is non-empty, the allowlist is applied
     server-side as a ``terms`` filter on ``file_extension.keyword``, so the
-    excluded 9.7M microscopy tiles never cross the wire. An empty allowlist
-    yields nothing — the explicit-empty configuration documented on
+    excluded 9.7M microscopy tiles never cross the wire. The query also
+    filters on ``data_access_level: public``: the index holds only public
+    files today, which is what retired the C2M2 path's pruning pass, and
+    the filter makes that an invariant of the load rather than an
+    assumption about a beta index. An empty allowlist yields nothing — the
+    explicit-empty configuration documented on
     :func:`file_extensions_from_env`.
 
-    Errors raise rather than ending the stream early, for the same reason
-    :func:`fetch_dataset_metadata_bulk` raises: a partial stream behind a
-    clear-before-reload would silently shrink the corpus.
+    Each page is retried on transient failure, and a partial page (failed
+    shards, an upstream timeout, a missing hits envelope) is refused rather
+    than walked past; see ``_search_page``. A failure that outlasts the
+    retries still raises mid-stream, and behind the loader's deferred clear
+    that leaves a partial slice -- loudly rather than silently, but only a
+    shadow-collection swap would make it atomic.
+
+    Args:
+        extensions: Dot-prefixed, lower-case extension allowlist.
+        deadline: Event-loop clock reading by which the whole stream must
+            finish; each page's timeout is clamped to what remains. None
+            leaves only the per-page timeout.
 
     Yields:
         The ``_source`` dict of each matching file document.
@@ -451,7 +595,14 @@ async def fetch_file_metadata(
     async with aiohttp.ClientSession() as session:
         while True:
             query: dict = {
-                "query": {"terms": {"file_extension.keyword": list(extensions)}},
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"terms": {"file_extension.keyword": list(extensions)}},
+                            {"term": {"data_access_level.keyword": "public"}},
+                        ]
+                    }
+                },
                 "size": page_size,
                 "_source": _FILE_SOURCE_FIELDS,
                 "sort": [{"file_uuid.keyword": "asc"}],
@@ -460,28 +611,12 @@ async def fetch_file_metadata(
             if search_after is not None:
                 query["search_after"] = search_after
 
-            try:
-                async with session.post(
-                    search_url,
-                    json=query,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"HuBMAP files search API error: "
-                            f"HTTP {response.status}"
-                        )
-
-                    data = await response.json()
-
-            except aiohttp.ClientError as e:
-                logger.error(f"HuBMAP files search API network error: {e}")
-                raise
+            hits = await _search_page(
+                session, search_url, query, "files", deadline=deadline
+            )
 
             await asyncio.sleep(_REQUEST_INTERVAL)
 
-            hits = data.get("hits", {}).get("hits", [])
             if not hits:
                 break
 
@@ -500,16 +635,41 @@ async def fetch_file_metadata(
     logger.info(f"HuBMAP file fetch: {total} total files fetched")
 
 
+def _uberon_term(organ: dict) -> Optional[dict]:
+    """The UBERON term for one UBKG organ entry, or None when it has none.
+
+    ``organ_uberon`` is not always UBERON despite its name: the lateral
+    organs (left/right knee, mammary gland, tonsil) carry FMA ids there,
+    and their side-neutral parent under ``category`` carries the UBERON
+    one. Falling back loses the side -- UBERON's knee is side-neutral --
+    which is the honest trade: an FMA id stored where the anatomy
+    contract promises UBERON would not resolve for any consumer.
+    """
+    for source in (organ, organ.get("category")):
+        if not isinstance(source, dict):
+            continue
+        uberon = source.get("organ_uberon")
+        if isinstance(uberon, str) and uberon.startswith("UBERON:"):
+            return {"id": uberon, "name": source.get("term") or uberon}
+    return None
+
+
 async def fetch_organ_map() -> dict[str, dict]:
     """
     Fetch the HuBMAP organ-code → UBERON mapping from the UBKG ontology API.
 
     One small request per sync. Returns ``{rui_code: {"id": uberon_id,
-    "name": term}}`` for every organ carrying both a code and a UBERON id.
-    Failure degrades rather than aborts — anatomy is enrichment, not
+    "name": term}}`` for every organ with a UBERON term, taking the
+    side-neutral ``category`` term where ``organ_uberon`` is not UBERON
+    (see ``_uberon_term``); a code with no UBERON term at all is left out,
+    so the transform counts it as unmapped rather than storing a foreign
+    id. Failure degrades rather than aborts -- anatomy is enrichment, not
     identity, so a UBKG outage costs the anatomy terms of one sync, not the
-    corpus — and returns an empty map with a warning.
+    corpus -- and returns an empty map with a warning. That covers a
+    timeout (a bare ``TimeoutError`` in aiohttp, not a ``ClientError``)
+    and an undecodable or wrongly shaped body as well as transport errors.
     """
+    degraded = "HuBMAP collections will carry no anatomy terms this sync"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -519,24 +679,29 @@ async def fetch_organ_map() -> dict[str, dict]:
                 if response.status != 200:
                     logger.warning(
                         f"UBKG organs API error: HTTP {response.status}; "
-                        "HuBMAP collections will carry no anatomy terms "
-                        "this sync"
+                        f"{degraded}"
                     )
                     return {}
                 organs = await response.json()
-    except aiohttp.ClientError as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning(f"UBKG organs API failed ({e!r}); {degraded}")
+        return {}
+
+    if not isinstance(organs, list):
         logger.warning(
-            f"UBKG organs API network error: {e}; HuBMAP collections will "
-            "carry no anatomy terms this sync"
+            f"UBKG organs API returned {type(organs).__name__}, not a list; "
+            f"{degraded}"
         )
         return {}
 
     organ_map: dict[str, dict] = {}
     for organ in organs:
+        if not isinstance(organ, dict):
+            continue
         code = organ.get("rui_code")
-        uberon = organ.get("organ_uberon")
-        if code and uberon:
-            organ_map[code] = {"id": uberon, "name": organ.get("term") or code}
+        term = _uberon_term(organ)
+        if code and term:
+            organ_map[code] = term
 
     logger.info(f"UBKG organs: {len(organ_map)} organ codes mapped to UBERON")
     return organ_map
@@ -767,7 +932,10 @@ def transform_file_to_cfdb(
             if stats is not None:
                 stats[f"unmapped_organ:{code}"] += 1
             continue
-        anatomy.append({"id": term["id"], "name": organ.get("label") or term["name"]})
+        # The UBKG term, not the file's own label: labels drift between
+        # files for the same code ("Main Bronchus (Right)" vs "Bronchus
+        # (Right)"), which would give one id two names.
+        anatomy.append({"id": term["id"], "name": term["name"]})
 
     # --- Collection, one per file: its parent dataset ---
     collection: dict = {
