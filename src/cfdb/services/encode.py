@@ -170,12 +170,16 @@ import os
 import re
 from contextlib import aclosing
 from typing import AsyncGenerator, Optional
-from urllib.parse import unquote, urlencode, urlsplit
+from urllib.parse import urlencode
 
 import aiohttp
 
 from cfdb.accessions import normalize_accession
 from cfdb.dcc_registry import get_dcc_config
+from cfdb.services.ingest_common import (
+    derive_compression_format,
+    timeout_from_env,
+)
 from cfdb.services.ontology_mappings import (
     get_assay_type,
     get_data_type,
@@ -184,29 +188,6 @@ from cfdb.services.ontology_mappings import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _timeout_from_env(name: str, default: int) -> int:
-    """Parse a positive-int timeout env var, failing loudly at import.
-
-    A bare ``int(os.getenv(...))`` raises a bare ``ValueError`` from deep in
-    the import machinery when an operator sets the variable to something
-    non-numeric, naming neither the variable nor the value. Zero or negative
-    is rejected too: aiohttp treats a non-positive total as "no timeout",
-    which would silently turn a misconfiguration into an unbounded request.
-    """
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        parsed = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"Environment variable {name}={raw!r} is not a valid integer"
-        ) from exc
-    if parsed <= 0:
-        raise ValueError(f"Environment variable {name}={parsed} must be > 0")
-    return parsed
 
 
 #: Environment variable overriding the metadata download budget, and the
@@ -234,7 +215,7 @@ def metadata_budget_seconds() -> int:
     shares one deadline across them, rather than granting each stream its
     own full allowance.
     """
-    return _timeout_from_env(
+    return timeout_from_env(
         _METADATA_TIMEOUT_ENV, _METADATA_TIMEOUT_DEFAULT_SECONDS
     )
 
@@ -262,7 +243,7 @@ def annotation_types_from_env() -> tuple[str, ...]:
     is deliberate -- turning the annotation path off is a legitimate
     operator choice, and having to edit code to make it is worse than
     honoring an explicitly empty setting. It is also the opposite of what
-    :func:`_timeout_from_env` does with an empty value, so the empty case
+    :func:`timeout_from_env` does with an empty value, so the empty case
     logs a warning rather than leaving the operator to infer it from an
     absence in the per-phase log.
 
@@ -274,7 +255,7 @@ def annotation_types_from_env() -> tuple[str, ...]:
     re-sync.
 
     Resolved per call rather than at import, matching
-    :func:`_timeout_from_env`: the value is only meaningful to the sync, so
+    :func:`timeout_from_env`: the value is only meaningful to the sync, so
     a bad one should fail the sync rather than the API's import of this
     module.
     """
@@ -287,7 +268,7 @@ def annotation_types_from_env() -> tuple[str, ...]:
     allowlist = tuple(dict.fromkeys(entry for entry in entries if entry))
 
     if not allowlist:
-        # Warned about because the neighbouring :func:`_timeout_from_env`
+        # Warned about because the neighbouring :func:`timeout_from_env`
         # reads an empty value as "unset, use the default" and this one
         # reads it as "ingest nothing" -- a difference an operator has no
         # reason to expect between two variables of the same module. Empty
@@ -525,99 +506,6 @@ def _parse_int(value: str | None) -> int | None:
         return int(v)
     except ValueError:
         return None
-
-
-# Compression suffix to EDAM CV term ID, verified against OLS4: format:3989 is
-# "GZIP format" (extensions gz, gzip), format:3615 is "bgzip" (bgz). Beware
-# format:3990, which adjoins them and is "AVI", not the bzip2 term it looks
-# like. The ENCODE metadata TSV carries no compression column (verified against
-# the live 59-column header), so the filename suffix is the only indicator.
-#
-# Only .gz and .starch actually occur in the released ENCODE corpus; the rest
-# are defensive. The suffix cannot distinguish BGZF from plain gzip — ENCODE
-# publishes no .bgz and roughly a quarter of its .gz files are BGZF — so
-# format:3989 here means "gzip-family stream", not "not bgzip".
-COMPRESSION_SUFFIX_TO_EDAM = {
-    ".gz": "format:3989",
-    ".gzip": "format:3989",
-    ".tgz": "format:3989",  # gzip-compressed tar; same bytes as .tar.gz
-    ".bgz": "format:3615",
-}
-
-# Suffixes that mark a file as compressed but that no EDAM term can express.
-# EDAM has no bzip2, xz, zstd or starch term. .zip is here despite having one
-# (format:3987) because a ZIP holds many members with many formats, so there is
-# no single post-decompression file_format to pair it with, and the tabix
-# processor rejects the PK magic outright — calling it a named compression
-# would invite a consumer to decompress and feed it onward. .starch is a
-# BEDOPS-compressed BED archive whose file_format already maps to plain BED.
-#
-# These resolve to None rather than to UNCOMPRESSED: they are compressed, so
-# claiming otherwise would be worse than admitting we cannot say.
-UNMAPPABLE_COMPRESSION_SUFFIXES = (".bz2", ".xz", ".zst", ".zip", ".starch")
-
-# Longest suffix first, so a more specific suffix is never shadowed by a
-# shorter one it ends with.
-_COMPRESSION_SUFFIXES: tuple[tuple[str, str | None], ...] = tuple(
-    sorted(
-        list(COMPRESSION_SUFFIX_TO_EDAM.items())
-        + [(suffix, None) for suffix in UNMAPPABLE_COMPRESSION_SUFFIXES],
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
-)
-
-# Sentinel for "no compression beyond what file_format already implies",
-# mirroring the value 4DN and HuBMAP carry from their upstream C2M2
-# datapackages. It is NOT a claim that the bytes are uncompressed: BAM, bigWig
-# and bigBed are internally compressed and carry this value, because their
-# file_format names the container rather than its decompressed contents.
-# Distinct from None, which means no determination was possible at all.
-UNCOMPRESSED = ""
-
-
-def derive_compression_format(filename_or_url: str | None) -> str | None:
-    """
-    Derive the EDAM compression term ID from a filename or download URL.
-
-    Reports only compression that is *extrinsic* to the declared file format —
-    a wrapper the filename reveals and file_format does not. A .bam is not
-    reported as compressed even though BGZF underlies it, because its
-    file_format already names that container; a .starch is not reported as
-    uncompressed, because its file_format names the BED it decompresses to.
-
-    Args:
-        filename_or_url: A bare filename or a full download URL.
-
-    Returns:
-        The EDAM CV term ID for the compression format (e.g. "format:3989"
-        for gzip); "" when the name carries no compression suffix; or None
-        when no determination is possible — either because no name was
-        available, or because the name ends in a compression suffix no EDAM
-        term can express.
-    """
-    value = _nonempty(filename_or_url)
-    if value is None:
-        return None
-
-    # Reduce to a basename. Query strings and fragments are URL syntax, so they
-    # are stripped only when the value actually is a URL — in a bare filename a
-    # '?' or '#' is an ordinary character and must not truncate the name.
-    if "://" in value:
-        basename = unquote(urlsplit(value).path).rsplit("/", 1)[-1]
-    else:
-        basename = value.rsplit("/", 1)[-1]
-    basename = basename.lower()
-    if not basename:
-        # A directory-style URL carries no evidence either way. Reporting it
-        # as uncompressed would be a positive claim about a file we cannot see.
-        return None
-
-    for suffix, term_id in _COMPRESSION_SUFFIXES:
-        if basename.endswith(suffix):
-            return term_id
-
-    return UNCOMPRESSED
 
 
 def _extract_donor_ids(donors_str: str | None) -> list[str]:

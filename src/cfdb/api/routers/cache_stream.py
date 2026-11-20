@@ -11,7 +11,7 @@ imported by ``routers.data`` and ``routers.index``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -103,7 +103,7 @@ def stream_cache_entry(
     )
 
 
-def stream_upstream_url(
+async def stream_upstream_url(
     download_url: str,
     file_size: Optional[int],
     filename: str,
@@ -117,8 +117,17 @@ def stream_upstream_url(
     The upstream-URL twin of :func:`stream_cache_entry`: same parse-range
     / 200-vs-206 / HEAD ritual, but the bytes come from ``download_url``
     via :func:`drs.stream_from_url` instead of a ``CacheBackend``. The
-    DRS/HTTPS, ENCODE, and 4DN-sidecar paths all delegate here so the
-    range contract stays in one place.
+    DRS/HTTPS, direct-URL (ENCODE, HuBMAP), and 4DN-sidecar paths all
+    delegate here so the range contract stays in one place.
+
+    The upstream request is opened before the response is built: the
+    first chunk is pulled from the stream here, which follows redirects
+    and checks the upstream status, so an upstream 403/404/5xx becomes
+    that status rather than a 200 whose body is cut off. Starlette sends
+    the status line before it iterates a ``StreamingResponse``, so an
+    error raised inside the body could only ever reach the client as a
+    truncated download. HEAD stays a metadata answer and does not
+    contact upstream.
 
     Args:
         download_url: Absolute URL to stream from (already allowlist-validated
@@ -135,6 +144,8 @@ def stream_upstream_url(
         HTTPException(416): size unknown on a range request, or the range
             is valid but out of bounds.
         HTTPException(400): Range header has invalid syntax.
+        HTTPException(403/404/502/504): upstream refused, lacks, failed, or
+            timed out on the file -- raised before any byte is sent.
     """
     response_headers = {
         "Content-Disposition": f'attachment; filename="{filename or "file"}"',
@@ -185,12 +196,67 @@ def stream_upstream_url(
             headers=response_headers,
         )
 
+    chunks = drs.stream_from_url(download_url, range_to_send)
+    first = await _open_upstream(chunks, download_url)
     return StreamingResponse(
-        drs.stream_from_url(download_url, range_to_send),
+        _resume_upstream(first, chunks),
         status_code=status_code,
         media_type=media_type,
         headers=response_headers,
     )
+
+
+async def _open_upstream(chunks: AsyncIterator[bytes], url: str) -> bytes:
+    """Pull the first chunk of an upstream stream, mapping its failures.
+
+    Returns ``b""`` for an empty body. On failure the stream is closed
+    and the upstream condition is raised as the status the DRS branch of
+    ``/data`` uses for the same condition.
+    """
+    try:
+        return await chunks.__anext__()
+    except StopAsyncIteration:
+        return b""
+    except BaseException as exc:
+        await chunks.aclose()
+        if isinstance(exc, drs.DRSNotFound):
+            logger.warning("Upstream has no file at %s: %s", url, exc)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found in repository",
+            ) from exc
+        if isinstance(exc, drs.DRSForbidden):
+            logger.warning("Upstream refused %s: %s", url, exc)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied by upstream repository",
+            ) from exc
+        if isinstance(exc, drs.DRSTimeout):
+            logger.warning("Upstream timed out for %s: %s", url, exc)
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Upstream repository timeout",
+            ) from exc
+        if isinstance(exc, drs.DRSError):
+            logger.warning("Upstream failed for %s: %s", url, exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to stream file from upstream",
+            ) from exc
+        raise
+
+
+async def _resume_upstream(
+    first: bytes, chunks: AsyncIterator[bytes]
+) -> AsyncIterator[bytes]:
+    """Yield the already-pulled first chunk, then the rest of the stream."""
+    try:
+        if first:
+            yield first
+        async for chunk in chunks:
+            yield chunk
+    finally:
+        await chunks.aclose()
 
 
 async def serve_workflow_artifact_or_dispatch(

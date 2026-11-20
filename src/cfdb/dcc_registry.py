@@ -12,10 +12,9 @@ DCC_CONFIG = {
     "hubmap": {
         "name": "HuBMAP",
         "display_name": "Human BioMolecular Atlas Program",
-        "type": "c2m2_zip",
-        "s3_base": "https://cfde-drc.s3.amazonaws.com/HuBMAP/C2M2/",
-        "latest_url": "https://cfde-drc.s3.amazonaws.com/HuBMAP/C2M2/2025-09-15/HuBMAP_C2M2_Fall_2025.zip",
+        "type": "rest_api",
         "api_base": "https://search.api.hubmapconsortium.org/v3",
+        "id_namespace": "https://hubmapconsortium.org",
     },
     "encode": {
         "name": "ENCODE",

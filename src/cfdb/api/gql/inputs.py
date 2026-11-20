@@ -150,6 +150,7 @@ class EnrichedHubmapCollectionInput:
     group_name: list[str] | None = None
     analyte_class: list[str] | None = None
     visualization: list[bool] | None = None
+    dataset_status: list[str] | None = None
 
 
 @strawberry.input

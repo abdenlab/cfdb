@@ -267,6 +267,52 @@ class TestStreamIndexFileFourdnSidecar:
 
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("upstream_error", "expected_status"),
+        [
+            (drs.DRSForbidden("upstream 403"), 403),
+            (drs.DRSNotFound("upstream 404"), 404),
+            (drs.DRSUpstreamError("upstream 500"), 502),
+            (drs.DRSTimeout("upstream timed out"), 504),
+        ],
+    )
+    async def test_stream_index_file_should_raise_the_upstream_status_for_a_sidecar(
+        self, mock_db, mocker, upstream_error, expected_status
+    ):
+        """Test a sidecar the upstream refuses becomes its status, not a cut-off 200.
+
+        Given:
+            A 4DN BED whose extra_files sidecar answers with an upstream
+            error before its first byte.
+        When:
+            stream_index_file is called.
+        Then:
+            It should raise the mapped HTTP status instead of returning a
+            response.
+        """
+        # Arrange
+        mocker.patch.object(locks, "wait_for_cutover", return_value=None)
+
+        async def fake_stream(url, _range):
+            raise upstream_error
+            yield b""  # pragma: no cover - makes this an async generator
+
+        mocker.patch.object(drs, "stream_from_url", fake_stream)
+        mock_db.files.docs = []
+        mock_db.file.docs = [
+            _make_file_doc(
+                extra={"extra_files": [{"href": "/x/abc.tbi", "file_size": 100}]}
+            )
+        ]
+
+        # Act
+        with pytest.raises(HTTPException) as exc_info:
+            await stream_index_file("4dn", "4DNFIBED01", _make_request(), range=None)
+
+        # Assert
+        assert exc_info.value.status_code == expected_status
+
+    @pytest.mark.asyncio
     async def test_stream_index_file_should_serve_fourdn_sidecar_when_extra_files_present(
         self, mock_db, mocker
     ):

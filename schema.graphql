@@ -351,6 +351,7 @@ input EnrichedHubmapCollectionInput {
   groupName: [String!] = null
   analyteClass: [String!] = null
   visualization: [Boolean!] = null
+  datasetStatus: [String!] = null
 }
 
 type EnrichedHubmapCollectionType {
@@ -360,6 +361,7 @@ type EnrichedHubmapCollectionType {
   visualization: Boolean
   vitessceHints: [String!]
   metadata: JSON
+  datasetStatus: String
 }
 
 input EnrichedHubmapFileInput {

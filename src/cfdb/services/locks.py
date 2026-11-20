@@ -17,7 +17,10 @@ CUTOVER_LOCK_ID = "cutover"
 CUTOVER_WAIT_TIMEOUT = 60.0  # seconds
 CUTOVER_POLL_INTERVAL = 0.1  # seconds
 
-# Stale lock threshold - if a lock is older than this, consider it abandoned
+# Stale lock threshold - if a lock has shown no sign of life for longer than
+# this, consider it abandoned. "Sign of life" is its ``heartbeat_at``, which
+# the sync refreshes at each DCC boundary (see ``heartbeat_sync_lock``); a
+# lock written before heartbeats existed falls back to its ``started_at``.
 STALE_LOCK_THRESHOLD = timedelta(hours=1)
 
 
@@ -48,7 +51,11 @@ async def try_acquire_sync_lock(task_id: str, dcc_names: list[str]) -> bool:
             "$or": [
                 {"active": False},
                 {"active": {"$exists": False}},
-                {"started_at": {"$lt": stale_threshold}},
+                {"heartbeat_at": {"$lt": stale_threshold}},
+                {
+                    "heartbeat_at": {"$exists": False},
+                    "started_at": {"$lt": stale_threshold},
+                },
             ],
         },
         {
@@ -57,6 +64,7 @@ async def try_acquire_sync_lock(task_id: str, dcc_names: list[str]) -> bool:
                 "task_id": task_id,
                 "dcc_names": dcc_names,
                 "started_at": now,
+                "heartbeat_at": now,
                 "updated_at": now,
             },
             "$unset": {"completed_at": ""},
@@ -115,12 +123,43 @@ async def is_sync_running() -> bool:
         return False
 
     # Check if lock is stale
-    started_at = lock.get("started_at")
-    if started_at and datetime.utcnow() - started_at > STALE_LOCK_THRESHOLD:
+    alive_at = sync_lock_alive_at(lock)
+    if alive_at and datetime.utcnow() - alive_at > STALE_LOCK_THRESHOLD:
         logger.warning("Found stale sync lock, considering it inactive")
         return False
 
     return True
+
+
+def sync_lock_alive_at(lock: dict) -> Optional[datetime]:
+    """When a sync lock last showed it was alive: its heartbeat, else its start.
+
+    Staleness is judged from this, so a long multi-DCC run that keeps
+    heartbeating is never mistaken for an abandoned one, while a crashed run
+    still goes stale ``STALE_LOCK_THRESHOLD`` after its last heartbeat.
+    """
+    return lock.get("heartbeat_at") or lock.get("started_at")
+
+
+async def heartbeat_sync_lock(task_id: str) -> None:
+    """Record that the running sync is alive, restarting its stale clock.
+
+    Called at each DCC boundary. Without it a lock's staleness counted from
+    the start of the whole run, so whichever DCC ran last inherited what the
+    earlier ones left of the hour -- or none of it. Scoped to ``task_id``, so
+    a run whose lock went stale and was taken over cannot keep its
+    successor's lock alive.
+
+    Args:
+        task_id: The task ID that holds the lock.
+    """
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    await api.db[LOCKS_COLLECTION].update_one(
+        {"_id": SYNC_LOCK_ID, "task_id": task_id, "active": True},
+        {"$set": {"heartbeat_at": datetime.utcnow()}},
+    )
 
 
 async def get_current_sync_task() -> Optional[dict]:

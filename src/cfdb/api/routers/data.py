@@ -30,6 +30,7 @@ from cfdb.services.drs import (
     DRSUpstreamError,
 )
 from cfdb.workflows.models import ArtifactKind
+from cfdb.workflows.urlsafe import UnsafeOutboundURL, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
@@ -149,9 +150,13 @@ async def stream_file(
         if workflow_response is not None:
             return workflow_response
 
-        # ENCODE files: Stream directly via HTTPS (bypass DRS)
-        if normalized_dcc == "encode":
-            return await _stream_encode_file(file_metadata, request, range)
+        # Direct URLs -- ENCODE downloads, HuBMAP assets -- stream as-is;
+        # only a drs:// URI needs a DRS broker to resolve it first. The
+        # split is by scheme rather than by DCC, the same one
+        # ``resolve_download_url`` makes for the workers, so a DCC whose
+        # access_url changes shape cannot fall into the wrong branch.
+        if not file_metadata.access_url.startswith("drs://"):
+            return await _stream_direct_url(file_metadata, request, range)
 
         # 6. Fetch DRS object metadata
         try:
@@ -210,7 +215,7 @@ async def stream_file(
                 )
                 logger.info(f"Streaming HTTPS file: {drs_object.name}")
 
-                return stream_upstream_url(
+                return await stream_upstream_url(
                     download_url,
                     drs_object.size,
                     drs_object.name or "file",
@@ -311,16 +316,18 @@ async def stream_file_status(
         )
 
 
-async def _stream_encode_file(
+async def _stream_direct_url(
     file_metadata: _FileRef,
     request: Request,
     range_header: Optional[str] = None,
 ):
     """
-    Stream ENCODE file directly via HTTPS.
+    Stream a file whose access URL is directly fetchable over HTTPS.
 
-    ENCODE files are publicly accessible and don't require DRS resolution.
-    We stream directly from the ENCODE download URL.
+    ENCODE download URLs and HuBMAP assets URLs need no DRS resolution.
+    The URL is checked against the outbound allowlist here, before the
+    response starts, so a disallowed DB-sourced URL is refused with a 502
+    rather than failing inside a response that has already begun.
 
     Args:
         file_metadata: The file's access URL, filename, and size
@@ -334,7 +341,16 @@ async def _stream_encode_file(
     filename = file_metadata.filename
     file_size = file_metadata.size_in_bytes
 
-    logger.info(f"Streaming ENCODE file: {filename} from {download_url}")
+    try:
+        validate_outbound_url(download_url)
+    except UnsafeOutboundURL as e:
+        logger.warning("Refusing direct file fetch: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Upstream URL failed allowlist validation",
+        )
+
+    logger.info(f"Streaming file directly: {filename} from {download_url}")
 
     # Determine media type from filename; default to binary. (Branches
     # that resolve to the default are folded away.)
@@ -345,7 +361,7 @@ async def _stream_encode_file(
         media_type = "text/plain"
 
     try:
-        return stream_upstream_url(
+        return await stream_upstream_url(
             download_url,
             file_size,
             filename,
@@ -356,8 +372,8 @@ async def _stream_encode_file(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"ENCODE streaming error: {str(e)}")
-        raise HTTPException(status_code=502, detail="Failed to stream ENCODE file")
+        logger.error(f"Direct streaming error: {str(e)}")
+        raise HTTPException(status_code=502, detail="Failed to stream file")
 
 
 async def _try_serve_workflow_artifact(

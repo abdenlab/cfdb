@@ -47,9 +47,9 @@ ALLOWED_NETLOC_SUFFIXES: Final[tuple[str, ...]] = (
     "encode-public.s3.amazonaws.com",
     # HuBMAP public assets.
     "assets.hubmapconsortium.org",
-    # HuBMAP DRS broker (GA4GH DRS metadata API that every HuBMAP
-    # ``access_url`` resolves through before bytes flow from
-    # assets.hubmapconsortium.org above).
+    # HuBMAP DRS broker (GA4GH DRS metadata API). HuBMAP documents now
+    # carry assets URLs directly, so nothing current resolves through it;
+    # kept for documents loaded before the files-index loader.
     "drs.hubmapconsortium.org",
 )
 

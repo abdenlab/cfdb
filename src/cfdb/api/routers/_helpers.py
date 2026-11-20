@@ -47,11 +47,11 @@ FILE_DOC_PROJECTION: Final[dict[str, int]] = {
     "data_access_level": 1,
     "size_in_bytes": 1,
     # Promoted to the top level by every DCC's sync: ENCODE via
-    # ``_add_extra(doc, "genome_assembly", ...)``, 4DN and HuBMAP via the
-    # ``top_level_map`` / direct ``update``. The ``extra.*.genome_assembly``
-    # fields declared on the enriched models are never written, so this is
-    # the only path that carries an assembly. Read by the tileset routers to
-    # derive HiGlass's ``coordSystem``.
+    # ``_add_extra(doc, "genome_assembly", ...)``, 4DN via the
+    # ``top_level_map`` / direct ``update``, HuBMAP by its transform. HuBMAP
+    # also mirrors it onto ``extra.hubmap.genome_assembly``, but the top
+    # level is the one path every DCC writes, so it is the one read here.
+    # Read by the tileset routers to derive HiGlass's ``coordSystem``.
     "genome_assembly": 1,
     "extra.extra_files": 1,
     "extra.fourdn.extra_files": 1,
@@ -177,8 +177,9 @@ async def resolve_file_doc(
             detail="File has no access URL",
         )
 
-    # Defense-in-depth: reject any non-public HuBMAP file that survived
-    # pruning, before any caller streams upstream bytes, caches them, or
+    # Defense-in-depth: reject any non-public HuBMAP file -- the loader
+    # admits only public ones, but a document loaded another way must not
+    # stream -- before any caller streams upstream bytes, caches them, or
     # dispatches a workflow.
     #
     # Runs after the access-url check so signed/private URLs for

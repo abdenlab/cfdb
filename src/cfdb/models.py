@@ -215,6 +215,7 @@ class EnrichedHubmapCollection(BaseModel):
     visualization: Optional[bool] = None
     vitessce_hints: Optional[List[str]] = None
     metadata: Optional[dict] = None
+    dataset_status: Optional[str] = None
 
 
 class EnrichedHubmapSubject(BaseModel):
@@ -505,15 +506,16 @@ class FileMetadataModel(BaseModel):
             comparison to RAS user-level access control metadata.
 
         access_url:
-            A DRS URI or publicly accessible DRS-compatible URL.
+            A DRS URI (4DN) or a directly fetchable HTTPS URL (ENCODE
+            downloads, HuBMAP assets).
 
         status:
-            HuBMAP dataset status (e.g., "Published", "QA") cached from HuBMAP
-            Search API.
+            HuBMAP dataset status (e.g., "Published", "QA") from the parent
+            dataset in the HuBMAP files search index.
 
         data_access_level:
-            HuBMAP data access level ("public", "consortium", "protected") cached
-            from HuBMAP Search API.
+            HuBMAP data access level ("public", "consortium", "protected")
+            from the HuBMAP files search index.
 
         extra:
             DCC-specific file metadata. See EnrichedFile for available fields.

@@ -11,7 +11,7 @@ from collections import Counter
 from contextlib import aclosing
 from copy import copy
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -148,11 +148,16 @@ async def _sync_dccs(task: SyncTask) -> None:
     for dcc in task.dcc_names:
         task.current_dcc = dcc
         dcc_type = get_dcc_type(dcc)
+        # Each DCC starts the sync lock's stale clock afresh, so a loader
+        # late in a long run is not starved of the hour by the ones before.
+        await locks.heartbeat_sync_lock(task.id)
 
         try:
             # Branch on DCC type
             if dcc_type == "rest_api" and dcc == "encode":
                 await _sync_encode(task)
+            elif dcc_type == "rest_api" and dcc == "hubmap":
+                await sync_hubmap(task)
             else:
                 await _sync_c2m2_zip(task, data_path, downloads_path)
         except Exception as exc:
@@ -289,16 +294,6 @@ async def _sync_c2m2_zip(
         logger.info(task.progress)
         await _stamp_4dn_file_accessions()
         await _enrich_4dn_collections()
-    elif dcc == "hubmap":
-        task.current_step = "enriching_collections"
-        task.progress = "Enriching HuBMAP collections and subjects from Search API..."
-        logger.info(task.progress)
-        dataset_metadata = await _enrich_hubmap_collections_and_subjects()
-
-        task.current_step = "pruning"
-        task.progress = "Pruning non-public HuBMAP files..."
-        logger.info(task.progress)
-        await _prune_non_public_hubmap_raw_records(dataset_metadata)
 
     # Step 7: Materialize files collection for this DCC
     task.current_step = "materializing"
@@ -313,11 +308,6 @@ async def _sync_c2m2_zip(
         task.progress = "Enriching 4DN files from portal API..."
         logger.info(task.progress)
         await _enrich_4dn_api_metadata()
-    elif dcc == "hubmap":
-        task.current_step = "enriching"
-        task.progress = "Enriching HuBMAP files from Search API..."
-        logger.info(task.progress)
-        await _enrich_hubmap_files(dataset_metadata)
 
 
 async def _set_accession_ids(collection, stamps: list, label: str) -> int:
@@ -640,438 +630,24 @@ async def _enrich_4dn_collections() -> None:
     )
 
 
-async def _enrich_hubmap_collections_and_subjects() -> dict[str, dict]:
-    """Enrich HuBMAP collections and subjects with metadata from the Search API.
-
-    Performs a single bulk fetch of all HuBMAP datasets, then:
-    1. Stores dataset-level metadata on collection.extra.hubmap
-    2. Stores donor demographics on subject.extra.hubmap
-    """
-    from pymongo import UpdateOne
-
-    from cfdb.services.hubmap import fetch_dataset_metadata_bulk
-
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
-    # Single bulk fetch for all datasets
-    dataset_metadata = await fetch_dataset_metadata_bulk()
-    logger.info(f"HuBMAP enrichment: {len(dataset_metadata)} dataset entries fetched")
-
-    # --- Collection enrichment ---
-    collection_ops = []
-    cursor = api.db.collection.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "persistent_id": 1},
-    )
-    async for doc in cursor:
-        persistent_id = doc.get("persistent_id", "")
-        meta = dataset_metadata.get(persistent_id)
-        if not meta:
-            continue
-
-        update_set: dict = {}
-
-        # Promoted to Collection top-level
-        dataset_type = meta.get("dataset_type")
-        if dataset_type is not None:
-            update_set["experiment_type"] = dataset_type
-        analyte_class = meta.get("analyte_class")
-        if analyte_class is not None:
-            update_set["analyte_class"] = analyte_class
-
-        # HuBMAP-specific fields stay nested on extra.hubmap
-        hubmap_extra: dict = {}
-        for key in (
-            "pipeline",
-            "processing",
-            "group_name",
-            "visualization",
-            "vitessce_hints",
-            "metadata",
-        ):
-            val = meta.get(key)
-            if val is not None:
-                hubmap_extra[key] = val
-
-        if hubmap_extra:
-            update_set["extra.hubmap"] = hubmap_extra
-
-        if update_set:
-            collection_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": update_set})
-            )
-
-    if collection_ops:
-        total_modified = 0
-        for i in range(0, len(collection_ops), BATCH_SIZE):
-            batch = collection_ops[i : i + BATCH_SIZE]
-            result = await api.db.collection.bulk_write(batch, ordered=False)
-            total_modified += result.modified_count
-        logger.info(f"HuBMAP collection enrichment: updated {total_modified} collections")
-    else:
-        logger.warning("HuBMAP collection enrichment: no updates to apply")
-
-    # --- Subject enrichment ---
-    # Build donor_uuid -> donor_metadata lookup from the bulk fetch
-    donor_lookup: dict[str, dict] = {}
-    for meta in dataset_metadata.values():
-        donor_uuid = meta.get("donor_uuid")
-        donor_metadata = meta.get("donor_metadata")
-        if donor_uuid and donor_metadata:
-            donor_lookup[donor_uuid] = donor_metadata
-
-    if not donor_lookup:
-        logger.info("HuBMAP subject enrichment: no donor metadata available")
-        return dataset_metadata
-
-    # Match subjects by local_id containing the donor UUID (HuBMAP C2M2 uses
-    # donor UUID as part of the subject local_id)
-    subject_ops = []
-    cursor = api.db.subject.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "local_id": 1},
-    )
-    async for doc in cursor:
-        local_id = doc.get("local_id", "")
-        # Try to match donor UUID in the subject local_id
-        matched_donor = None
-        for donor_uuid, donor_meta in donor_lookup.items():
-            if donor_uuid in local_id:
-                matched_donor = donor_meta
-                break
-
-        if not matched_donor:
-            continue
-
-        extra: dict = {}
-        for key in (
-            "age_value",
-            "age_unit",
-            "body_mass_index_value",
-            "body_mass_index_unit",
-            "cause_of_death",
-            "death_event",
-            "mechanism_of_injury",
-            "height_value",
-            "height_unit",
-            "weight_value",
-            "weight_unit",
-        ):
-            val = matched_donor.get(key)
-            if val is not None:
-                # HuBMAP returns single-element lists for some fields
-                if isinstance(val, list) and len(val) == 1:
-                    val = val[0]
-                extra[key] = val
-
-        # String list fields
-        for key in ("sex", "race"):
-            val = matched_donor.get(key)
-            if val is not None:
-                if isinstance(val, list) and len(val) == 1:
-                    val = val[0]
-                extra[key] = val
-
-        for key in ("medical_history", "social_history"):
-            val = matched_donor.get(key)
-            if isinstance(val, list) and val:
-                extra[key] = val
-
-        if extra:
-            subject_ops.append(
-                UpdateOne({"_id": doc["_id"]}, {"$set": {"extra.hubmap": extra}})
-            )
-
-    if subject_ops:
-        total_modified = 0
-        for i in range(0, len(subject_ops), BATCH_SIZE):
-            batch = subject_ops[i : i + BATCH_SIZE]
-            result = await api.db.subject.bulk_write(batch, ordered=False)
-            total_modified += result.modified_count
-        logger.info(f"HuBMAP subject enrichment: updated {total_modified} subjects")
-    else:
-        logger.warning("HuBMAP subject enrichment: no updates to apply")
-
-    return dataset_metadata
-
-
-async def _prune_non_public_hubmap_raw_records(
-    dataset_metadata: dict[str, dict],
-) -> None:
-    """Remove non-public HuBMAP records from raw C2M2 tables before materialization.
-
-    Deletes ``file_in_collection`` links and orphaned ``file`` rows for any
-    dataset whose ``data_access_level`` is not ``"public"``.  Datasets with a
-    missing access level are treated as non-public (conservative default).
-    """
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
-    # 1. Identify non-public DOIs
-    non_public_dois = [
-        doi
-        for doi, meta in dataset_metadata.items()
-        if meta.get("data_access_level") != "public"
-    ]
-
-    if not non_public_dois:
-        logger.info("HuBMAP pruning: all datasets are public, nothing to prune")
-        return
-
-    logger.info(
-        f"HuBMAP pruning: {len(non_public_dois)} non-public datasets identified"
-    )
-
-    # 2. Find matching raw collection records
-    collection_keys: list[dict] = []
-    cursor = api.db.collection.find(
-        {
-            "submission": "hubmap",
-            "persistent_id": {"$in": non_public_dois},
-        },
-        {"id_namespace": 1, "local_id": 1},
-    )
-    async for doc in cursor:
-        collection_keys.append(
-            {
-                "id_namespace": doc["id_namespace"],
-                "local_id": doc["local_id"],
-            }
-        )
-
-    if not collection_keys:
-        logger.info("HuBMAP pruning: no raw collection records match non-public DOIs")
-        return
-
-    # 3. Collect potentially-orphaned file keys from file_in_collection
-    or_filter = [
-        {
-            "collection_id_namespace": ck["id_namespace"],
-            "collection_local_id": ck["local_id"],
-        }
-        for ck in collection_keys
-    ]
-
-    candidate_file_keys: set[tuple[str, str]] = set()
-    cursor = api.db.file_in_collection.find(
-        {"$or": or_filter},
-        {"file_id_namespace": 1, "file_local_id": 1},
-    )
-    async for doc in cursor:
-        candidate_file_keys.add(
-            (doc["file_id_namespace"], doc["file_local_id"])
-        )
-
-    # 4. Delete non-public file_in_collection links
-    fic_result = await api.db.file_in_collection.delete_many({"$or": or_filter})
-    logger.info(
-        f"HuBMAP pruning: deleted {fic_result.deleted_count} file_in_collection links"
-    )
-
-    # 4b. Delete files matched to a non-public dataset via the persistent_id
-    # (DOI) fallback join. HuBMAP's C2M2 export never populates
-    # file_in_collection (confirmed empty on every sync), so the
-    # materializer falls back to matching file.persistent_id against
-    # collection.persistent_id (see materialize/src/main.rs, "Fallback:
-    # look up collection by persistent_id"). Step 4 above is blind to that
-    # join, so without this a file whose own persistent_id names a
-    # non-public dataset survives pruning and gets the blanket
-    # data_access_level=public stamp below regardless of its true access
-    # level -- confirmed to leak files registered under dbGaP
-    # controlled-access studies.
-    doi_result = await api.db.file.delete_many(
-        {"submission": "hubmap", "persistent_id": {"$in": non_public_dois}}
-    )
-    logger.info(
-        f"HuBMAP pruning: deleted {doi_result.deleted_count} file records via "
-        "persistent_id (DOI) fallback match"
-    )
-
-    # 5. Find which candidate files still have links (shared with a public collection)
-    if candidate_file_keys:
-        still_linked: set[tuple[str, str]] = set()
-        file_or_filter = [
-            {"file_id_namespace": ns, "file_local_id": lid}
-            for ns, lid in candidate_file_keys
-        ]
-        cursor = api.db.file_in_collection.find(
-            {"$or": file_or_filter},
-            {"file_id_namespace": 1, "file_local_id": 1},
-        )
-        async for doc in cursor:
-            still_linked.add(
-                (doc["file_id_namespace"], doc["file_local_id"])
-            )
-
-        orphaned = candidate_file_keys - still_linked
-
-        # 6. Delete truly orphaned files
-        if orphaned:
-            orphan_filter = [
-                {"id_namespace": ns, "local_id": lid}
-                for ns, lid in orphaned
-            ]
-            file_result = await api.db.file.delete_many({"$or": orphan_filter})
-            logger.info(
-                f"HuBMAP pruning: deleted {file_result.deleted_count} orphaned file records"
-            )
-        else:
-            logger.info("HuBMAP pruning: no orphaned file records to delete")
-    else:
-        logger.info("HuBMAP pruning: no file_in_collection links found for non-public collections")
-
-
-async def _enrich_hubmap_files(dataset_metadata: dict[str, dict]) -> None:
-    """Enrich materialized HuBMAP files with metadata from the Search API.
-
-    Stores ``genome_assembly``, ``is_data_product``, and ``rel_path`` on
-    ``extra``, then stamps all HuBMAP files as ``data_access_level = "public"``
-    (non-public records were already pruned before materialization).
-    """
-    from pymongo import UpdateOne
-
-    if api.db is None:
-        raise RuntimeError("Database not initialized")
-
-    # Build DOI -> file-level lookup
-    doi_file_info: dict[str, dict] = {}
-    for doi_url, meta in dataset_metadata.items():
-        info: dict = {}
-
-        genome_assembly = meta.get("genome_assembly")
-        if genome_assembly:
-            info["genome_assembly"] = genome_assembly
-
-        # Build filename -> file metadata lookup from files array
-        files_list = meta.get("files", [])
-        file_lookup: dict[str, dict] = {}
-        for f in files_list:
-            rel_path = f.get("rel_path")
-            if rel_path:
-                entry = {"rel_path": rel_path}
-                is_data_product = f.get("is_data_product")
-                if is_data_product is not None:
-                    entry["is_data_product"] = is_data_product
-                # Use the basename as key for matching with C2M2 filename
-                basename = rel_path.rsplit("/", 1)[-1] if "/" in rel_path else rel_path
-                file_lookup[basename] = entry
-        if file_lookup:
-            info["file_lookup"] = file_lookup
-
-        if info:
-            doi_file_info[doi_url] = info
-
-    if not doi_file_info:
-        logger.warning("HuBMAP file enrichment: no dataset metadata available")
-        # Still stamp all HuBMAP files as public
-        await api.db.files.update_many(
-            {"submission": "hubmap"},
-            {"$set": {"data_access_level": "public"}},
-        )
-        return
-
-    # Get DOI URLs for all HuBMAP collections (to map files to datasets)
-    collection_doi_map: dict[str, str] = {}  # (id_namespace, local_id) key -> doi_url
-    cursor = api.db.collection.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "id_namespace": 1, "local_id": 1, "persistent_id": 1},
-    )
-    async for doc in cursor:
-        persistent_id = doc.get("persistent_id", "")
-        if persistent_id in doi_file_info:
-            key = f"{doc.get('id_namespace', '')}|{doc.get('local_id', '')}"
-            collection_doi_map[key] = persistent_id
-
-    logger.info(
-        f"HuBMAP file enrichment: {len(collection_doi_map)} collections matched to datasets"
-    )
-
-    # Iterate materialized files and build updates
-    operations = []
-    cursor = api.db.files.find(
-        {"submission": "hubmap"},
-        {"_id": 1, "filename": 1, "collections": 1},
-    )
-    async for doc in cursor:
-        # Find matching dataset via collection DOI
-        collections = doc.get("collections", [])
-        matched_info = None
-        for coll in collections:
-            if isinstance(coll, dict):
-                key = f"{coll.get('id_namespace', '')}|{coll.get('local_id', '')}"
-            else:
-                continue
-            doi_url = collection_doi_map.get(key)
-            if doi_url:
-                matched_info = doi_file_info.get(doi_url)
-                if matched_info:
-                    break
-
-        if not matched_info:
-            continue
-
-        update: dict = {}
-
-        # Promoted field
-        genome_assembly = matched_info.get("genome_assembly")
-        if genome_assembly:
-            update["genome_assembly"] = genome_assembly
-
-        # Try to match by filename to get per-file metadata
-        filename = doc.get("filename", "")
-        file_lookup = matched_info.get("file_lookup", {})
-        if filename and filename in file_lookup:
-            file_meta = file_lookup[filename]
-            rel_path = file_meta.get("rel_path")
-            if rel_path:
-                update["extra.hubmap.rel_path"] = rel_path
-            is_data_product = file_meta.get("is_data_product")
-            if is_data_product is not None:
-                update["extra.hubmap.is_data_product"] = is_data_product
-
-        if update:
-            operations.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
-
-    if not operations:
-        logger.warning("HuBMAP file enrichment: no updates to apply")
-        # Still stamp all HuBMAP files as public
-        await api.db.files.update_many(
-            {"submission": "hubmap"},
-            {"$set": {"data_access_level": "public"}},
-        )
-        return
-
-    total_modified = 0
-    for i in range(0, len(operations), BATCH_SIZE):
-        batch = operations[i : i + BATCH_SIZE]
-        result = await api.db.files.bulk_write(batch, ordered=False)
-        total_modified += result.modified_count
-
-    logger.info(f"HuBMAP file enrichment: updated {total_modified} files")
-
-    # All surviving HuBMAP files are public (non-public pruned before materialization)
-    await api.db.files.update_many(
-        {"submission": "hubmap"},
-        {"$set": {"data_access_level": "public"}},
-    )
-
-
-async def _ingest_encode_rows(
+async def _ingest_rows(
     task: SyncTask,
+    submission: str,
     label: str,
     rows,
     transform,
-    compression_counts: Counter[str | None],
-    annotation_type_counts: Counter[str],
     counts_by_phase: dict[str, int],
     stale_filter: dict,
+    tally=None,
+    clear_on_empty: bool = True,
 ) -> None:
-    """Transform and batch-insert one ENCODE metadata stream.
+    """Transform and batch-insert one upstream metadata stream.
 
-    Shared by the experiment and annotation phases so both use the same
-    batching, the same skip-on-None handling, and contribute to the same
-    corpus-wide tallies.
+    Shared by the ENCODE phases and the HuBMAP loader so every REST-API
+    ingest uses the same batching, the same skip-on-None handling, and the
+    same deferred stale-clearing -- the detach-before-await, cancellation,
+    and finally-flush semantics below are subtle enough that forking them
+    per DCC would be how they diverge.
 
     The row count is reported by mutating ``counts_by_phase`` rather than by
     returning, and a partial batch left buffered by a dead stream is flushed
@@ -1081,9 +657,10 @@ async def _ingest_encode_rows(
     does. Reporting by return meant a failed phase contributed nothing to
     the caller's total even though its completed batches were already
     committed, so the sync under-reported the corpus by up to everything
-    that phase had loaded, while the tallies below (mutated per row, not per
-    batch) over-reported it by the discarded partial batch. Three numbers in
-    one log block that disagreed with each other and with the database.
+    that phase had loaded, while the caller's tallies (mutated per row, not
+    per batch) over-reported it by the discarded partial batch. Three
+    numbers in one log block that disagreed with each other and with the
+    database.
 
     The *clean-path* flush is deliberately not in that ``finally``. A
     ``finally`` runs whether or not an exception is in flight, so suppressing
@@ -1094,15 +671,30 @@ async def _ingest_encode_rows(
 
     Args:
         task: Sync task whose ``progress`` is updated per batch.
-        label: Names this stream in progress and log lines.
-        rows: Async iterable of TSV row dicts.
+        submission: DCC whose slice of ``files`` this stream loads. Scopes
+            the stale clear and names the stream in progress and log lines.
+        label: Names this stream alongside ``submission``, so with several
+            streams per sync a progress or timeout message identifies which
+            one it came from.
+        rows: Async iterable of upstream row/document dicts.
         transform: Row -> document callable; None means skip the row.
-        compression_counts: Mutated with each document's compression term.
-        annotation_type_counts: Mutated with each document's annotation type.
         counts_by_phase: Mutated with this phase's committed row count, on
             the failure path as well as the success path.
-        stale_filter: Selects the slice of ``files`` this phase owns, deleted
-            once replacement rows are in hand. See ``clear_stale_once``.
+        stale_filter: Selects the slice of ``files`` this phase owns within
+            the submission, deleted once replacement rows are in hand. An
+            empty dict means the whole submission. See ``clear_stale_once``.
+        tally: Optional callable invoked with each transformed document
+            before it is buffered, so a caller can maintain corpus-wide
+            distributions without this function knowing their shape. Like
+            the row count, it runs per row rather than per batch, so a
+            mid-flight death leaves it ahead of the database by the
+            discarded partial batch.
+        clear_on_empty: Whether a stream that drains cleanly with no rows
+            is authoritative and clears the slice. True suits a stream
+            owning one slice among several, where an empty answer is a
+            legitimate result; a stream owning a whole submission passes
+            False, and an empty drain then raises instead of deleting the
+            submission over what is almost certainly an upstream fault.
     """
     batch: list[dict] = []
     count = 0
@@ -1112,7 +704,7 @@ async def _ingest_encode_rows(
         """Delete the slice this phase owns, once, before its first write.
 
         Deferred to the first batch rather than run before the stream opens.
-        The known ENCODE failures -- a 504 while the portal assembles the
+        The known upstream failures -- a 504 while a portal assembles the
         response, an exhausted download budget -- strike before any row
         arrives, and clearing up front would delete the slice and then have
         nothing to put back, serving an empty one until the next successful
@@ -1125,10 +717,13 @@ async def _ingest_encode_rows(
             return
         stale_cleared = True
         deleted = await api.db.files.delete_many(
-            {"submission": "encode", **stale_filter}
+            {"submission": submission, **stale_filter}
         )
         logger.info(
-            "ENCODE %s: cleared %d stale files", label, deleted.deleted_count
+            "%s %s: cleared %d stale files",
+            submission.upper(),
+            label,
+            deleted.deleted_count,
         )
 
     async def commit(pending: list[dict]) -> None:
@@ -1147,20 +742,16 @@ async def _ingest_encode_rows(
         # The stream owns an aiohttp session inside its own ``async with``,
         # released only when the generator is finalized -- left to the
         # garbage collector that is neither prompt nor guaranteed in a
-        # long-lived API process, and the annotation fan-out turned one
-        # stream per sync into N+1.
+        # long-lived API process, and the ENCODE annotation fan-out turned
+        # one stream per sync into N+1.
         async with aclosing(rows):
             async for row in rows:
                 doc = transform(row)
                 if doc is None:
                     continue
 
-                compression_counts[doc.get("compression_format")] += 1
-                annotation_type = (
-                    doc.get("extra", {}).get("encode", {}).get("annotation_type")
-                )
-                if annotation_type:
-                    annotation_type_counts[annotation_type] += 1
+                if tally is not None:
+                    tally(doc)
 
                 batch.append(doc)
                 count += 1
@@ -1175,12 +766,22 @@ async def _ingest_encode_rows(
                 if len(batch) >= BATCH_SIZE:
                     pending, batch = batch, []
                     await commit(pending)
-                    task.progress = f"Inserted {count} ENCODE {label} files..."
+                    task.progress = (
+                        f"{submission.upper()} {label}: inserted "
+                        f"{count} files..."
+                    )
                     logger.info(task.progress)
 
         # The stream drained without error, so its result is authoritative
-        # even when it is empty: clear here too, or a type ENCODE stopped
-        # publishing would keep serving last sync's rows indefinitely.
+        # even when it is empty: clear here too, or a type the upstream
+        # stopped publishing would keep serving last sync's rows
+        # indefinitely -- unless the caller has said an empty answer from
+        # this stream is never authoritative.
+        if count == 0 and not clear_on_empty:
+            raise RuntimeError(
+                f"{submission.upper()} {label}: the stream yielded no rows; "
+                "refusing to clear the existing slice over an empty result"
+            )
         await clear_stale_once()
 
         # The clean-path flush: inside the ``try``, so a sink failure with no
@@ -1209,12 +810,15 @@ async def _ingest_encode_rows(
             except Exception:
                 # Never let the flush replace the exception that caused it.
                 logger.exception(
-                    "ENCODE %s: failed to commit the final %d-row batch",
+                    "%s %s: failed to commit the final %d-row batch",
+                    submission.upper(),
                     label,
                     len(batch),
                 )
         counts_by_phase[label] = count
-        logger.info(f"ENCODE {label} ingest complete: {count} files")
+        logger.info(
+            f"{submission.upper()} {label} ingest complete: {count} files"
+        )
 
 
 async def _sync_encode(task: SyncTask) -> None:
@@ -1344,17 +948,26 @@ async def _sync_encode(task: SyncTask) -> None:
                 )
             )
 
+        def tally(doc: dict) -> None:
+            """Maintain the ENCODE-specific corpus-wide distributions."""
+            compression_counts[doc.get("compression_format")] += 1
+            annotation_type = (
+                doc.get("extra", {}).get("encode", {}).get("annotation_type")
+            )
+            if annotation_type:
+                annotation_type_counts[annotation_type] += 1
+
         for label, open_stream, transform, stale_filter in phases:
             try:
-                await _ingest_encode_rows(
+                await _ingest_rows(
                     task,
+                    "encode",
                     label,
                     open_stream(),
                     transform,
-                    compression_counts,
-                    annotation_type_counts,
                     counts_by_phase,
                     stale_filter,
+                    tally=tally,
                 )
             except Exception as exc:
                 # Deliberately broad: the point is that no failure mode of
@@ -1415,6 +1028,278 @@ async def _sync_encode(task: SyncTask) -> None:
             f"({failed_labels}); {count} files were loaded from the phases "
             "that succeeded"
         ) from failures[0][1]
+
+
+#: Margin kept between an in-lock stream's deadline and the moment the sync
+#: lock turns stale, so the stream's own teardown fits inside the lock.
+_STALE_MARGIN = timedelta(minutes=5)
+
+#: The least time the HuBMAP file stream is allowed to start with. The
+#: stream's slice is cleared at its first committed batch, so a deadline that
+#: expires mid-walk leaves a truncated slice; refusing to start with less than
+#: this keeps the previous slice instead. A full walk takes one to two minutes.
+_MIN_STREAM_SECONDS = 300
+
+
+async def _stale_safe_deadline(budget_seconds: int) -> float:
+    """Event-loop deadline for a sync's network work, clamped to the lock.
+
+    ``budget_seconds`` from now, or the moment the sync lock would turn
+    stale less ``_STALE_MARGIN``, whichever comes first. Staleness counts
+    from the lock's last heartbeat, which ``_sync_dccs`` refreshes as each
+    DCC starts, so the clamp normally leaves the whole budget; it binds only
+    when the budget itself would outlive the lock, or when no heartbeat has
+    been recorded since a long run began. With no sync lock held (a direct
+    call), only the budget applies.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_seconds
+    lock = await locks.get_current_sync_task()
+    alive_at = locks.sync_lock_alive_at(lock) if lock else None
+    if isinstance(alive_at, datetime):
+        stale_at = alive_at + locks.STALE_LOCK_THRESHOLD - _STALE_MARGIN
+        remaining = (stale_at - datetime.utcnow()).total_seconds()
+        deadline = min(deadline, loop.time() + remaining)
+    return deadline
+
+
+async def sync_hubmap(task: SyncTask) -> None:
+    """
+    Sync HuBMAP data from the files search API.
+
+    Like ENCODE, HuBMAP documents are pre-materialized directly into the
+    files collection -- no C2M2 zip download, no TSV load, and no Rust
+    materializer run. Dataset-level context (donor demographics, pipeline,
+    genome assembly) is prefetched before the file stream opens, and organ
+    codes map through a checked-in UBERON table, so every document is
+    emitted fully populated in one insert pass and no post-load enrichment
+    or pruning stages exist. The file query itself admits only public
+    files, which is what retired the pruning pass.
+
+    The prefetch runs before the cutover lock is taken: it touches no
+    database state, and the lock gates the whole read surface, so holding
+    it across ~10k datasets of network fetch would fail every API request
+    for that long. Only the clear and the file stream run under the lock.
+    Every fetch shares one deadline from ``sync_budget_seconds``, clamped so
+    it ends before the sync lock -- whose staleness counts from the start
+    of the whole multi-DCC run -- could turn stale and admit a second sync.
+    The in-lock stream still holds the read surface for the minutes it
+    takes; only a staged load would shorten that.
+
+    A single stream loads the whole submission, so there is no per-phase
+    isolation: any failure propagates and is recorded as this DCC's failure
+    by ``_sync_dccs``, while ``_ingest_rows``'s deferred clear ensures a
+    fetch that dies before delivering rows leaves the previous corpus being
+    served rather than empty. A stream that drains cleanly with no rows is
+    refused rather than obeyed, and so is an empty dataset map: for a
+    submission one stream owns, either is an upstream fault, never a real
+    answer.
+
+    An empty extension allowlist is a no-op that leaves the existing slice
+    in place -- the same outcome an empty ``ENCODE_ANNOTATION_TYPES`` has
+    for ENCODE's annotation phases.
+    """
+    from cfdb.models import FileMetadataModel
+    from cfdb.services.hubmap import (
+        build_donor_lookup,
+        build_hubmap_dcc_record,
+        fetch_dataset_metadata_bulk,
+        fetch_file_metadata,
+        file_extensions_from_env,
+        sync_budget_seconds,
+        transform_file_to_cfdb,
+    )
+
+    if api.db is None:
+        raise RuntimeError("Database not initialized")
+
+    extensions = file_extensions_from_env()
+    if not extensions:
+        task.progress = (
+            "HuBMAP sync skipped: the extension allowlist is empty; the "
+            "existing HuBMAP slice was left in place"
+        )
+        logger.warning(task.progress)
+        return
+    logger.info("HuBMAP file ingest: extension allowlist %s", list(extensions))
+
+    counts_by_phase: dict[str, int] = {}
+    # One counter for everything the transform wants observed -- the
+    # per-extension document distribution, skip reasons, unmapped organ
+    # codes, and join misses -- logged as distributions below rather than a
+    # line per file.
+    stats: Counter[str] = Counter()
+
+    # One deadline for every network fetch this sync makes, resolved before
+    # the first of them and clamped to the sync lock's stale threshold; see
+    # ``_stale_safe_deadline``.
+    deadline = await _stale_safe_deadline(sync_budget_seconds())
+
+    # Step 1: Prefetch the dataset-level context the files index does not
+    # carry, outside the cutover lock. ~10k datasets held in memory -- small
+    # against the file stream they enrich, and what makes the single-pass
+    # join possible. Organ codes need no fetch: they map through a checked-in
+    # table.
+    task.current_step = "fetching"
+    task.progress = "Fetching HuBMAP dataset metadata..."
+    logger.info(task.progress)
+
+    dataset_metadata = await fetch_dataset_metadata_bulk(deadline=deadline)
+    if not dataset_metadata:
+        # Refused before the lock, so the previous slice keeps being served:
+        # an empty map would load every file without its dataset context or
+        # donor demographics and report success.
+        raise RuntimeError(
+            "HuBMAP dataset index returned no datasets; refusing to load "
+            "files with no dataset context"
+        )
+    donor_lookup = build_donor_lookup(dataset_metadata)
+
+    def transform(src: dict) -> Optional[dict]:
+        # One malformed upstream document costs that document, not the
+        # sync: an exception here would otherwise abort the stream after
+        # the stale clear and leave a partial slice. The model check is part
+        # of the same guard -- a document that transforms but does not
+        # validate (an upstream field that changed type) would otherwise be
+        # stored, and every API page holding it would then fail to build.
+        try:
+            doc = transform_file_to_cfdb(
+                src,
+                dataset_metadata=dataset_metadata,
+                donor_lookup=donor_lookup,
+                stats=stats,
+            )
+            if doc is not None:
+                FileMetadataModel(**doc)
+            return doc
+        except Exception:
+            stats["skipped:malformed"] += 1
+            if stats["skipped:malformed"] <= 5:
+                logger.exception(
+                    "Skipping malformed HuBMAP file document (file_uuid=%r)",
+                    src.get("file_uuid") if isinstance(src, dict) else None,
+                )
+            return None
+
+    # The stream's slice is cleared at its first committed batch, so a
+    # deadline that expires mid-walk leaves a truncated slice. Refuse here,
+    # before the lock and before any clear, unless enough of the deadline is
+    # left for the walk -- the previous slice is then kept untouched.
+    remaining = deadline - asyncio.get_running_loop().time()
+    floor = min(_MIN_STREAM_SECONDS, sync_budget_seconds() / 2)
+    logger.info("HuBMAP file stream: %.0f s of the sync's deadline remain", remaining)
+    if remaining < floor:
+        raise RuntimeError(
+            f"HuBMAP sync: only {max(remaining, 0):.0f} s of its deadline remain, "
+            f"less than the {floor:.0f} s the file stream needs; refusing to "
+            "start it, so the existing HuBMAP slice is kept"
+        )
+
+    try:
+        async with locks.CutoverLock("hubmap"):
+            # Step 2: Clear existing raw HuBMAP data. ``files`` is
+            # deliberately not cleared here: ``_ingest_rows`` clears that
+            # slice once replacement rows are in hand, so a fetch that fails
+            # before delivering any leaves the previous corpus being served
+            # rather than empty. The raw C2M2 collections (file, collection,
+            # subject, ...) are cleared outright -- nothing reloads them
+            # anymore.
+            task.current_step = "clearing"
+            task.progress = "Clearing existing HuBMAP data..."
+            logger.info(task.progress)
+            await _clear_dcc_data_async("hubmap", skip_collections={"files"})
+
+            # Step 3: Upsert DCC record
+            task.current_step = "dcc_record"
+            task.progress = "Creating HuBMAP DCC record..."
+            logger.info(task.progress)
+            await api.db.dcc.update_one(
+                {"submission": "hubmap"},
+                {"$set": build_hubmap_dcc_record()},
+                upsert=True,
+            )
+
+            # Step 4: Stream, transform, and insert in one pass, under the
+            # deadline resolved above, so the lock window is bounded.
+            task.current_step = "loading"
+            task.progress = "Loading HuBMAP files from the files search API..."
+            logger.info(task.progress)
+
+            await _ingest_rows(
+                task,
+                "hubmap",
+                "files index",
+                fetch_file_metadata(extensions, deadline=deadline),
+                transform,
+                counts_by_phase,
+                # One stream owns the whole submission, so its slice is the
+                # whole submission -- and an empty walk is never a real
+                # answer for it: a mapping change on the index, or an
+                # allowlist that matches nothing, returns a well-formed
+                # empty page that would otherwise delete everything.
+                stale_filter={},
+                clear_on_empty=False,
+            )
+    finally:
+        # HuBMAP writes straight into the materialized collection and never
+        # runs the materializer, which is the only other creator of files
+        # indexes -- same reasoning as the ENCODE path above, including
+        # running on failure: a partially loaded slice still has to be
+        # servable without a full collection scan.
+        await ensure_indexes(api.db, materialized_files_index_specs())
+
+    count = counts_by_phase.get("files index", 0)
+    task.progress = f"HuBMAP sync complete: {count} files"
+    logger.info(task.progress)
+    logger.info(
+        "HuBMAP extension distribution: %s",
+        {
+            key.removeprefix("extension:"): n
+            for key, n in stats.most_common()
+            if key.startswith("extension:")
+        },
+    )
+    skipped = stats.get("skipped:incomplete", 0)
+    if skipped:
+        logger.warning(
+            f"HuBMAP ingest: skipped {skipped} documents missing file_uuid, "
+            "rel_path, or dataset_uuid"
+        )
+    unmapped = {
+        key.removeprefix("unmapped_organ:"): n
+        for key, n in stats.items()
+        if key.startswith("unmapped_organ:")
+    }
+    if unmapped:
+        logger.warning(
+            f"HuBMAP ingest: organ codes with no UBERON mapping {unmapped}; "
+            "those anatomy terms were omitted"
+        )
+    malformed = stats.get("skipped:malformed", 0)
+    if malformed:
+        logger.warning(
+            f"HuBMAP ingest: skipped {malformed} documents that failed to "
+            "transform or to validate"
+        )
+    missing = {
+        key.removeprefix("missing:"): n
+        for key, n in stats.items()
+        if key.startswith("missing:")
+    }
+    if missing:
+        logger.warning(
+            f"HuBMAP ingest: files missing upstream integrity fields {missing}; "
+            "those fields were stored as null"
+        )
+    unjoined = {
+        key: stats[key] for key in ("unjoined_dataset", "unjoined_donor") if stats[key]
+    }
+    if unjoined:
+        logger.warning(
+            f"HuBMAP ingest: join misses {unjoined} (file occurrences whose "
+            "dataset or donor is absent from the dataset index); those "
+            "documents carry no dataset context or demographics"
+        )
 
 
 async def _materialize_files(submission: str) -> None:

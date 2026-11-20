@@ -353,11 +353,11 @@ class _Dumper:
     def _precoerce_int(self, container: Any, key: str, counter: str) -> None:
         """Coerce a known string-typed numeric field on the raw document.
 
-        4DN and HuBMAP load ``size_in_bytes`` (and 4DN its sidecar
-        ``file_size``) as strings through the C2M2 TSV path. Left alone,
-        a non-numeric value would fail the whole document's model
-        validation; coerced here, the failure costs one NULL and one
-        counted coercion instead of the document.
+        4DN loads ``size_in_bytes`` (and its sidecar ``file_size``) as
+        strings through the C2M2 TSV path. Left alone, a non-numeric value
+        would fail the whole document's model validation; coerced here, the
+        failure costs one NULL and one counted coercion instead of the
+        document.
         """
         if not isinstance(container, dict):
             return
@@ -801,6 +801,7 @@ class _Dumper:
                     if hubmap.metadata is None
                     else json.dumps(hubmap.metadata, sort_keys=True)
                 ),
+                "dataset_status": hubmap.dataset_status,
             }
             if self._any_value(row, key_cols):
                 self._register("collection_extra_hubmap", row)
