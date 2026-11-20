@@ -215,6 +215,7 @@ class EnrichedHubmapCollection(BaseModel):
     visualization: Optional[bool] = None
     vitessce_hints: Optional[List[str]] = None
     metadata: Optional[dict] = None
+    dataset_status: Optional[str] = None
 
 
 class EnrichedHubmapSubject(BaseModel):
