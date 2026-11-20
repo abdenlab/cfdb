@@ -1,4 +1,13 @@
-"""Tests for sync service pruning and enrichment changes."""
+"""Tests for the sync service: dispatch, per-DCC loaders, and enrichment.
+
+These tests drive the module's private per-DCC functions (``_sync_dccs``,
+``_sync_encode``, ``_sync_hubmap``, ...) directly. That is a deliberate,
+module-wide exception to the test guide's rule against referencing private
+functions: the only public entry point, ``start_sync``, schedules the run
+as a detached background task and returns before it does any work, so no
+public seam exists to drive a loader through and observe what it wrote.
+New loaders follow the same convention rather than forking it.
+"""
 
 from __future__ import annotations
 
@@ -383,7 +392,8 @@ class TestSyncDccsFailureIsolation:
 
 
 # ---------------------------------------------------------------------------
-# _sync_hubmap
+# _sync_hubmap -- driven directly under the module docstring's recorded
+# exception for private per-DCC loaders, like _sync_encode above.
 # ---------------------------------------------------------------------------
 
 
