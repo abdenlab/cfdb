@@ -184,7 +184,7 @@ Because both prod task definitions already reference `:prod`, this doubles as th
 
 Production never advances automatically. `.github/workflows/promote-to-prod.yml` is `workflow_dispatch`-only and gated on the `prod` GitHub Environment's required reviewers. Dispatch it with the 8-character `:<sha>` tag that the dev pipeline already built, scanned, and shipped; it verifies that tag exists in **both** `cfdb` and `cfdb-wool`, re-tags each onto `:prod` by copying the ECR manifest, rolls the prod API service, and waits for `services-stable`.
 
-Promotion re-tags rather than rebuilds, so prod runs bytes byte-identical to what dev validated. **Rollback is the same operation with an older SHA:** dispatch the workflow again naming the previous `:<sha>`. As on dev, the worker fleet needs no ECS step — the prod worker task def also references `:prod` and workers are ephemeral, so the next `EcsProvisioner` `RunTask` pulls the new image. That does mean the API rolls immediately while in-flight workers may still run the prior image until they drain, so keep the API↔worker dispatch contract compatible across adjacent promotions.
+Promotion re-tags rather than rebuilds, so prod runs bytes byte-identical to what dev validated. **Rollback is the same operation with an older SHA:** dispatch the workflow again naming the previous `:<sha>`. As on dev, the worker fleet needs no ECS step — the prod worker task def also references `:prod` and workers are ephemeral, so the next `EcsProvisioner` `RunTask` pulls the new image. That does mean the API rolls immediately while in-flight workers may still run the prior image until they drain, so keep the API↔worker dispatch contract compatible across adjacent promotions. Rolling back past the HuBMAP files-API loader is the one rollback that also needs data: documents it wrote carry assets URLs that older images refuse, so re-sync HuBMAP after such a rollback (see `HUBMAP-SUPPLEMENT.md`, Rolling back).
 
 Prod requires this one-time setup before the first promotion:
 
@@ -831,12 +831,13 @@ Stream index files (e.g., `.px2`, `.bai`) associated with DCC data files.
 | 202 | Index not yet cached — workflow accepted. `Location: /jobs/{id}` and `Retry-After` headers point to the polling endpoint. Under load the job may sit `pending` in the durable queue before a worker picks it up; poll `/jobs/{id}` for progress. |
 | 206 | Partial content (Range request) |
 | 400 | Invalid DCC, path-param shape, or Range header |
-| 403 | File requires consortium/protected access (HuBMAP) |
-| 404 | File not found, format has no index (CSV/TSV/bigWig), or HEAD probe of a not-yet-cached index |
+| 403 | File requires consortium/protected access (HuBMAP), or the upstream host refused the sidecar |
+| 404 | File not found, format has no index (CSV/TSV/bigWig), HEAD probe of a not-yet-cached index, or the sidecar is missing upstream |
 | 416 | Range not satisfiable |
 | 429 | Too many active preprocessing jobs — the active-workflow ceiling (`CFDB_WORKFLOW_MAX_ACTIVE`) is reached; `Retry-After` header set. Retry shortly. |
 | 502 | Upstream service error or malformed sidecar |
 | 503 | Workflow subsystem disabled (set `SYNC_DATA_DIR`) for a processable format, or shutting down (`Retry-After`) |
+| 504 | Upstream timed out before sending the sidecar |
 
 ```bash
 # Download an index file
