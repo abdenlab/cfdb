@@ -1,4 +1,4 @@
-"""Tests for ENCODE file format mapping in ontology_mappings."""
+"""Tests for the ontology mapping tables and lookups."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from hypothesis import strategies as st
 
 from cfdb.services.ontology_mappings import (
     FILE_FORMAT_TO_EDAM,
+    HUBMAP_ORGAN_TO_UBERON,
     MINTED_FORMAT_PREFIX,
     get_data_type,
     get_file_format,
@@ -443,3 +444,54 @@ def test_get_file_format_return_type_invariant(format_string):
         assert isinstance(result, dict)
         assert "id" in result
         assert "name" in result
+
+
+def test_hubmap_organ_to_uberon_should_hold_only_uberon_terms():
+    """Test every HuBMAP organ code maps to a UBERON id with a label.
+
+    The data model promises UBERON anatomy ids, and UBKG's organ_uberon
+    carries FMA ids for some codes, so the table is where that promise is
+    kept.
+
+    Given:
+        The checked-in HuBMAP organ table.
+    When:
+        Its entries are inspected.
+    Then:
+        Every id should be a UBERON CURIE and every name a non-empty,
+        lower-case UBERON label.
+    """
+    # Act
+    entries = list(HUBMAP_ORGAN_TO_UBERON.values())
+
+    # Assert
+    assert entries
+    assert all(entry["id"].startswith("UBERON:") for entry in entries)
+    assert all(entry["name"] and entry["name"] == entry["name"].lower() for entry in entries)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "parent"),
+    [
+        ("LN", "RN", "UBERON:0001465"),
+        ("ML", "MR", "UBERON:0001911"),
+        ("LT", "RT", "UBERON:0002372"),
+    ],
+)
+def test_hubmap_organ_to_uberon_should_map_fma_only_lateral_organs_to_their_parent(
+    left, right, parent
+):
+    """Test the organs UBKG gives only FMA ids land on their UBERON parent.
+
+    Given:
+        A left/right organ pair whose UBKG entries carry FMA ids.
+    When:
+        Both codes are looked up in the table.
+    Then:
+        Both should map to the side-neutral UBERON parent.
+    """
+    # Act
+    ids = {HUBMAP_ORGAN_TO_UBERON[left]["id"], HUBMAP_ORGAN_TO_UBERON[right]["id"]}
+
+    # Assert
+    assert ids == {parent}

@@ -280,6 +280,69 @@ ORGANISM_TO_NCBI_TAXONOMY = {
 }
 
 
+# HuBMAP organ code (``organs[].code`` in the files index, UBKG's
+# ``rui_code``) to its UBERON term, named by the UBERON label so an id
+# carries the same name here as in ENCODE and 4DN. Snapshot of the UBKG
+# organs endpoint (ontology.api.hubmapconsortium.org/organs?
+# application_context=HUBMAP) taken 2026-11-20, labels from OLS4. UBKG's
+# ``organ_uberon`` holds FMA ids for the lateral knee, mammary gland and
+# tonsil codes; those map to their side-neutral UBERON parent, which UBKG
+# names under ``category``. A static table rather than a per-sync fetch, as
+# the loader's issue allows: a fetch that fails would strip anatomy from the
+# whole slice, and UBKG's display terms ("Kidney (Left)") are not UBERON
+# labels ("left kidney"). A code that appears upstream later is counted and
+# logged as unmapped by the loader until it is added here.
+HUBMAP_ORGAN_TO_UBERON = {
+    "AD": {"id": "UBERON:0001013", "name": "adipose tissue"},
+    "BD": {"id": "UBERON:0000178", "name": "blood"},
+    "BL": {"id": "UBERON:0001255", "name": "urinary bladder"},
+    "BM": {"id": "UBERON:0002371", "name": "bone marrow"},
+    "BR": {"id": "UBERON:0000955", "name": "brain"},
+    "BV": {"id": "UBERON:0004537", "name": "blood vasculature"},
+    "HT": {"id": "UBERON:0000948", "name": "heart"},
+    "ID": {"id": "UBERON:0001066", "name": "intervertebral disk"},
+    "LA": {"id": "UBERON:0001737", "name": "larynx"},
+    "LB": {"id": "UBERON:0002178", "name": "left main bronchus"},
+    "LE": {"id": "UBERON:0004548", "name": "left eye"},
+    "LF": {"id": "UBERON:0001303", "name": "left fallopian tube"},
+    "LI": {"id": "UBERON:0000059", "name": "large intestine"},
+    "LK": {"id": "UBERON:0004538", "name": "left kidney"},
+    "LL": {"id": "UBERON:0002168", "name": "left lung"},
+    "LN": {"id": "UBERON:0001465", "name": "knee"},  # Knee (Left): side-neutral parent; UBKG gives FMA here
+    "LO": {"id": "UBERON:0002119", "name": "left ovary"},
+    "LT": {"id": "UBERON:0002372", "name": "tonsil"},  # Tonsil (Left): side-neutral parent; UBKG gives FMA here
+    "LU": {"id": "UBERON:0001223", "name": "left ureter"},
+    "LV": {"id": "UBERON:0002107", "name": "liver"},
+    "LY": {"id": "UBERON:0000029", "name": "lymph node"},
+    "MB": {"id": "UBERON:2001553", "name": "manubrium"},
+    "MH": {"id": "UBERON:0000165", "name": "mouth"},
+    "ML": {"id": "UBERON:0001911", "name": "mammary gland"},  # Mammary Gland (Left): side-neutral parent; UBKG gives FMA here
+    "MR": {"id": "UBERON:0001911", "name": "mammary gland"},  # Mammary Gland (Right): side-neutral parent; UBKG gives FMA here
+    "PA": {"id": "UBERON:0001264", "name": "pancreas"},
+    "PL": {"id": "UBERON:0001987", "name": "placenta"},
+    "PR": {"id": "UBERON:0000079", "name": "male reproductive system"},  # Prostate: UBKG's mapping, kept verbatim
+    "PV": {"id": "UBERON:0001270", "name": "bony pelvis"},
+    "RB": {"id": "UBERON:0002177", "name": "right main bronchus"},
+    "RE": {"id": "UBERON:0004549", "name": "right eye"},
+    "RF": {"id": "UBERON:0001302", "name": "right fallopian tube"},
+    "RK": {"id": "UBERON:0004539", "name": "right kidney"},
+    "RL": {"id": "UBERON:0002167", "name": "right lung"},
+    "RN": {"id": "UBERON:0001465", "name": "knee"},  # Knee (Right): side-neutral parent; UBKG gives FMA here
+    "RO": {"id": "UBERON:0002118", "name": "right ovary"},
+    "RT": {"id": "UBERON:0002372", "name": "tonsil"},  # Tonsil (Right): side-neutral parent; UBKG gives FMA here
+    "RU": {"id": "UBERON:0001222", "name": "right ureter"},
+    "SC": {"id": "UBERON:0002240", "name": "spinal cord"},
+    "SI": {"id": "UBERON:0002108", "name": "small intestine"},
+    "SK": {"id": "UBERON:0002097", "name": "skin of body"},
+    "SP": {"id": "UBERON:0002106", "name": "spleen"},
+    "ST": {"id": "UBERON:0000975", "name": "sternum"},
+    "TH": {"id": "UBERON:0002370", "name": "thymus"},
+    "TR": {"id": "UBERON:0003126", "name": "trachea"},
+    "UT": {"id": "UBERON:0000995", "name": "uterus"},
+    "VL": {"id": "UBERON:0004536", "name": "lymph vasculature"},
+}
+
+
 def get_file_format(encode_format: str) -> dict | None:
     """
     Map ENCODE file_format to EDAM CV term.
