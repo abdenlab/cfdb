@@ -96,7 +96,7 @@ Run `./certs/generate-certs.sh --help` for full usage information.
 | `make api` | Build and start the API container |
 | `make api-tiles` | Build and start the API container **with matrix tile serving enabled**, on a cache volume shared with the worker (local dev; see [Serving tiles locally](#serving-tiles-locally)) |
 | `make worker-tiles` | Start a containerized LAN worker pool on that same cache volume |
-| `make materialize-files` | Manually materialize all file metadata (usually done via sync) |
+| `make materialize-files` | Manually materialize all file metadata (usually done via sync). It drops the whole `files` collection before rebuilding from the raw C2M2 tables, so it deletes every ENCODE and HuBMAP document and writes none back — those DCCs have no raw tables; re-sync them afterwards |
 | `make materialize-dcc DCC=4dn` | Materialize a single DCC. Only C2M2 DCCs (4DN) are materialized: ENCODE and HuBMAP write the `files` collection directly from their APIs and have no raw tables to rebuild from, so materializing either deletes its documents and writes none back |
 | `make schema` | Regenerate the checked-in `schema.graphql` from the Strawberry schema |
 | `make certs` | Generate TLS certificates for production |
