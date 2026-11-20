@@ -145,1112 +145,1133 @@ def _page(*sources: dict, sort_key: str = "file_uuid") -> dict:
     }
 
 
-class TestFileExtensionsFromEnv:
-    def test_file_extensions_from_env_should_return_default_when_unset(
-        self, monkeypatch
-    ):
-        """Test the default allowlist applies when the variable is unset.
+def test_file_extensions_from_env_should_return_default_when_unset(
+    monkeypatch
+):
+    """Test the default allowlist applies when the variable is unset.
 
-        Given:
-            No HUBMAP_FILE_EXTENSIONS in the environment.
-        When:
-            file_extensions_from_env resolves the allowlist.
-        Then:
-            It should return the non-empty default, dot-prefixed throughout.
-        """
-        # Arrange
-        monkeypatch.delenv(EXTENSIONS_ENV, raising=False)
+    Given:
+        No HUBMAP_FILE_EXTENSIONS in the environment.
+    When:
+        file_extensions_from_env resolves the allowlist.
+    Then:
+        It should return the non-empty default, dot-prefixed throughout.
+    """
+    # Arrange
+    monkeypatch.delenv(EXTENSIONS_ENV, raising=False)
 
-        # Act
+    # Act
+    allowlist = file_extensions_from_env()
+
+    # Assert
+    assert allowlist
+    assert ".h5ad" in allowlist
+    assert all(ext.startswith(".") for ext in allowlist)
+
+
+def test_file_extensions_from_env_should_normalize_case_and_missing_dots(
+    monkeypatch
+):
+    """Test entries normalize to what the index's field values look like.
+
+    The server-side terms filter matches ``file_extension`` exactly, so
+    an entry that keeps its case or lacks its dot silently matches
+    nothing.
+
+    Given:
+        A mixed-case, mixed-dot, whitespace-padded override.
+    When:
+        file_extensions_from_env resolves the allowlist.
+    Then:
+        Every entry should come out lower-cased with a leading dot, in
+        the configured order.
+    """
+    # Arrange
+    monkeypatch.setenv(EXTENSIONS_ENV, " h5ad, .BCF ,Gz")
+
+    # Act
+    allowlist = file_extensions_from_env()
+
+    # Assert
+    assert allowlist == (".h5ad", ".bcf", ".gz")
+
+
+def test_file_extensions_from_env_should_return_empty_and_warn_when_set_empty(
+    monkeypatch, caplog
+):
+    """Test an explicitly empty value disables ingest loudly.
+
+    Given:
+        HUBMAP_FILE_EXTENSIONS set to a blank string.
+    When:
+        file_extensions_from_env resolves the allowlist.
+    Then:
+        It should return an empty tuple and log a warning naming the
+        variable.
+    """
+    # Arrange
+    monkeypatch.setenv(EXTENSIONS_ENV, "  ")
+
+    # Act
+    with caplog.at_level("WARNING"):
         allowlist = file_extensions_from_env()
 
-        # Assert
-        assert allowlist
-        assert ".h5ad" in allowlist
-        assert all(ext.startswith(".") for ext in allowlist)
+    # Assert
+    assert allowlist == ()
+    assert any(EXTENSIONS_ENV in record.message for record in caplog.records)
 
-    def test_file_extensions_from_env_should_normalize_case_and_missing_dots(
-        self, monkeypatch
-    ):
-        """Test entries normalize to what the index's field values look like.
 
-        The server-side terms filter matches ``file_extension`` exactly, so
-        an entry that keeps its case or lacks its dot silently matches
-        nothing.
+def test_file_extensions_from_env_should_collapse_repeats_keeping_order(
+    monkeypatch
+):
+    """Test a duplicated token cannot widen or reorder the filter.
 
-        Given:
-            A mixed-case, mixed-dot, whitespace-padded override.
-        When:
-            file_extensions_from_env resolves the allowlist.
-        Then:
-            Every entry should come out lower-cased with a leading dot, in
-            the configured order.
-        """
-        # Arrange
-        monkeypatch.setenv(EXTENSIONS_ENV, " h5ad, .BCF ,Gz")
+    Given:
+        An override repeating one extension in two spellings.
+    When:
+        file_extensions_from_env resolves the allowlist.
+    Then:
+        The first occurrence should win and order should be preserved.
+    """
+    # Arrange
+    monkeypatch.setenv(EXTENSIONS_ENV, ".h5ad,bcf,.H5AD,.bcf")
 
-        # Act
-        allowlist = file_extensions_from_env()
+    # Act
+    allowlist = file_extensions_from_env()
 
-        # Assert
-        assert allowlist == (".h5ad", ".bcf", ".gz")
+    # Assert
+    assert allowlist == (".h5ad", ".bcf")
 
-    def test_file_extensions_from_env_should_return_empty_and_warn_when_set_empty(
-        self, monkeypatch, caplog
-    ):
-        """Test an explicitly empty value disables ingest loudly.
 
-        Given:
-            HUBMAP_FILE_EXTENSIONS set to a blank string.
-        When:
-            file_extensions_from_env resolves the allowlist.
-        Then:
-            It should return an empty tuple and log a warning naming the
-            variable.
-        """
-        # Arrange
-        monkeypatch.setenv(EXTENSIONS_ENV, "  ")
-
-        # Act
-        with caplog.at_level("WARNING"):
-            allowlist = file_extensions_from_env()
-
-        # Assert
-        assert allowlist == ()
-        assert any(EXTENSIONS_ENV in record.message for record in caplog.records)
-
-    def test_file_extensions_from_env_should_collapse_repeats_keeping_order(
-        self, monkeypatch
-    ):
-        """Test a duplicated token cannot widen or reorder the filter.
-
-        Given:
-            An override repeating one extension in two spellings.
-        When:
-            file_extensions_from_env resolves the allowlist.
-        Then:
-            The first occurrence should win and order should be preserved.
-        """
-        # Arrange
-        monkeypatch.setenv(EXTENSIONS_ENV, ".h5ad,bcf,.H5AD,.bcf")
-
-        # Act
-        allowlist = file_extensions_from_env()
-
-        # Assert
-        assert allowlist == (".h5ad", ".bcf")
-
-    @given(
-        entries=st.lists(
-            st.text(
-                alphabet=st.characters(
-                    whitelist_categories=("Ll", "Lu", "Nd")
-                ),
-                min_size=1,
-                max_size=8,
+@given(
+    entries=st.lists(
+        st.text(
+            alphabet=st.characters(
+                whitelist_categories=("Ll", "Lu", "Nd")
             ),
             min_size=1,
             max_size=8,
-        )
+        ),
+        min_size=1,
+        max_size=8,
     )
-    def test_file_extensions_from_env_should_emit_index_shaped_entries(
-        self, entries
-    ):
-        """Test every resolved entry matches the index's value shape.
+)
+def test_file_extensions_from_env_should_emit_index_shaped_entries(
+    entries
+):
+    """Test every resolved entry matches the index's value shape.
 
-        Given:
-            Any comma-joined list of alphanumeric tokens.
-        When:
-            file_extensions_from_env resolves the allowlist.
-        Then:
-            Every entry should be lower-cased, dot-prefixed, and unique.
-        """
-        import os
+    Given:
+        Any comma-joined list of alphanumeric tokens.
+    When:
+        file_extensions_from_env resolves the allowlist.
+    Then:
+        Every entry should be lower-cased, dot-prefixed, and unique.
+    """
+    import os
 
-        # Arrange
-        os.environ[EXTENSIONS_ENV] = ",".join(entries)
-        try:
-            # Act
-            allowlist = file_extensions_from_env()
-        finally:
-            del os.environ[EXTENSIONS_ENV]
+    # Arrange
+    os.environ[EXTENSIONS_ENV] = ",".join(entries)
+    try:
+        # Act
+        allowlist = file_extensions_from_env()
+    finally:
+        del os.environ[EXTENSIONS_ENV]
 
-        # Assert
-        assert all(ext.startswith(".") and ext == ext.lower() for ext in allowlist)
-        assert len(set(allowlist)) == len(allowlist)
+    # Assert
+    assert all(ext.startswith(".") and ext == ext.lower() for ext in allowlist)
+    assert len(set(allowlist)) == len(allowlist)
 
 
-class TestExtractGenomeAssembly:
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("aligned against hg38 reference", "GRCh38"),
-            ("aligned against GRCh38", "GRCh38"),
-            ("built on hg19", "GRCh37"),
-            ("mouse mm10 pipeline", "GRCm38"),
-            ("GRCm39 assembly", "GRCm39"),
-            ("no assembly named here", None),
-        ],
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("aligned against hg38 reference", "GRCh38"),
+        ("aligned against GRCh38", "GRCh38"),
+        ("built on hg19", "GRCh37"),
+        ("mouse mm10 pipeline", "GRCm38"),
+        ("GRCm39 assembly", "GRCm39"),
+        ("no assembly named here", None),
+    ],
+)
+def test_extract_genome_assembly_should_normalize_to_canonical_names(
+    text, expected
+):
+    """Test assembly mentions resolve to their canonical identifiers.
+
+    Given:
+        A workflow description naming an assembly in one of the
+        recognized spellings, or none at all.
+    When:
+        extract_genome_assembly scans it.
+    Then:
+        It should return the canonical assembly name, or None when no
+        pattern matches.
+    """
+    # Act & assert
+    assert extract_genome_assembly(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_name"),
+    [
+        ("secondary_analysis.h5ad", "HDF5"),
+        ("reads.fastq.gz", "FASTQ"),
+        ("variants.bcf", "BCF"),
+        ("matrix.mtx", "MTX"),
+        ("expr.csv", "CSV"),
+    ],
+)
+def test_derive_file_format_should_map_the_inner_extension(
+    filename, expected_name
+):
+    """Test the format comes from the extension under any compression.
+
+    The index's file_extension names the outermost suffix, which for a
+    .fastq.gz is the wrapper rather than the format.
+
+    Given:
+        A filename, compressed or not.
+    When:
+        derive_file_format maps it.
+    Then:
+        It should name the format of the bytes under the compression.
+    """
+    # Act
+    result = derive_file_format(filename)
+
+    # Assert
+    assert result is not None
+    assert result["name"] == expected_name
+
+
+def test_derive_file_format_should_return_none_when_nothing_maps():
+    """Test an unknown or absent extension maps to no format.
+
+    Given:
+        A filename with an unmapped extension and one with none.
+    When:
+        derive_file_format maps each.
+    Then:
+        It should return None for both rather than guessing.
+    """
+    # Act & assert
+    assert derive_file_format("notes.unknownext") is None
+    assert derive_file_format("README") is None
+
+
+def test_transform_file_to_cfdb_should_map_the_file_level_fields():
+    """Test the per-file surface of the index lands on the document.
+
+    Given:
+        A complete files-index document with no dataset join inputs.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        It should carry the identity, checksum, size, status, format,
+        and assets access_url fields the index provides.
+    """
+    # Act
+    doc = _transform(_file_doc())
+
+    # Assert
+    assert doc["submission"] == "hubmap"
+    assert doc["local_id"] == "abc123"
+    assert doc["accession_id"] is None
+    assert doc["filename"] == "secondary_analysis.h5ad"
+    assert doc["extra"]["hubmap"]["rel_path"] == (
+        "processed/secondary_analysis.h5ad"
     )
-    def test_extract_genome_assembly_should_normalize_to_canonical_names(
-        self, text, expected
-    ):
-        """Test assembly mentions resolve to their canonical identifiers.
-
-        Given:
-            A workflow description naming an assembly in one of the
-            recognized spellings, or none at all.
-        When:
-            extract_genome_assembly scans it.
-        Then:
-            It should return the canonical assembly name, or None when no
-            pattern matches.
-        """
-        # Act & assert
-        assert extract_genome_assembly(text) == expected
-
-
-class TestDeriveFileFormat:
-    @pytest.mark.parametrize(
-        ("filename", "expected_name"),
-        [
-            ("secondary_analysis.h5ad", "HDF5"),
-            ("reads.fastq.gz", "FASTQ"),
-            ("variants.bcf", "BCF"),
-            ("matrix.mtx", "MTX"),
-            ("expr.csv", "CSV"),
-        ],
+    assert doc["size_in_bytes"] == 5529765
+    assert isinstance(doc["size_in_bytes"], int)
+    assert doc["md5"] == "0b05f823fd4b3cc86204366c6f71eae9"
+    assert doc["sha256"].startswith("f51518c924f3")
+    assert doc["access_url"] == (
+        "https://assets.hubmapconsortium.org/ds-uuid-1/"
+        "processed/secondary_analysis.h5ad"
     )
-    def test_derive_file_format_should_map_the_inner_extension(
-        self, filename, expected_name
-    ):
-        """Test the format comes from the extension under any compression.
-
-        The index's file_extension names the outermost suffix, which for a
-        .fastq.gz is the wrapper rather than the format.
-
-        Given:
-            A filename, compressed or not.
-        When:
-            derive_file_format maps it.
-        Then:
-            It should name the format of the bytes under the compression.
-        """
-        # Act
-        result = derive_file_format(filename)
-
-        # Assert
-        assert result is not None
-        assert result["name"] == expected_name
-
-    def test_derive_file_format_should_return_none_when_nothing_maps(self):
-        """Test an unknown or absent extension maps to no format.
-
-        Given:
-            A filename with an unmapped extension and one with none.
-        When:
-            derive_file_format maps each.
-        Then:
-            It should return None for both rather than guessing.
-        """
-        # Act & assert
-        assert derive_file_format("notes.unknownext") is None
-        assert derive_file_format("README") is None
+    assert doc["status"] == "Published"
+    assert doc["data_access_level"] == "public"
+    assert doc["file_format"]["name"] == "HDF5"
 
 
-class TestTransformFileToCfdb:
-    def test_transform_file_to_cfdb_should_map_the_file_level_fields(self):
-        """Test the per-file surface of the index lands on the document.
+def test_transform_file_to_cfdb_should_produce_a_valid_model():
+    """Test the emitted document validates against the file model.
 
-        Given:
-            A complete files-index document with no dataset join inputs.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            It should carry the identity, checksum, size, status, format,
-            and assets access_url fields the index provides.
-        """
-        # Act
-        doc = _transform(_file_doc())
-
-        # Assert
-        assert doc["submission"] == "hubmap"
-        assert doc["local_id"] == "abc123"
-        assert doc["accession_id"] is None
-        assert doc["filename"] == "secondary_analysis.h5ad"
-        assert doc["extra"]["hubmap"]["rel_path"] == (
-            "processed/secondary_analysis.h5ad"
-        )
-        assert doc["size_in_bytes"] == 5529765
-        assert isinstance(doc["size_in_bytes"], int)
-        assert doc["md5"] == "0b05f823fd4b3cc86204366c6f71eae9"
-        assert doc["sha256"].startswith("f51518c924f3")
-        assert doc["access_url"] == (
-            "https://assets.hubmapconsortium.org/ds-uuid-1/"
-            "processed/secondary_analysis.h5ad"
-        )
-        assert doc["status"] == "Published"
-        assert doc["data_access_level"] == "public"
-        assert doc["file_format"]["name"] == "HDF5"
-
-    def test_transform_file_to_cfdb_should_produce_a_valid_model(self):
-        """Test the emitted document validates against the file model.
-
-        Given:
-            A complete files-index document with full join inputs.
-        When:
-            transform_file_to_cfdb runs and the result is validated.
-        Then:
-            FileMetadataModel should accept it without error.
-        """
-        # Arrange
-        dataset_metadata = {
-            "ds-uuid-1": {
-                "pipeline": "Salmon",
-                "genome_assembly": "GRCh38",
-                "donor_uuid": "donor-1",
-                "donor_metadata": {"sex": ["Female"]},
-            }
+    Given:
+        A complete files-index document with full join inputs.
+    When:
+        transform_file_to_cfdb runs and the result is validated.
+    Then:
+        FileMetadataModel should accept it without error.
+    """
+    # Arrange
+    dataset_metadata = {
+        "ds-uuid-1": {
+            "pipeline": "Salmon",
+            "genome_assembly": "GRCh38",
+            "donor_uuid": "donor-1",
+            "donor_metadata": {"sex": ["Female"]},
         }
+    }
 
-        # Act
-        doc = _transform(
-            _file_doc(),
-            dataset_metadata=dataset_metadata,
-            donor_lookup={"donor-1": {"sex": ["Female"], "age_value": [67.0]}},
-            organ_map={"TH": {"id": "UBERON:0002370", "name": "Thymus"}},
-        )
+    # Act
+    doc = _transform(
+        _file_doc(),
+        dataset_metadata=dataset_metadata,
+        donor_lookup={"donor-1": {"sex": ["Female"], "age_value": [67.0]}},
+        organ_map={"TH": {"id": "UBERON:0002370", "name": "Thymus"}},
+    )
 
-        # Assert
-        model = FileMetadataModel(**doc)
-        assert model.local_id == "abc123"
-        assert model.collections[0].extra.hubmap.dataset_status == "Published"
+    # Assert
+    model = FileMetadataModel(**doc)
+    assert model.local_id == "abc123"
+    assert model.collections[0].extra.hubmap.dataset_status == "Published"
 
-    def test_transform_file_to_cfdb_should_percent_encode_the_access_url(self):
-        """Test a rel_path with URL-hostile characters still forms a URL.
 
-        Given:
-            A rel_path containing spaces.
-        When:
-            transform_file_to_cfdb builds the assets URL.
-        Then:
-            Path segments should be percent-encoded with the separators
-            kept.
-        """
-        # Act
-        doc = _transform(_file_doc(rel_path="a dir/file name.h5ad"))
+def test_transform_file_to_cfdb_should_percent_encode_the_access_url():
+    """Test a rel_path with URL-hostile characters still forms a URL.
 
-        # Assert
-        assert doc["access_url"] == (
-            "https://assets.hubmapconsortium.org/ds-uuid-1/"
-            "a%20dir/file%20name.h5ad"
-        )
+    Given:
+        A rel_path containing spaces.
+    When:
+        transform_file_to_cfdb builds the assets URL.
+    Then:
+        Path segments should be percent-encoded with the separators
+        kept.
+    """
+    # Act
+    doc = _transform(_file_doc(rel_path="a dir/file name.h5ad"))
 
-    def test_transform_file_to_cfdb_should_join_dataset_and_donor_metadata(self):
-        """Test the in-memory join lands demographics and dataset context.
+    # Assert
+    assert doc["access_url"] == (
+        "https://assets.hubmapconsortium.org/ds-uuid-1/"
+        "a%20dir/file%20name.h5ad"
+    )
 
-        Given:
-            Dataset metadata and donor demographics keyed for the file's
-            dataset and donor.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            The collection should carry the dataset context and the subject
-            the unwrapped demographics.
-        """
-        # Arrange
-        dataset_metadata = {
-            "ds-uuid-1": {
-                "pipeline": "Salmon",
-                "processing": "processed",
-                "group_name": "Stanford TMC",
-                "visualization": True,
-                "vitessce_hints": ["rna"],
-                "metadata": {"library_layout": "paired-end"},
-                "genome_assembly": "GRCh38",
-            }
-        }
-        donor_lookup = {
-            "donor-1": {
-                "sex": ["Female"],
-                "age_value": [67.0],
-                "medical_history": ["Diabetes", "Hypertension"],
-            }
-        }
 
-        # Act
-        doc = _transform(
-            _file_doc(),
-            dataset_metadata=dataset_metadata,
-            donor_lookup=donor_lookup,
-        )
+def test_transform_file_to_cfdb_should_join_dataset_and_donor_metadata():
+    """Test the in-memory join lands demographics and dataset context.
 
-        # Assert
-        assert doc["genome_assembly"] == "GRCh38"
-        assert doc["extra"]["hubmap"]["genome_assembly"] == "GRCh38"
-        collection = doc["collections"][0]
-        assert collection["local_id"] == "ds-uuid-1"
-        assert collection["name"] == "HBM339.XXWC.842"
-        assert collection["persistent_id"] == (
-            "https://portal.hubmapconsortium.org/browse/dataset/ds-uuid-1"
-        )
-        assert collection["experiment_type"] == "RNAseq"
-        assert collection["analyte_class"] == "RNA"
-        assert collection["extra"]["hubmap"] == {
+    Given:
+        Dataset metadata and donor demographics keyed for the file's
+        dataset and donor.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        The collection should carry the dataset context and the subject
+        the unwrapped demographics.
+    """
+    # Arrange
+    dataset_metadata = {
+        "ds-uuid-1": {
             "pipeline": "Salmon",
             "processing": "processed",
             "group_name": "Stanford TMC",
             "visualization": True,
             "vitessce_hints": ["rna"],
             "metadata": {"library_layout": "paired-end"},
-            "dataset_status": "Published",
+            "genome_assembly": "GRCh38",
         }
-        subject = collection["subjects"][0]
-        assert subject["local_id"] == "donor-1"
-        assert subject["taxonomy"]["id"] == "NCBI:txid9606"
-        assert subject["extra"]["hubmap"]["sex"] == "Female"
-        assert subject["extra"]["hubmap"]["age_value"] == 67.0
-        assert subject["extra"]["hubmap"]["medical_history"] == [
-            "Diabetes",
-            "Hypertension",
-        ]
-
-    def test_transform_file_to_cfdb_should_degrade_when_dataset_unknown(self):
-        """Test a file whose dataset is missing from the map still loads.
-
-        The dataset map is prefetched from a different index, so a dataset
-        the files index knows and the dataset index does not must degrade
-        the document rather than drop it.
-
-        Given:
-            Empty join inputs.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            The document should carry the file fields, no genome_assembly,
-            a subject without demographics, and a collection without the
-            dataset-index extras.
-        """
-        # Act
-        doc = _transform(_file_doc())
-
-        # Assert
-        assert "genome_assembly" not in doc
-        collection = doc["collections"][0]
-        assert collection["extra"]["hubmap"] == {"dataset_status": "Published"}
-        assert "extra" not in collection["subjects"][0]
-
-    def test_transform_file_to_cfdb_should_map_organs_through_the_organ_map(
-        self,
-    ):
-        """Test anatomy terms come from the UBKG mapping, never fabricated.
-
-        Given:
-            One mappable organ code, one unmapped, and one duplicated, with
-            a stats counter attached.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            The collection should carry exactly one UBERON term named by
-            the document's label, and the unmapped code should be counted.
-        """
-        from collections import Counter
-
-        # Arrange
-        organs = [
-            {"code": "TH", "label": "Thymus"},
-            {"code": "TH", "label": "Thymus"},
-            {"code": "ZZ", "label": "Mystery"},
-        ]
-        stats: Counter[str] = Counter()
-
-        # Act
-        doc = transform_file_to_cfdb(
-            _file_doc(organs=organs),
-            dataset_metadata={},
-            donor_lookup={},
-            organ_map={"TH": {"id": "UBERON:0002370", "name": "Thymus"}},
-            stats=stats,
-        )
-
-        # Assert
-        assert doc["collections"][0]["anatomy"] == [
-            {"id": "UBERON:0002370", "name": "Thymus"}
-        ]
-        assert stats["unmapped_organ:ZZ"] == 1
-
-    @pytest.mark.parametrize(
-        "missing", ["file_uuid", "rel_path", "dataset_uuid"]
-    )
-    def test_transform_file_to_cfdb_should_return_none_when_unaddressable(
-        self, missing
-    ):
-        """Test a document missing an identity field is skipped.
-
-        Given:
-            A files-index document missing one of the fields that make it
-            addressable.
-        When:
-            transform_file_to_cfdb runs with a stats counter.
-        Then:
-            It should return None and count the skip.
-        """
-        from collections import Counter
-
-        # Arrange
-        stats: Counter[str] = Counter()
-
-        # Act
-        doc = transform_file_to_cfdb(
-            _file_doc(**{missing: None}),
-            dataset_metadata={},
-            donor_lookup={},
-            organ_map={},
-            stats=stats,
-        )
-
-        # Assert
-        assert doc is None
-        assert stats["skipped:incomplete"] == 1
-
-    def test_transform_file_to_cfdb_should_null_an_unparseable_size(self):
-        """Test a size the index mistypes degrades to null, not a string.
-
-        Given:
-            A document whose size is not a number.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            size_in_bytes should be None.
-        """
-        # Act
-        doc = _transform(_file_doc(size="not-a-number"))
-
-        # Assert
-        assert doc["size_in_bytes"] is None
-
-    def test_transform_file_to_cfdb_should_count_extensions_into_stats(self):
-        """Test the transform reports what it emitted for the sync's log.
-
-        Given:
-            A document and a stats counter.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            The counter should tally the document under its extension.
-        """
-        from collections import Counter
-
-        # Arrange
-        stats: Counter[str] = Counter()
-
-        # Act
-        transform_file_to_cfdb(
-            _file_doc(),
-            dataset_metadata={},
-            donor_lookup={},
-            organ_map={},
-            stats=stats,
-        )
-
-        # Assert
-        assert stats["extension:.h5ad"] == 1
-
-    def test_transform_file_to_cfdb_should_dedupe_repeated_donors(self):
-        """Test a donor the index repeats becomes one subject.
-
-        The live index lists a donor once per contributing tissue block --
-        one file names the same uuid 26 times -- so emitting a subject per
-        entry would stack identical subjects on one collection.
-
-        Given:
-            A document whose donors list repeats one uuid around a second.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            The collection should carry one subject per distinct donor, in
-            first-occurrence order.
-        """
-        # Arrange
-        donors = [
-            {"entity_type": "Donor", "uuid": "donor-1"},
-            {"entity_type": "Donor", "uuid": "donor-1"},
-            {"entity_type": "Donor", "uuid": "donor-2"},
-            {"entity_type": "Donor", "uuid": "donor-1"},
-        ]
-
-        # Act
-        doc = _transform(_file_doc(donors=donors))
-
-        # Assert
-        subjects = doc["collections"][0]["subjects"]
-        assert [s["local_id"] for s in subjects] == ["donor-1", "donor-2"]
-
-    @given(
-        uuids=st.lists(
-            st.one_of(st.sampled_from(["d1", "d2", "d3"]), st.none(), st.just("")),
-            max_size=12,
-        )
-    )
-    @settings(max_examples=50)
-    def test_transform_file_to_cfdb_should_emit_each_donor_once(self, uuids):
-        """Test subjects are the distinct donors, whatever the repetition.
-
-        Given:
-            Any donors list drawn from a small uuid pool, with repeats and
-            blank or missing uuids mixed in.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            Subject local_ids should equal the distinct non-blank uuids in
-            first-occurrence order.
-        """
-        # Arrange
-        donors = [{"entity_type": "Donor", "uuid": uuid} for uuid in uuids]
-        expected = list(dict.fromkeys(uuid for uuid in uuids if uuid))
-
-        # Act
-        doc = _transform(_file_doc(donors=donors))
-
-        # Assert
-        subjects = doc["collections"][0]["subjects"]
-        assert [s["local_id"] for s in subjects] == expected
-
-    @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [
-            ("True", True),
-            ("False", False),
-            (" false ", False),
-            (True, True),
-            (False, False),
-        ],
-    )
-    def test_transform_file_to_cfdb_should_parse_is_data_product_flags(
-        self, raw, expected
-    ):
-        """Test the index's stringly-typed flag lands as a real bool.
-
-        The index serializes is_data_product as "True"/"False", so a
-        truthiness test would read "False" as true.
-
-        Given:
-            A document whose is_data_product is one of the recognized
-            spellings.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            extra.hubmap.is_data_product should be the matching bool.
-        """
-        # Act
-        doc = _transform(_file_doc(is_data_product=raw))
-
-        # Assert
-        assert doc["extra"]["hubmap"]["is_data_product"] is expected
-
-    @pytest.mark.parametrize("raw", [None, "yes", "", 1])
-    def test_transform_file_to_cfdb_should_omit_is_data_product_when_unrecognized(
-        self, raw
-    ):
-        """Test an unrecognized flag reads as unknown, not as false.
-
-        Given:
-            A document whose is_data_product is missing or neither
-            recognized spelling.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            extra.hubmap should carry no is_data_product key at all.
-        """
-        # Act
-        doc = _transform(_file_doc(is_data_product=raw))
-
-        # Assert
-        assert "is_data_product" not in doc["extra"]["hubmap"]
-
-    def test_transform_file_to_cfdb_should_omit_is_data_product_when_absent(self):
-        """Test a document without the flag stays unknown.
-
-        A third of the live allowlisted files carry no is_data_product, and
-        defaulting them to false would fabricate a fact.
-
-        Given:
-            A document with no is_data_product key.
-        When:
-            transform_file_to_cfdb runs.
-        Then:
-            extra.hubmap should carry no is_data_product key.
-        """
-        # Arrange
-        src = _file_doc()
-        src.pop("is_data_product", None)
-
-        # Act
-        doc = _transform(src)
-
-        # Assert
-        assert "is_data_product" not in doc["extra"]["hubmap"]
-
-
-class TestFetchFileMetadata:
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_paginate_with_search_after(
-        self, mocker
-    ):
-        """Test the walk carries each page's sort key into the next request.
-
-        Given:
-            Two pages of file documents.
-        When:
-            fetch_file_metadata drains the stream.
-        Then:
-            It should yield every document and send the second request with
-            the first page's last sort value as search_after.
-        """
-        # Arrange
-        session = _SearchSession(
-            pages=[
-                _page(_file_doc(file_uuid="aaa"), _file_doc(file_uuid="bbb")),
-                _page(_file_doc(file_uuid="ccc")),
-            ]
-        )
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        docs = [doc async for doc in fetch_file_metadata((".h5ad",))]
-
-        # Assert
-        assert [doc["file_uuid"] for doc in docs] == ["aaa", "bbb", "ccc"]
-        assert "search_after" not in session.post_bodies[0]
-        assert session.post_bodies[1]["search_after"] == ["bbb"]
-
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_filter_extensions_server_side(
-        self, mocker
-    ):
-        """Test the allowlist becomes a terms filter in the request body.
-
-        Excluding 9.7M microscopy tiles client-side would stream them all;
-        the filter has to ride the query.
-
-        Given:
-            A two-extension allowlist.
-        When:
-            fetch_file_metadata issues its first request.
-        Then:
-            The body should carry a terms filter on file_extension.keyword
-            with exactly those values.
-        """
-        # Arrange
-        session = _SearchSession()
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        [doc async for doc in fetch_file_metadata((".h5ad", ".bcf"))]
-
-        # Assert
-        assert session.post_bodies[0]["query"] == {
-            "terms": {"file_extension.keyword": [".h5ad", ".bcf"]}
+    }
+    donor_lookup = {
+        "donor-1": {
+            "sex": ["Female"],
+            "age_value": [67.0],
+            "medical_history": ["Diabetes", "Hypertension"],
         }
+    }
 
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_yield_nothing_when_allowlist_empty(
-        self, mocker
+    # Act
+    doc = _transform(
+        _file_doc(),
+        dataset_metadata=dataset_metadata,
+        donor_lookup=donor_lookup,
+    )
+
+    # Assert
+    assert doc["genome_assembly"] == "GRCh38"
+    assert doc["extra"]["hubmap"]["genome_assembly"] == "GRCh38"
+    collection = doc["collections"][0]
+    assert collection["local_id"] == "ds-uuid-1"
+    assert collection["name"] == "HBM339.XXWC.842"
+    assert collection["persistent_id"] == (
+        "https://portal.hubmapconsortium.org/browse/dataset/ds-uuid-1"
+    )
+    assert collection["experiment_type"] == "RNAseq"
+    assert collection["analyte_class"] == "RNA"
+    assert collection["extra"]["hubmap"] == {
+        "pipeline": "Salmon",
+        "processing": "processed",
+        "group_name": "Stanford TMC",
+        "visualization": True,
+        "vitessce_hints": ["rna"],
+        "metadata": {"library_layout": "paired-end"},
+        "dataset_status": "Published",
+    }
+    subject = collection["subjects"][0]
+    assert subject["local_id"] == "donor-1"
+    assert subject["taxonomy"]["id"] == "NCBI:txid9606"
+    assert subject["extra"]["hubmap"]["sex"] == "Female"
+    assert subject["extra"]["hubmap"]["age_value"] == 67.0
+    assert subject["extra"]["hubmap"]["medical_history"] == [
+        "Diabetes",
+        "Hypertension",
+    ]
+
+
+def test_transform_file_to_cfdb_should_degrade_when_dataset_unknown():
+    """Test a file whose dataset is missing from the map still loads.
+
+    The dataset map is prefetched from a different index, so a dataset
+    the files index knows and the dataset index does not must degrade
+    the document rather than drop it.
+
+    Given:
+        Empty join inputs.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        The document should carry the file fields, no genome_assembly,
+        a subject without demographics, and a collection without the
+        dataset-index extras.
+    """
+    # Act
+    doc = _transform(_file_doc())
+
+    # Assert
+    assert "genome_assembly" not in doc
+    collection = doc["collections"][0]
+    assert collection["extra"]["hubmap"] == {"dataset_status": "Published"}
+    assert "extra" not in collection["subjects"][0]
+
+
+def test_transform_file_to_cfdb_should_map_organs_through_the_organ_map(
     ):
-        """Test the explicit-empty configuration never opens a request.
+    """Test anatomy terms come from the UBKG mapping, never fabricated.
 
-        Given:
-            An empty allowlist.
-        When:
-            fetch_file_metadata is drained.
-        Then:
-            It should yield nothing and make no network request.
-        """
-        # Arrange
-        session_factory = mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession"
-        )
+    Given:
+        One mappable organ code, one unmapped, and one duplicated, with
+        a stats counter attached.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        The collection should carry exactly one UBERON term named by
+        the document's label, and the unmapped code should be counted.
+    """
+    from collections import Counter
 
-        # Act
-        docs = [doc async for doc in fetch_file_metadata(())]
+    # Arrange
+    organs = [
+        {"code": "TH", "label": "Thymus"},
+        {"code": "TH", "label": "Thymus"},
+        {"code": "ZZ", "label": "Mystery"},
+    ]
+    stats: Counter[str] = Counter()
 
-        # Assert
-        assert docs == []
-        session_factory.assert_not_called()
+    # Act
+    doc = transform_file_to_cfdb(
+        _file_doc(organs=organs),
+        dataset_metadata={},
+        donor_lookup={},
+        organ_map={"TH": {"id": "UBERON:0002370", "name": "Thymus"}},
+        stats=stats,
+    )
 
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_raise_on_http_error(self, mocker):
-        """Test an upstream error fails the stream instead of truncating it.
+    # Assert
+    assert doc["collections"][0]["anatomy"] == [
+        {"id": "UBERON:0002370", "name": "Thymus"}
+    ]
+    assert stats["unmapped_organ:ZZ"] == 1
 
-        The loader clears before reloading, so a stream that quietly ended
-        early would silently shrink the corpus.
 
-        Given:
-            A files search endpoint answering HTTP 503.
-        When:
-            fetch_file_metadata is drained.
-        Then:
-            It should raise rather than end the stream.
-        """
-        # Arrange
-        session = _SearchSession(status=503)
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
+@pytest.mark.parametrize(
+    "missing", ["file_uuid", "rel_path", "dataset_uuid"]
+)
+def test_transform_file_to_cfdb_should_return_none_when_unaddressable(
+    missing
+):
+    """Test a document missing an identity field is skipped.
 
-        # Act & assert
-        with pytest.raises(RuntimeError, match="HTTP 503"):
-            [doc async for doc in fetch_file_metadata((".h5ad",))]
+    Given:
+        A files-index document missing one of the fields that make it
+        addressable.
+    When:
+        transform_file_to_cfdb runs with a stats counter.
+    Then:
+        It should return None and count the skip.
+    """
+    from collections import Counter
 
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_request_is_data_product(
-        self, mocker
-    ):
-        """Test the requested source fields include the data-product flag.
+    # Arrange
+    stats: Counter[str] = Counter()
 
-        A field missing from _source never crosses the wire, so the
-        transform would see every file as flagless.
+    # Act
+    doc = transform_file_to_cfdb(
+        _file_doc(**{missing: None}),
+        dataset_metadata={},
+        donor_lookup={},
+        organ_map={},
+        stats=stats,
+    )
 
-        Given:
-            An allowlist.
-        When:
-            fetch_file_metadata issues its first request.
-        Then:
-            The body's _source should name is_data_product.
-        """
-        # Arrange
-        session = _SearchSession()
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
+    # Assert
+    assert doc is None
+    assert stats["skipped:incomplete"] == 1
 
-        # Act
+
+def test_transform_file_to_cfdb_should_null_an_unparseable_size():
+    """Test a size the index mistypes degrades to null, not a string.
+
+    Given:
+        A document whose size is not a number.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        size_in_bytes should be None.
+    """
+    # Act
+    doc = _transform(_file_doc(size="not-a-number"))
+
+    # Assert
+    assert doc["size_in_bytes"] is None
+
+
+def test_transform_file_to_cfdb_should_count_extensions_into_stats():
+    """Test the transform reports what it emitted for the sync's log.
+
+    Given:
+        A document and a stats counter.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        The counter should tally the document under its extension.
+    """
+    from collections import Counter
+
+    # Arrange
+    stats: Counter[str] = Counter()
+
+    # Act
+    transform_file_to_cfdb(
+        _file_doc(),
+        dataset_metadata={},
+        donor_lookup={},
+        organ_map={},
+        stats=stats,
+    )
+
+    # Assert
+    assert stats["extension:.h5ad"] == 1
+
+
+def test_transform_file_to_cfdb_should_dedupe_repeated_donors():
+    """Test a donor the index repeats becomes one subject.
+
+    The live index lists a donor once per contributing tissue block --
+    one file names the same uuid 26 times -- so emitting a subject per
+    entry would stack identical subjects on one collection.
+
+    Given:
+        A document whose donors list repeats one uuid around a second.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        The collection should carry one subject per distinct donor, in
+        first-occurrence order.
+    """
+    # Arrange
+    donors = [
+        {"entity_type": "Donor", "uuid": "donor-1"},
+        {"entity_type": "Donor", "uuid": "donor-1"},
+        {"entity_type": "Donor", "uuid": "donor-2"},
+        {"entity_type": "Donor", "uuid": "donor-1"},
+    ]
+
+    # Act
+    doc = _transform(_file_doc(donors=donors))
+
+    # Assert
+    subjects = doc["collections"][0]["subjects"]
+    assert [s["local_id"] for s in subjects] == ["donor-1", "donor-2"]
+
+
+@given(
+    uuids=st.lists(
+        st.one_of(st.sampled_from(["d1", "d2", "d3"]), st.none(), st.just("")),
+        max_size=12,
+    )
+)
+@settings(max_examples=50)
+def test_transform_file_to_cfdb_should_emit_each_donor_once(uuids):
+    """Test subjects are the distinct donors, whatever the repetition.
+
+    Given:
+        Any donors list drawn from a small uuid pool, with repeats and
+        blank or missing uuids mixed in.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        Subject local_ids should equal the distinct non-blank uuids in
+        first-occurrence order.
+    """
+    # Arrange
+    donors = [{"entity_type": "Donor", "uuid": uuid} for uuid in uuids]
+    expected = list(dict.fromkeys(uuid for uuid in uuids if uuid))
+
+    # Act
+    doc = _transform(_file_doc(donors=donors))
+
+    # Assert
+    subjects = doc["collections"][0]["subjects"]
+    assert [s["local_id"] for s in subjects] == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("True", True),
+        ("False", False),
+        (" false ", False),
+        (True, True),
+        (False, False),
+    ],
+)
+def test_transform_file_to_cfdb_should_parse_is_data_product_flags(
+    raw, expected
+):
+    """Test the index's stringly-typed flag lands as a real bool.
+
+    The index serializes is_data_product as "True"/"False", so a
+    truthiness test would read "False" as true.
+
+    Given:
+        A document whose is_data_product is one of the recognized
+        spellings.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        extra.hubmap.is_data_product should be the matching bool.
+    """
+    # Act
+    doc = _transform(_file_doc(is_data_product=raw))
+
+    # Assert
+    assert doc["extra"]["hubmap"]["is_data_product"] is expected
+
+
+@pytest.mark.parametrize("raw", [None, "yes", "", 1])
+def test_transform_file_to_cfdb_should_omit_is_data_product_when_unrecognized(
+    raw
+):
+    """Test an unrecognized flag reads as unknown, not as false.
+
+    Given:
+        A document whose is_data_product is missing or neither
+        recognized spelling.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        extra.hubmap should carry no is_data_product key at all.
+    """
+    # Act
+    doc = _transform(_file_doc(is_data_product=raw))
+
+    # Assert
+    assert "is_data_product" not in doc["extra"]["hubmap"]
+
+
+def test_transform_file_to_cfdb_should_omit_is_data_product_when_absent():
+    """Test a document without the flag stays unknown.
+
+    A third of the live allowlisted files carry no is_data_product, and
+    defaulting them to false would fabricate a fact.
+
+    Given:
+        A document with no is_data_product key.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        extra.hubmap should carry no is_data_product key.
+    """
+    # Arrange
+    src = _file_doc()
+    src.pop("is_data_product", None)
+
+    # Act
+    doc = _transform(src)
+
+    # Assert
+    assert "is_data_product" not in doc["extra"]["hubmap"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_paginate_with_search_after(
+    mocker
+):
+    """Test the walk carries each page's sort key into the next request.
+
+    Given:
+        Two pages of file documents.
+    When:
+        fetch_file_metadata drains the stream.
+    Then:
+        It should yield every document and send the second request with
+        the first page's last sort value as search_after.
+    """
+    # Arrange
+    session = _SearchSession(
+        pages=[
+            _page(_file_doc(file_uuid="aaa"), _file_doc(file_uuid="bbb")),
+            _page(_file_doc(file_uuid="ccc")),
+        ]
+    )
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    docs = [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert [doc["file_uuid"] for doc in docs] == ["aaa", "bbb", "ccc"]
+    assert "search_after" not in session.post_bodies[0]
+    assert session.post_bodies[1]["search_after"] == ["bbb"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_filter_extensions_server_side(
+    mocker
+):
+    """Test the allowlist becomes a terms filter in the request body.
+
+    Excluding 9.7M microscopy tiles client-side would stream them all;
+    the filter has to ride the query.
+
+    Given:
+        A two-extension allowlist.
+    When:
+        fetch_file_metadata issues its first request.
+    Then:
+        The body should carry a terms filter on file_extension.keyword
+        with exactly those values.
+    """
+    # Arrange
+    session = _SearchSession()
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    [doc async for doc in fetch_file_metadata((".h5ad", ".bcf"))]
+
+    # Assert
+    assert session.post_bodies[0]["query"] == {
+        "terms": {"file_extension.keyword": [".h5ad", ".bcf"]}
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_yield_nothing_when_allowlist_empty(
+    mocker
+):
+    """Test the explicit-empty configuration never opens a request.
+
+    Given:
+        An empty allowlist.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should yield nothing and make no network request.
+    """
+    # Arrange
+    session_factory = mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession"
+    )
+
+    # Act
+    docs = [doc async for doc in fetch_file_metadata(())]
+
+    # Assert
+    assert docs == []
+    session_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_raise_on_http_error(mocker):
+    """Test an upstream error fails the stream instead of truncating it.
+
+    The loader clears before reloading, so a stream that quietly ended
+    early would silently shrink the corpus.
+
+    Given:
+        A files search endpoint answering HTTP 503.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should raise rather than end the stream.
+    """
+    # Arrange
+    session = _SearchSession(status=503)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with pytest.raises(RuntimeError, match="HTTP 503"):
         [doc async for doc in fetch_file_metadata((".h5ad",))]
 
-        # Assert
-        assert "is_data_product" in session.post_bodies[0]["_source"]
 
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_raise_on_network_error(
-        self, mocker
-    ):
-        """Test a dropped connection fails the stream instead of ending it.
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_request_is_data_product(
+    mocker
+):
+    """Test the requested source fields include the data-product flag.
 
-        Given:
-            A files search endpoint whose request raises a client error.
-        When:
-            fetch_file_metadata is drained.
-        Then:
-            The client error should propagate.
-        """
-        # Arrange
-        session = _SearchSession(error=aiohttp.ClientError("reset"))
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
+    A field missing from _source never crosses the wire, so the
+    transform would see every file as flagless.
 
-        # Act & assert
-        with pytest.raises(aiohttp.ClientError, match="reset"):
-            [doc async for doc in fetch_file_metadata((".h5ad",))]
+    Given:
+        An allowlist.
+    When:
+        fetch_file_metadata issues its first request.
+    Then:
+        The body's _source should name is_data_product.
+    """
+    # Arrange
+    session = _SearchSession()
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
 
-    @pytest.mark.asyncio
-    async def test_fetch_file_metadata_should_stop_when_a_page_has_no_sort(
-        self, mocker
-    ):
-        """Test a page without a sort cursor ends the walk.
+    # Act
+    [doc async for doc in fetch_file_metadata((".h5ad",))]
 
-        Without a cursor there is nothing to resume from; re-sending the
-        query would re-serve the same page forever.
-
-        Given:
-            A page whose last hit carries no sort value.
-        When:
-            fetch_file_metadata is drained.
-        Then:
-            It should yield that page and issue no second request.
-        """
-        # Arrange
-        session = _SearchSession(
-            pages=[{"hits": {"hits": [{"_source": _file_doc()}]}}]
-        )
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        docs = [doc async for doc in fetch_file_metadata((".h5ad",))]
-
-        # Assert
-        assert len(docs) == 1
-        assert len(session.post_bodies) == 1
+    # Assert
+    assert "is_data_product" in session.post_bodies[0]["_source"]
 
 
-class TestFetchDatasetMetadataBulk:
-    @pytest.mark.asyncio
-    async def test_fetch_dataset_metadata_bulk_should_key_results_by_uuid(
-        self, mocker
-    ):
-        """Test the map joins against what the files index actually carries.
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_raise_on_network_error(
+    mocker
+):
+    """Test a dropped connection fails the stream instead of ending it.
 
-        The files index names a parent dataset only by dataset_uuid, so a
-        map keyed any other way (the retired doi_url keying) cannot be
-        joined against it.
+    Given:
+        A files search endpoint whose request raises a client error.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        The client error should propagate.
+    """
+    # Arrange
+    session = _SearchSession(error=aiohttp.ClientError("reset"))
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
 
-        Given:
-            One dataset document with donor metadata and a workflow
-            description naming hg38.
-        When:
-            fetch_dataset_metadata_bulk drains the index.
-        Then:
-            The entry should sit under the dataset uuid with the donor
-            fields and the canonicalized assembly.
-        """
-        # Arrange
-        src = {
-            "uuid": "ds-uuid-1",
-            "pipeline": "Salmon",
-            "donor": {"uuid": "donor-1", "mapped_metadata": {"sex": ["F"]}},
-            "ingest_metadata": {"workflow_description": "aligned to hg38"},
-        }
-        session = _SearchSession(pages=[_page(src, sort_key="uuid")])
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        results = await fetch_dataset_metadata_bulk()
-
-        # Assert
-        assert set(results) == {"ds-uuid-1"}
-        entry = results["ds-uuid-1"]
-        assert entry["pipeline"] == "Salmon"
-        assert entry["donor_uuid"] == "donor-1"
-        assert entry["donor_metadata"] == {"sex": ["F"]}
-        assert entry["genome_assembly"] == "GRCh38"
-
-    @pytest.mark.asyncio
-    async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(
-        self, mocker
-    ):
-        """Test a partial dataset map is refused rather than returned.
-
-        A silently partial map would mean silently under-enriched
-        documents behind a clear-before-reload.
-
-        Given:
-            A dataset search endpoint answering HTTP 502.
-        When:
-            fetch_dataset_metadata_bulk runs.
-        Then:
-            It should raise rather than return what it fetched so far.
-        """
-        # Arrange
-        session = _SearchSession(status=502)
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act & assert
-        with pytest.raises(RuntimeError, match="HTTP 502"):
-            await fetch_dataset_metadata_bulk()
-
-    @pytest.mark.asyncio
-    async def test_fetch_dataset_metadata_bulk_should_skip_hits_without_uuid(
-        self, mocker
-    ):
-        """Test unkeyable datasets are dropped and the rest keep their context.
-
-        Given:
-            One dataset hit with no uuid and one carrying vitessce-hints
-            and assay metadata.
-        When:
-            fetch_dataset_metadata_bulk drains the index.
-        Then:
-            Only the keyed dataset should be returned, with vitessce-hints
-            under vitessce_hints and the metadata dict intact.
-        """
-        # Arrange
-        keyed = {
-            "uuid": "ds-uuid-1",
-            "vitessce-hints": ["is_sc", "rna"],
-            "metadata": {"assay_category": "sequence"},
-        }
-        session = _SearchSession(
-            pages=[_page({"pipeline": "Salmon"}, keyed, sort_key="uuid")]
-        )
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        results = await fetch_dataset_metadata_bulk()
-
-        # Assert
-        assert set(results) == {"ds-uuid-1"}
-        assert results["ds-uuid-1"]["vitessce_hints"] == ["is_sc", "rna"]
-        assert results["ds-uuid-1"]["metadata"] == {"assay_category": "sequence"}
-
-    @pytest.mark.asyncio
-    async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(
-        self, mocker
-    ):
-        """Test a dropped connection refuses the partial map.
-
-        Given:
-            A dataset search endpoint whose request raises a client error.
-        When:
-            fetch_dataset_metadata_bulk runs.
-        Then:
-            The client error should propagate.
-        """
-        # Arrange
-        session = _SearchSession(error=aiohttp.ClientError("reset"))
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act & assert
-        with pytest.raises(aiohttp.ClientError, match="reset"):
-            await fetch_dataset_metadata_bulk()
-
-    @pytest.mark.asyncio
-    async def test_fetch_dataset_metadata_bulk_should_stop_when_a_page_has_no_sort(
-        self, mocker
-    ):
-        """Test a page without a sort cursor ends the walk.
-
-        Given:
-            A page whose last hit carries no sort value.
-        When:
-            fetch_dataset_metadata_bulk runs.
-        Then:
-            It should return that page's dataset after a single request.
-        """
-        # Arrange
-        session = _SearchSession(
-            pages=[{"hits": {"hits": [{"_source": {"uuid": "ds-uuid-1"}}]}}]
-        )
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        results = await fetch_dataset_metadata_bulk()
-
-        # Assert
-        assert set(results) == {"ds-uuid-1"}
-        assert len(session.post_bodies) == 1
+    # Act & assert
+    with pytest.raises(aiohttp.ClientError, match="reset"):
+        [doc async for doc in fetch_file_metadata((".h5ad",))]
 
 
-class TestFetchOrganMap:
-    @pytest.mark.asyncio
-    async def test_fetch_organ_map_should_key_uberon_terms_by_rui_code(
-        self, mocker
-    ):
-        """Test the UBKG payload becomes a code-keyed UBERON lookup.
+@pytest.mark.asyncio
+async def test_fetch_file_metadata_should_stop_when_a_page_has_no_sort(
+    mocker
+):
+    """Test a page without a sort cursor ends the walk.
 
-        Given:
-            A UBKG organs payload with one complete entry and one missing
-            its UBERON id.
-        When:
-            fetch_organ_map runs.
-        Then:
-            Only the complete entry should be mapped.
-        """
-        # Arrange
-        payload = [
-            {"rui_code": "TH", "term": "Thymus", "organ_uberon": "UBERON:0002370"},
-            {"rui_code": "XX", "term": "No Uberon", "organ_uberon": None},
-        ]
-        session = _OrganSession(payload=payload)
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
+    Without a cursor there is nothing to resume from; re-sending the
+    query would re-serve the same page forever.
 
-        # Act
+    Given:
+        A page whose last hit carries no sort value.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should yield that page and issue no second request.
+    """
+    # Arrange
+    session = _SearchSession(
+        pages=[{"hits": {"hits": [{"_source": _file_doc()}]}}]
+    )
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    docs = [doc async for doc in fetch_file_metadata((".h5ad",))]
+
+    # Assert
+    assert len(docs) == 1
+    assert len(session.post_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_dataset_metadata_bulk_should_key_results_by_uuid(
+    mocker
+):
+    """Test the map joins against what the files index actually carries.
+
+    The files index names a parent dataset only by dataset_uuid, so a
+    map keyed any other way (the retired doi_url keying) cannot be
+    joined against it.
+
+    Given:
+        One dataset document with donor metadata and a workflow
+        description naming hg38.
+    When:
+        fetch_dataset_metadata_bulk drains the index.
+    Then:
+        The entry should sit under the dataset uuid with the donor
+        fields and the canonicalized assembly.
+    """
+    # Arrange
+    src = {
+        "uuid": "ds-uuid-1",
+        "pipeline": "Salmon",
+        "donor": {"uuid": "donor-1", "mapped_metadata": {"sex": ["F"]}},
+        "ingest_metadata": {"workflow_description": "aligned to hg38"},
+    }
+    session = _SearchSession(pages=[_page(src, sort_key="uuid")])
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    results = await fetch_dataset_metadata_bulk()
+
+    # Assert
+    assert set(results) == {"ds-uuid-1"}
+    entry = results["ds-uuid-1"]
+    assert entry["pipeline"] == "Salmon"
+    assert entry["donor_uuid"] == "donor-1"
+    assert entry["donor_metadata"] == {"sex": ["F"]}
+    assert entry["genome_assembly"] == "GRCh38"
+
+
+@pytest.mark.asyncio
+async def test_fetch_dataset_metadata_bulk_should_raise_on_http_error(
+    mocker
+):
+    """Test a partial dataset map is refused rather than returned.
+
+    A silently partial map would mean silently under-enriched
+    documents behind a clear-before-reload.
+
+    Given:
+        A dataset search endpoint answering HTTP 502.
+    When:
+        fetch_dataset_metadata_bulk runs.
+    Then:
+        It should raise rather than return what it fetched so far.
+    """
+    # Arrange
+    session = _SearchSession(status=502)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with pytest.raises(RuntimeError, match="HTTP 502"):
+        await fetch_dataset_metadata_bulk()
+
+
+@pytest.mark.asyncio
+async def test_fetch_dataset_metadata_bulk_should_skip_hits_without_uuid(
+    mocker
+):
+    """Test unkeyable datasets are dropped and the rest keep their context.
+
+    Given:
+        One dataset hit with no uuid and one carrying vitessce-hints
+        and assay metadata.
+    When:
+        fetch_dataset_metadata_bulk drains the index.
+    Then:
+        Only the keyed dataset should be returned, with vitessce-hints
+        under vitessce_hints and the metadata dict intact.
+    """
+    # Arrange
+    keyed = {
+        "uuid": "ds-uuid-1",
+        "vitessce-hints": ["is_sc", "rna"],
+        "metadata": {"assay_category": "sequence"},
+    }
+    session = _SearchSession(
+        pages=[_page({"pipeline": "Salmon"}, keyed, sort_key="uuid")]
+    )
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    results = await fetch_dataset_metadata_bulk()
+
+    # Assert
+    assert set(results) == {"ds-uuid-1"}
+    assert results["ds-uuid-1"]["vitessce_hints"] == ["is_sc", "rna"]
+    assert results["ds-uuid-1"]["metadata"] == {"assay_category": "sequence"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_dataset_metadata_bulk_should_raise_on_network_error(
+    mocker
+):
+    """Test a dropped connection refuses the partial map.
+
+    Given:
+        A dataset search endpoint whose request raises a client error.
+    When:
+        fetch_dataset_metadata_bulk runs.
+    Then:
+        The client error should propagate.
+    """
+    # Arrange
+    session = _SearchSession(error=aiohttp.ClientError("reset"))
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act & assert
+    with pytest.raises(aiohttp.ClientError, match="reset"):
+        await fetch_dataset_metadata_bulk()
+
+
+@pytest.mark.asyncio
+async def test_fetch_dataset_metadata_bulk_should_stop_when_a_page_has_no_sort(
+    mocker
+):
+    """Test a page without a sort cursor ends the walk.
+
+    Given:
+        A page whose last hit carries no sort value.
+    When:
+        fetch_dataset_metadata_bulk runs.
+    Then:
+        It should return that page's dataset after a single request.
+    """
+    # Arrange
+    session = _SearchSession(
+        pages=[{"hits": {"hits": [{"_source": {"uuid": "ds-uuid-1"}}]}}]
+    )
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    results = await fetch_dataset_metadata_bulk()
+
+    # Assert
+    assert set(results) == {"ds-uuid-1"}
+    assert len(session.post_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_organ_map_should_key_uberon_terms_by_rui_code(
+    mocker
+):
+    """Test the UBKG payload becomes a code-keyed UBERON lookup.
+
+    Given:
+        A UBKG organs payload with one complete entry and one missing
+        its UBERON id.
+    When:
+        fetch_organ_map runs.
+    Then:
+        Only the complete entry should be mapped.
+    """
+    # Arrange
+    payload = [
+        {"rui_code": "TH", "term": "Thymus", "organ_uberon": "UBERON:0002370"},
+        {"rui_code": "XX", "term": "No Uberon", "organ_uberon": None},
+    ]
+    session = _OrganSession(payload=payload)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    organ_map = await fetch_organ_map()
+
+    # Assert
+    assert organ_map == {"TH": {"id": "UBERON:0002370", "name": "Thymus"}}
+
+
+@pytest.mark.asyncio
+async def test_fetch_organ_map_should_return_empty_and_warn_on_failure(
+    mocker, caplog
+):
+    """Test a UBKG outage degrades anatomy instead of failing the sync.
+
+    Given:
+        A UBKG endpoint that raises a client error.
+    When:
+        fetch_organ_map runs.
+    Then:
+        It should return an empty map and log a warning.
+    """
+    # Arrange
+    session = _OrganSession(error=aiohttp.ClientError("down"))
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+
+    # Act
+    with caplog.at_level("WARNING"):
         organ_map = await fetch_organ_map()
 
-        # Assert
-        assert organ_map == {"TH": {"id": "UBERON:0002370", "name": "Thymus"}}
-
-    @pytest.mark.asyncio
-    async def test_fetch_organ_map_should_return_empty_and_warn_on_failure(
-        self, mocker, caplog
-    ):
-        """Test a UBKG outage degrades anatomy instead of failing the sync.
-
-        Given:
-            A UBKG endpoint that raises a client error.
-        When:
-            fetch_organ_map runs.
-        Then:
-            It should return an empty map and log a warning.
-        """
-        # Arrange
-        session = _OrganSession(error=aiohttp.ClientError("down"))
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        with caplog.at_level("WARNING"):
-            organ_map = await fetch_organ_map()
-
-        # Assert
-        assert organ_map == {}
-        assert any("UBKG" in record.message for record in caplog.records)
-
-    @pytest.mark.asyncio
-    async def test_fetch_organ_map_should_return_empty_and_warn_on_http_error(
-        self, mocker, caplog
-    ):
-        """Test a UBKG error status degrades anatomy like an outage does.
-
-        Given:
-            A UBKG endpoint answering HTTP 500.
-        When:
-            fetch_organ_map runs.
-        Then:
-            It should return an empty map and log a warning naming UBKG.
-        """
-        # Arrange
-        session = _OrganSession(status=500)
-        mocker.patch.object(
-            hubmap_module.aiohttp, "ClientSession", return_value=session
-        )
-
-        # Act
-        with caplog.at_level("WARNING"):
-            organ_map = await fetch_organ_map()
-
-        # Assert
-        assert organ_map == {}
-        assert any("HTTP 500" in record.message for record in caplog.records)
+    # Assert
+    assert organ_map == {}
+    assert any("UBKG" in record.message for record in caplog.records)
 
 
-class TestBuildHubmapDccRecord:
-    def test_build_hubmap_dcc_record_should_carry_the_static_dcc_fields(self):
-        """Test the DCC record names HuBMAP under its registry id.
+@pytest.mark.asyncio
+async def test_fetch_organ_map_should_return_empty_and_warn_on_http_error(
+    mocker, caplog
+):
+    """Test a UBKG error status degrades anatomy like an outage does.
 
-        Given:
-            The static HuBMAP configuration.
-        When:
-            build_hubmap_dcc_record runs.
-        Then:
-            The record should carry the submission, registry id, labels,
-            and project namespace fields the dcc collection expects.
-        """
-        # Act
-        record = build_hubmap_dcc_record()
+    Given:
+        A UBKG endpoint answering HTTP 500.
+    When:
+        fetch_organ_map runs.
+    Then:
+        It should return an empty map and log a warning naming UBKG.
+    """
+    # Arrange
+    session = _OrganSession(status=500)
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
 
-        # Assert
-        assert record["submission"] == "hubmap"
-        assert record["id"] == "cfde_registry_dcc:hubmap"
-        assert record["dcc_abbreviation"] == "HuBMAP"
-        assert record["dcc_url"] == "https://hubmapconsortium.org"
-        assert record["project_id_namespace"] == "https://hubmapconsortium.org"
-        assert record["project_local_id"] == "HuBMAP"
+    # Act
+    with caplog.at_level("WARNING"):
+        organ_map = await fetch_organ_map()
+
+    # Assert
+    assert organ_map == {}
+    assert any("HTTP 500" in record.message for record in caplog.records)
+
+
+def test_build_hubmap_dcc_record_should_carry_the_static_dcc_fields():
+    """Test the DCC record names HuBMAP under its registry id.
+
+    Given:
+        The static HuBMAP configuration.
+    When:
+        build_hubmap_dcc_record runs.
+    Then:
+        The record should carry the submission, registry id, labels,
+        and project namespace fields the dcc collection expects.
+    """
+    # Act
+    record = build_hubmap_dcc_record()
+
+    # Assert
+    assert record["submission"] == "hubmap"
+    assert record["id"] == "cfde_registry_dcc:hubmap"
+    assert record["dcc_abbreviation"] == "HuBMAP"
+    assert record["dcc_url"] == "https://hubmapconsortium.org"
+    assert record["project_id_namespace"] == "https://hubmapconsortium.org"
+    assert record["project_local_id"] == "HuBMAP"
