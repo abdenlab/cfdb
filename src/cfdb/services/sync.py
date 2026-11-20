@@ -1024,14 +1024,27 @@ async def _sync_hubmap(task: SyncTask) -> None:
     genome assembly) and the organ-to-UBERON map are prefetched before the
     file stream opens, so every document is emitted fully populated in one
     insert pass and no post-load enrichment or pruning stages exist. The
-    index itself holds only public files, which is what retired the pruning
-    pass.
+    file query itself admits only public files, which is what retired the
+    pruning pass.
+
+    The prefetch runs before the cutover lock is taken: it touches no
+    database state, and the lock gates the whole read surface, so holding
+    it across ~10k datasets of network fetch would fail every API request
+    for that long. Only the clear and the file stream run under the lock,
+    and the stream carries one deadline from ``sync_budget_seconds`` so the
+    lock cannot outlive the sync lock's stale threshold.
 
     A single stream loads the whole submission, so there is no per-phase
     isolation: any failure propagates and is recorded as this DCC's failure
     by ``_sync_dccs``, while ``_ingest_rows``'s deferred clear ensures a
     fetch that dies before delivering rows leaves the previous corpus being
     served rather than empty.
+
+    An empty extension allowlist is a no-op that leaves the existing slice
+    in place -- the same outcome an empty ``ENCODE_ANNOTATION_TYPES`` has
+    for ENCODE's annotation phases. Draining an empty stream instead would
+    read as an authoritative empty result and delete the whole slice, and
+    empty values arrive by accident routinely.
     """
     from cfdb.services.hubmap import (
         build_hubmap_dcc_record,
@@ -1039,11 +1052,22 @@ async def _sync_hubmap(task: SyncTask) -> None:
         fetch_file_metadata,
         fetch_organ_map,
         file_extensions_from_env,
+        sync_budget_seconds,
         transform_file_to_cfdb,
     )
 
     if api.db is None:
         raise RuntimeError("Database not initialized")
+
+    extensions = file_extensions_from_env()
+    if not extensions:
+        task.progress = (
+            "HuBMAP sync skipped: the extension allowlist is empty; the "
+            "existing HuBMAP slice was left in place"
+        )
+        logger.warning(task.progress)
+        return
+    logger.info("HuBMAP file ingest: extension allowlist %s", list(extensions))
 
     counts_by_phase: dict[str, int] = {}
     # One counter for everything the transform wants observed -- the
@@ -1051,79 +1075,80 @@ async def _sync_hubmap(task: SyncTask) -> None:
     # codes -- logged as distributions below rather than a line per file.
     stats: Counter[str] = Counter()
 
-    async with locks.CutoverLock("hubmap"):
-        # Step 1: Clear existing raw HuBMAP data. ``files`` is deliberately
-        # not cleared here: ``_ingest_rows`` clears that slice once
-        # replacement rows are in hand, so a fetch that fails before
-        # delivering any leaves the previous corpus being served rather
-        # than empty. The raw C2M2 collections (file, collection, subject,
-        # ...) are cleared outright -- nothing reloads them anymore.
-        task.current_step = "clearing"
-        task.progress = "Clearing existing HuBMAP data..."
-        logger.info(task.progress)
-        await _clear_dcc_data_async("hubmap", skip_collections={"files"})
+    # Step 1: Prefetch the dataset-level context the files index does not
+    # carry, plus the organ-to-UBERON map, outside the cutover lock. ~10k
+    # datasets held in memory -- small against the file stream they enrich,
+    # and what makes the single-pass join possible.
+    task.current_step = "fetching"
+    task.progress = "Fetching HuBMAP dataset metadata..."
+    logger.info(task.progress)
 
-        # Step 2: Upsert DCC record
-        task.current_step = "dcc_record"
-        task.progress = "Creating HuBMAP DCC record..."
-        logger.info(task.progress)
-        await api.db.dcc.update_one(
-            {"submission": "hubmap"},
-            {"$set": build_hubmap_dcc_record()},
-            upsert=True,
+    dataset_metadata = await fetch_dataset_metadata_bulk()
+    donor_lookup = {
+        meta["donor_uuid"]: meta["donor_metadata"]
+        for meta in dataset_metadata.values()
+        if meta.get("donor_uuid") and meta.get("donor_metadata")
+    }
+    organ_map = await fetch_organ_map()
+
+    def transform(src: dict) -> Optional[dict]:
+        return transform_file_to_cfdb(
+            src,
+            dataset_metadata=dataset_metadata,
+            donor_lookup=donor_lookup,
+            organ_map=organ_map,
+            stats=stats,
         )
 
-        # Step 3: Prefetch the dataset-level context the files index does
-        # not carry, plus the organ-to-UBERON map. ~10k datasets held in
-        # memory -- small against the file stream they enrich, and what
-        # makes the single-pass join possible.
-        task.current_step = "fetching"
-        task.progress = "Fetching HuBMAP dataset metadata..."
-        logger.info(task.progress)
+    try:
+        async with locks.CutoverLock("hubmap"):
+            # Step 2: Clear existing raw HuBMAP data. ``files`` is
+            # deliberately not cleared here: ``_ingest_rows`` clears that
+            # slice once replacement rows are in hand, so a fetch that fails
+            # before delivering any leaves the previous corpus being served
+            # rather than empty. The raw C2M2 collections (file, collection,
+            # subject, ...) are cleared outright -- nothing reloads them
+            # anymore.
+            task.current_step = "clearing"
+            task.progress = "Clearing existing HuBMAP data..."
+            logger.info(task.progress)
+            await _clear_dcc_data_async("hubmap", skip_collections={"files"})
 
-        dataset_metadata = await fetch_dataset_metadata_bulk()
-        donor_lookup = {
-            meta["donor_uuid"]: meta["donor_metadata"]
-            for meta in dataset_metadata.values()
-            if meta.get("donor_uuid") and meta.get("donor_metadata")
-        }
-        organ_map = await fetch_organ_map()
-
-        extensions = file_extensions_from_env()
-        logger.info(
-            "HuBMAP file ingest: extension allowlist %s", list(extensions)
-        )
-
-        # Step 4: Stream, transform, and insert in one pass.
-        task.current_step = "loading"
-        task.progress = "Loading HuBMAP files from the files search API..."
-        logger.info(task.progress)
-
-        def transform(src: dict) -> Optional[dict]:
-            return transform_file_to_cfdb(
-                src,
-                dataset_metadata=dataset_metadata,
-                donor_lookup=donor_lookup,
-                organ_map=organ_map,
-                stats=stats,
+            # Step 3: Upsert DCC record
+            task.current_step = "dcc_record"
+            task.progress = "Creating HuBMAP DCC record..."
+            logger.info(task.progress)
+            await api.db.dcc.update_one(
+                {"submission": "hubmap"},
+                {"$set": build_hubmap_dcc_record()},
+                upsert=True,
             )
 
-        await _ingest_rows(
-            task,
-            "hubmap",
-            "files index",
-            fetch_file_metadata(extensions),
-            transform,
-            counts_by_phase,
-            # One stream owns the whole submission, so its slice is the
-            # whole submission.
-            stale_filter={},
-        )
+            # Step 4: Stream, transform, and insert in one pass, under one
+            # deadline resolved here so the lock window is bounded.
+            task.current_step = "loading"
+            task.progress = "Loading HuBMAP files from the files search API..."
+            logger.info(task.progress)
+            deadline = asyncio.get_running_loop().time() + sync_budget_seconds()
 
-    # HuBMAP writes straight into the materialized collection and never runs
-    # the materializer, which is the only other creator of files indexes --
-    # same reasoning as the ENCODE path above.
-    await ensure_indexes(api.db, materialized_files_index_specs())
+            await _ingest_rows(
+                task,
+                "hubmap",
+                "files index",
+                fetch_file_metadata(extensions, deadline=deadline),
+                transform,
+                counts_by_phase,
+                # One stream owns the whole submission, so its slice is the
+                # whole submission.
+                stale_filter={},
+            )
+    finally:
+        # HuBMAP writes straight into the materialized collection and never
+        # runs the materializer, which is the only other creator of files
+        # indexes -- same reasoning as the ENCODE path above, including
+        # running on failure: a partially loaded slice still has to be
+        # servable without a full collection scan.
+        await ensure_indexes(api.db, materialized_files_index_specs())
 
     count = counts_by_phase.get("files index", 0)
     task.progress = f"HuBMAP sync complete: {count} files"
