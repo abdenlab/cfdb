@@ -11,7 +11,7 @@ from collections import Counter
 from contextlib import aclosing
 from copy import copy
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -636,6 +636,7 @@ async def _ingest_rows(
     counts_by_phase: dict[str, int],
     stale_filter: dict,
     tally=None,
+    clear_on_empty: bool = True,
 ) -> None:
     """Transform and batch-insert one upstream metadata stream.
 
@@ -685,6 +686,12 @@ async def _ingest_rows(
             the row count, it runs per row rather than per batch, so a
             mid-flight death leaves it ahead of the database by the
             discarded partial batch.
+        clear_on_empty: Whether a stream that drains cleanly with no rows
+            is authoritative and clears the slice. True suits a stream
+            owning one slice among several, where an empty answer is a
+            legitimate result; a stream owning a whole submission passes
+            False, and an empty drain then raises instead of deleting the
+            submission over what is almost certainly an upstream fault.
     """
     batch: list[dict] = []
     count = 0
@@ -765,7 +772,13 @@ async def _ingest_rows(
         # The stream drained without error, so its result is authoritative
         # even when it is empty: clear here too, or a type the upstream
         # stopped publishing would keep serving last sync's rows
-        # indefinitely.
+        # indefinitely -- unless the caller has said an empty answer from
+        # this stream is never authoritative.
+        if count == 0 and not clear_on_empty:
+            raise RuntimeError(
+                f"{submission.upper()} {label}: the stream yielded no rows; "
+                "refusing to clear the existing slice over an empty result"
+            )
         await clear_stale_once()
 
         # The clean-path flush: inside the ``try``, so a sink failure with no
@@ -1014,6 +1027,35 @@ async def _sync_encode(task: SyncTask) -> None:
         ) from failures[0][1]
 
 
+#: Margin kept between an in-lock stream's deadline and the moment the sync
+#: lock turns stale, so the stream's own teardown fits inside the lock.
+_STALE_MARGIN = timedelta(minutes=5)
+
+
+async def _stale_safe_deadline(budget_seconds: int) -> float:
+    """Event-loop deadline for a sync's network work, clamped to the lock.
+
+    ``budget_seconds`` from now, or the moment the sync lock would turn
+    stale less ``_STALE_MARGIN``, whichever comes first. The sync lock's
+    staleness is measured from its ``started_at``, set once for the whole
+    multi-DCC run, and DCCs run in sorted order -- so a loader late in a
+    long run can start with little of the hour left, and a budget counted
+    from its own start would let it outlive the lock and admit a second,
+    clearing sync. Clamping fails that loader's fetch instead, which its
+    deferred clear survives. With no sync lock held (a direct call), only
+    the budget applies.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_seconds
+    lock = await locks.get_current_sync_task()
+    started_at = (lock or {}).get("started_at")
+    if isinstance(started_at, datetime):
+        stale_at = started_at + locks.STALE_LOCK_THRESHOLD - _STALE_MARGIN
+        remaining = (stale_at - datetime.utcnow()).total_seconds()
+        deadline = min(deadline, loop.time() + remaining)
+    return deadline
+
+
 async def _sync_hubmap(task: SyncTask) -> None:
     """
     Sync HuBMAP data from the files search API.
@@ -1021,36 +1063,40 @@ async def _sync_hubmap(task: SyncTask) -> None:
     Like ENCODE, HuBMAP documents are pre-materialized directly into the
     files collection -- no C2M2 zip download, no TSV load, and no Rust
     materializer run. Dataset-level context (donor demographics, pipeline,
-    genome assembly) and the organ-to-UBERON map are prefetched before the
-    file stream opens, so every document is emitted fully populated in one
-    insert pass and no post-load enrichment or pruning stages exist. The
-    file query itself admits only public files, which is what retired the
-    pruning pass.
+    genome assembly) is prefetched before the file stream opens, and organ
+    codes map through a checked-in UBERON table, so every document is
+    emitted fully populated in one insert pass and no post-load enrichment
+    or pruning stages exist. The file query itself admits only public
+    files, which is what retired the pruning pass.
 
     The prefetch runs before the cutover lock is taken: it touches no
     database state, and the lock gates the whole read surface, so holding
     it across ~10k datasets of network fetch would fail every API request
-    for that long. Only the clear and the file stream run under the lock,
-    and the stream carries one deadline from ``sync_budget_seconds`` so the
-    lock cannot outlive the sync lock's stale threshold.
+    for that long. Only the clear and the file stream run under the lock.
+    Every fetch shares one deadline from ``sync_budget_seconds``, clamped so
+    it ends before the sync lock -- whose staleness counts from the start
+    of the whole multi-DCC run -- could turn stale and admit a second sync.
+    The in-lock stream still holds the read surface for the minutes it
+    takes; only a staged load would shorten that.
 
     A single stream loads the whole submission, so there is no per-phase
     isolation: any failure propagates and is recorded as this DCC's failure
     by ``_sync_dccs``, while ``_ingest_rows``'s deferred clear ensures a
     fetch that dies before delivering rows leaves the previous corpus being
-    served rather than empty.
+    served rather than empty. A stream that drains cleanly with no rows is
+    refused rather than obeyed, and so is an empty dataset map: for a
+    submission one stream owns, either is an upstream fault, never a real
+    answer.
 
     An empty extension allowlist is a no-op that leaves the existing slice
     in place -- the same outcome an empty ``ENCODE_ANNOTATION_TYPES`` has
-    for ENCODE's annotation phases. Draining an empty stream instead would
-    read as an authoritative empty result and delete the whole slice, and
-    empty values arrive by accident routinely.
+    for ENCODE's annotation phases.
     """
     from cfdb.services.hubmap import (
+        build_donor_lookup,
         build_hubmap_dcc_record,
         fetch_dataset_metadata_bulk,
         fetch_file_metadata,
-        fetch_organ_map,
         file_extensions_from_env,
         sync_budget_seconds,
         transform_file_to_cfdb,
@@ -1071,34 +1117,55 @@ async def _sync_hubmap(task: SyncTask) -> None:
 
     counts_by_phase: dict[str, int] = {}
     # One counter for everything the transform wants observed -- the
-    # per-extension document distribution, skip reasons, and unmapped organ
-    # codes -- logged as distributions below rather than a line per file.
+    # per-extension document distribution, skip reasons, unmapped organ
+    # codes, and join misses -- logged as distributions below rather than a
+    # line per file.
     stats: Counter[str] = Counter()
 
+    # One deadline for every network fetch this sync makes, resolved before
+    # the first of them and clamped to the sync lock's stale threshold; see
+    # ``_stale_safe_deadline``.
+    deadline = await _stale_safe_deadline(sync_budget_seconds())
+
     # Step 1: Prefetch the dataset-level context the files index does not
-    # carry, plus the organ-to-UBERON map, outside the cutover lock. ~10k
-    # datasets held in memory -- small against the file stream they enrich,
-    # and what makes the single-pass join possible.
+    # carry, outside the cutover lock. ~10k datasets held in memory -- small
+    # against the file stream they enrich, and what makes the single-pass
+    # join possible. Organ codes need no fetch: they map through a checked-in
+    # table.
     task.current_step = "fetching"
     task.progress = "Fetching HuBMAP dataset metadata..."
     logger.info(task.progress)
 
-    dataset_metadata = await fetch_dataset_metadata_bulk()
-    donor_lookup = {
-        meta["donor_uuid"]: meta["donor_metadata"]
-        for meta in dataset_metadata.values()
-        if meta.get("donor_uuid") and meta.get("donor_metadata")
-    }
-    organ_map = await fetch_organ_map()
+    dataset_metadata = await fetch_dataset_metadata_bulk(deadline=deadline)
+    if not dataset_metadata:
+        # Refused before the lock, so the previous slice keeps being served:
+        # an empty map would load every file without its dataset context or
+        # donor demographics and report success.
+        raise RuntimeError(
+            "HuBMAP dataset index returned no datasets; refusing to load "
+            "files with no dataset context"
+        )
+    donor_lookup = build_donor_lookup(dataset_metadata)
 
     def transform(src: dict) -> Optional[dict]:
-        return transform_file_to_cfdb(
-            src,
-            dataset_metadata=dataset_metadata,
-            donor_lookup=donor_lookup,
-            organ_map=organ_map,
-            stats=stats,
-        )
+        # One malformed upstream document costs that document, not the
+        # sync: an exception here would otherwise abort the stream after
+        # the stale clear and leave a partial slice.
+        try:
+            return transform_file_to_cfdb(
+                src,
+                dataset_metadata=dataset_metadata,
+                donor_lookup=donor_lookup,
+                stats=stats,
+            )
+        except Exception:
+            stats["skipped:malformed"] += 1
+            if stats["skipped:malformed"] <= 5:
+                logger.exception(
+                    "Skipping malformed HuBMAP file document (file_uuid=%r)",
+                    src.get("file_uuid") if isinstance(src, dict) else None,
+                )
+            return None
 
     try:
         async with locks.CutoverLock("hubmap"):
@@ -1124,12 +1191,11 @@ async def _sync_hubmap(task: SyncTask) -> None:
                 upsert=True,
             )
 
-            # Step 4: Stream, transform, and insert in one pass, under one
-            # deadline resolved here so the lock window is bounded.
+            # Step 4: Stream, transform, and insert in one pass, under the
+            # deadline resolved above, so the lock window is bounded.
             task.current_step = "loading"
             task.progress = "Loading HuBMAP files from the files search API..."
             logger.info(task.progress)
-            deadline = asyncio.get_running_loop().time() + sync_budget_seconds()
 
             await _ingest_rows(
                 task,
@@ -1139,8 +1205,12 @@ async def _sync_hubmap(task: SyncTask) -> None:
                 transform,
                 counts_by_phase,
                 # One stream owns the whole submission, so its slice is the
-                # whole submission.
+                # whole submission -- and an empty walk is never a real
+                # answer for it: a mapping change on the index, or an
+                # allowlist that matches nothing, returns a well-formed
+                # empty page that would otherwise delete everything.
                 stale_filter={},
+                clear_on_empty=False,
             )
     finally:
         # HuBMAP writes straight into the materialized collection and never
@@ -1176,6 +1246,18 @@ async def _sync_hubmap(task: SyncTask) -> None:
         logger.warning(
             f"HuBMAP ingest: organ codes with no UBERON mapping {unmapped}; "
             "those anatomy terms were omitted"
+        )
+    malformed = stats.get("skipped:malformed", 0)
+    if malformed:
+        logger.warning(f"HuBMAP ingest: skipped {malformed} malformed documents")
+    unjoined = {
+        key: stats[key] for key in ("unjoined_dataset", "unjoined_donor") if stats[key]
+    }
+    if unjoined:
+        logger.warning(
+            f"HuBMAP ingest: join misses {unjoined} (file occurrences whose "
+            "dataset or donor is absent from the dataset index); those "
+            "documents carry no dataset context or demographics"
         )
 
 

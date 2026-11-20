@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import pytest
@@ -13,12 +14,12 @@ from hypothesis import strategies as st
 from cfdb.models import FileMetadataModel
 from cfdb.services import hubmap as hubmap_module
 from cfdb.services.hubmap import (
+    build_donor_lookup,
     build_hubmap_dcc_record,
     derive_file_format,
     extract_genome_assembly,
     fetch_dataset_metadata_bulk,
     fetch_file_metadata,
-    fetch_organ_map,
     file_extensions_from_env,
     transform_file_to_cfdb,
 )
@@ -131,26 +132,6 @@ class _SearchSession:
         return _FakeJsonResponse(self._status, payload)
 
 
-class _OrganSession:
-    """Fake aiohttp session for the single UBKG organs ``get``."""
-
-    def __init__(self, payload=None, status=200, error=None):
-        self._payload = payload or []
-        self._status = status
-        self._error = error
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    def get(self, url, **kwargs):
-        if self._error is not None:
-            raise self._error
-        return _FakeJsonResponse(self._status, self._payload)
-
-
 def _page(*sources: dict, sort_key: str = "file_uuid") -> dict:
     """Wrap ``_source`` dicts in the Elasticsearch page envelope."""
     return {
@@ -239,13 +220,13 @@ def test_file_extensions_from_env_should_normalize_case_and_missing_dots(
         the configured order.
     """
     # Arrange
-    monkeypatch.setenv(EXTENSIONS_ENV, " h5ad, .BCF ,Gz")
+    monkeypatch.setenv(EXTENSIONS_ENV, " h5ad, .MTX ,Gz")
 
     # Act
     allowlist = file_extensions_from_env()
 
     # Assert
-    assert allowlist == (".h5ad", ".bcf", ".gz")
+    assert allowlist == (".h5ad", ".mtx", ".gz")
 
 
 def test_file_extensions_from_env_should_return_empty_and_warn_when_set_empty(
@@ -286,13 +267,13 @@ def test_file_extensions_from_env_should_collapse_repeats_keeping_order(
         The first occurrence should win and order should be preserved.
     """
     # Arrange
-    monkeypatch.setenv(EXTENSIONS_ENV, ".h5ad,bcf,.H5AD,.bcf")
+    monkeypatch.setenv(EXTENSIONS_ENV, ".h5ad,mtx,.H5AD,.mtx")
 
     # Act
     allowlist = file_extensions_from_env()
 
     # Assert
-    assert allowlist == (".h5ad", ".bcf")
+    assert allowlist == (".h5ad", ".mtx")
 
 
 @given(
@@ -369,7 +350,6 @@ def test_extract_genome_assembly_should_normalize_to_canonical_names(
     [
         ("secondary_analysis.h5ad", "HDF5"),
         ("reads.fastq.gz", "FASTQ"),
-        ("variants.bcf", "BCF"),
         ("matrix.mtx", "MTX"),
         ("expr.csv", "CSV"),
     ],
@@ -410,6 +390,41 @@ def test_derive_file_format_should_return_none_when_nothing_maps():
     # Act & assert
     assert derive_file_format("notes.unknownext") is None
     assert derive_file_format("README") is None
+
+
+@given(
+    base=st.text(
+        alphabet="abcdefghijklmnopqrstuvwxyz0123456789_-", min_size=1, max_size=12
+    ),
+    extension=st.sampled_from(
+        ["h5ad", "h5mu", "hdf5", "csv", "tsv", "mtx", "bed", "bam", "fastq"]
+    ),
+    compression=st.sampled_from([".gz", ".bz2", ".xz"]),
+)
+@settings(max_examples=100)
+def test_derive_file_format_should_ignore_a_compression_wrapper(
+    base, extension, compression
+):
+    """Test a compression suffix never changes the derived format.
+
+    Given:
+        Any plain base name, any mapped extension, and any compression
+        suffix the derivation strips.
+    When:
+        derive_file_format runs on the name with and without the suffix.
+    Then:
+        Both should map to the same format term.
+    """
+    # Arrange
+    name = f"{base}.{extension}"
+
+    # Act
+    plain = derive_file_format(name)
+    wrapped = derive_file_format(name + compression)
+
+    # Assert
+    assert plain is not None
+    assert wrapped == plain
 
 
 def test_transform_file_to_cfdb_should_map_the_file_level_fields():
@@ -500,6 +515,39 @@ def test_transform_file_to_cfdb_should_percent_encode_the_access_url():
         "https://assets.hubmapconsortium.org/ds-uuid-1/"
         "a%20dir/file%20name.h5ad"
     )
+
+
+@given(
+    dataset_uuid=st.text(alphabet="0123456789abcdef", min_size=8, max_size=32),
+    rel_path=st.text(
+        alphabet=st.characters(blacklist_categories=("Cs",)),
+        min_size=1,
+        max_size=40,
+    ),
+)
+@settings(max_examples=100)
+def test_transform_file_to_cfdb_should_build_an_access_url_that_round_trips(
+    dataset_uuid, rel_path
+):
+    """Test the assets URL always decodes back to the dataset and path.
+
+    Given:
+        Any dataset uuid and any rel_path, including spaces, reserved
+        URL characters, and non-ASCII text.
+    When:
+        transform_file_to_cfdb builds the access_url.
+    Then:
+        It should point at the assets host, and its unquoted path should
+        be exactly the dataset uuid followed by the rel_path.
+    """
+    # Act
+    doc = _transform(_file_doc(dataset_uuid=dataset_uuid, rel_path=rel_path))
+
+    # Assert
+    parsed = urlparse(doc["access_url"])
+    assert f"{parsed.scheme}://{parsed.netloc}" == hubmap_module.ASSETS_BASE_URL
+    assert unquote(parsed.path) == f"/{dataset_uuid}/{rel_path}"
+    assert not parsed.query and not parsed.fragment
 
 
 def test_transform_file_to_cfdb_should_join_dataset_and_donor_metadata():
@@ -718,6 +766,71 @@ def test_transform_file_to_cfdb_should_count_extensions_into_stats():
     assert stats["extension:.h5ad"] == 1
 
 
+def test_transform_file_to_cfdb_should_name_anatomy_from_the_uberon_table():
+    """Test the default organ table supplies UBERON ids and UBERON labels.
+
+    UBKG's display terms ("Kidney (Left)") are not UBERON labels ("left
+    kidney"), so naming anatomy by them gave one id different names in
+    HuBMAP and in the other DCCs.
+
+    Given:
+        A document naming a plain organ code and a lateral one, with no
+        organ map supplied.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        The collection should carry each code's UBERON term from the
+        checked-in table, the lateral knee on its side-neutral parent.
+    """
+    # Arrange
+    organs = [
+        {"code": "TH", "label": "Thymus"},
+        {"code": "RN", "label": "Knee (Right)"},
+    ]
+
+    # Act
+    doc = transform_file_to_cfdb(
+        _file_doc(organs=organs), dataset_metadata={}, donor_lookup={}
+    )
+
+    # Assert
+    assert doc["collections"][0]["anatomy"] == [
+        {"id": "UBERON:0002370", "name": "thymus"},
+        {"id": "UBERON:0001465", "name": "knee"},
+    ]
+
+
+def test_transform_file_to_cfdb_should_count_join_misses():
+    """Test a dataset or donor absent from the join maps is counted.
+
+    A wholesale join failure would otherwise load every file without its
+    dataset context or demographics and look like success.
+
+    Given:
+        A document whose dataset is absent from the dataset map and whose
+        donor is absent from the donor lookup, with a stats counter.
+    When:
+        transform_file_to_cfdb runs.
+    Then:
+        It should still return the document and count one unjoined
+        dataset and one unjoined donor.
+    """
+    from collections import Counter
+
+    # Arrange
+    stats: Counter[str] = Counter()
+
+    # Act
+    doc = transform_file_to_cfdb(
+        _file_doc(), dataset_metadata={}, donor_lookup={}, stats=stats
+    )
+
+    # Assert
+    assert doc is not None
+    assert stats["unjoined_dataset"] == 1
+    assert stats["unjoined_donor"] == 1
+
+
 def test_transform_file_to_cfdb_should_dedupe_repeated_donors():
     """Test a donor the index repeats becomes one subject.
 
@@ -916,11 +1029,11 @@ async def test_fetch_file_metadata_should_filter_extensions_server_side(
     )
 
     # Act
-    [doc async for doc in fetch_file_metadata((".h5ad", ".bcf"))]
+    [doc async for doc in fetch_file_metadata((".h5ad", ".mtx"))]
 
     # Assert
     filters = session.post_bodies[0]["query"]["bool"]["filter"]
-    assert {"terms": {"file_extension.keyword": [".h5ad", ".bcf"]}} in filters
+    assert {"terms": {"file_extension.keyword": [".h5ad", ".mtx"]}} in filters
 
 
 @pytest.mark.asyncio
@@ -1196,6 +1309,45 @@ async def test_fetch_file_metadata_should_raise_at_once_on_a_client_error_status
 
 
 @pytest.mark.asyncio
+async def test_fetch_file_metadata_should_raise_when_the_walk_ends_short(mocker):
+    """Test a walk that delivers less than the index reported is refused.
+
+    Given:
+        A first page reporting an exact total of 3 but carrying 2 hits,
+        after which the index serves nothing more.
+    When:
+        fetch_file_metadata is drained.
+    Then:
+        It should yield the 2 documents, then raise naming the shortfall,
+        having asked for an exact total on the first page.
+    """
+    # Arrange
+    first = {
+        "hits": {
+            "total": {"value": 3, "relation": "eq"},
+            "hits": [
+                {"_source": _file_doc(file_uuid="aaa"), "sort": ["aaa"]},
+                {"_source": _file_doc(file_uuid="bbb"), "sort": ["bbb"]},
+            ],
+        }
+    }
+    session = _SearchSession(pages=[first])
+    mocker.patch.object(
+        hubmap_module.aiohttp, "ClientSession", return_value=session
+    )
+    docs = []
+
+    # Act
+    with pytest.raises(RuntimeError, match="2 of the 3"):
+        async for doc in fetch_file_metadata((".h5ad",)):
+            docs.append(doc)
+
+    # Assert
+    assert [doc["file_uuid"] for doc in docs] == ["aaa", "bbb"]
+    assert session.post_bodies[0]["track_total_hits"] is True
+
+
+@pytest.mark.asyncio
 async def test_fetch_file_metadata_should_raise_when_the_deadline_has_passed(
     mocker,
 ):
@@ -1394,197 +1546,98 @@ async def test_fetch_dataset_metadata_bulk_should_stop_when_a_page_has_no_sort(
 
 
 @pytest.mark.asyncio
-async def test_fetch_organ_map_should_key_uberon_terms_by_rui_code(
-    mocker
-):
-    """Test the UBKG payload becomes a code-keyed UBERON lookup.
-
-    Given:
-        A UBKG organs payload with one complete entry and one missing
-        its UBERON id.
-    When:
-        fetch_organ_map runs.
-    Then:
-        Only the complete entry should be mapped.
-    """
-    # Arrange
-    payload = [
-        {"rui_code": "TH", "term": "Thymus", "organ_uberon": "UBERON:0002370"},
-        {"rui_code": "XX", "term": "No Uberon", "organ_uberon": None},
-    ]
-    session = _OrganSession(payload=payload)
-    mocker.patch.object(
-        hubmap_module.aiohttp, "ClientSession", return_value=session
-    )
-
-    # Act
-    organ_map = await fetch_organ_map()
-
-    # Assert
-    assert organ_map == {"TH": {"id": "UBERON:0002370", "name": "Thymus"}}
-
-
-@pytest.mark.asyncio
-async def test_fetch_organ_map_should_return_empty_and_warn_on_failure(
-    mocker, caplog
-):
-    """Test a UBKG outage degrades anatomy instead of failing the sync.
-
-    Given:
-        A UBKG endpoint that raises a client error.
-    When:
-        fetch_organ_map runs.
-    Then:
-        It should return an empty map and log a warning.
-    """
-    # Arrange
-    session = _OrganSession(error=aiohttp.ClientError("down"))
-    mocker.patch.object(
-        hubmap_module.aiohttp, "ClientSession", return_value=session
-    )
-
-    # Act
-    with caplog.at_level("WARNING"):
-        organ_map = await fetch_organ_map()
-
-    # Assert
-    assert organ_map == {}
-    assert any("UBKG" in record.message for record in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_fetch_organ_map_should_return_empty_and_warn_on_http_error(
-    mocker, caplog
-):
-    """Test a UBKG error status degrades anatomy like an outage does.
-
-    Given:
-        A UBKG endpoint answering HTTP 500.
-    When:
-        fetch_organ_map runs.
-    Then:
-        It should return an empty map and log a warning naming UBKG.
-    """
-    # Arrange
-    session = _OrganSession(status=500)
-    mocker.patch.object(
-        hubmap_module.aiohttp, "ClientSession", return_value=session
-    )
-
-    # Act
-    with caplog.at_level("WARNING"):
-        organ_map = await fetch_organ_map()
-
-    # Assert
-    assert organ_map == {}
-    assert any("HTTP 500" in record.message for record in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_fetch_organ_map_should_fall_back_to_the_category_uberon_term(
+async def test_fetch_dataset_metadata_bulk_should_collect_every_listed_donor(
     mocker,
 ):
-    """Test a lateral organ's FMA id is replaced by its UBERON parent.
-
-    UBKG puts FMA ids in organ_uberon for the left/right knee, mammary
-    gland and tonsil, while their side-neutral category carries UBERON.
+    """Test a pooled dataset's donors are all carried, not just the first.
 
     Given:
-        A UBKG entry whose organ_uberon is FMA and whose category carries a
-        UBERON id.
+        A dataset whose singular donor is one of the three it lists under
+        donors, each with demographics.
     When:
-        fetch_organ_map runs.
+        fetch_dataset_metadata_bulk drains the index.
     Then:
-        The code should map to the category's UBERON id and term.
+        The entry's donors map should hold all three donors' demographics.
     """
     # Arrange
-    payload = [
-        {
-            "rui_code": "RN",
-            "term": "Knee (Right)",
-            "organ_uberon": "FMA:24977",
-            "category": {"organ_uberon": "UBERON:0001465", "term": "Knee"},
-        }
-    ]
-    session = _OrganSession(payload=payload)
+    src = {
+        "uuid": "ds-uuid-1",
+        "donor": {"uuid": "d1", "mapped_metadata": {"sex": ["F"]}},
+        "donors": [
+            {"uuid": "d1", "mapped_metadata": {"sex": ["F"]}},
+            {"uuid": "d2", "mapped_metadata": {"sex": ["M"]}},
+            {"uuid": "d3", "mapped_metadata": {"sex": ["F"]}},
+        ],
+    }
+    session = _SearchSession(pages=[_page(src, sort_key="uuid")])
     mocker.patch.object(
         hubmap_module.aiohttp, "ClientSession", return_value=session
     )
 
     # Act
-    organ_map = await fetch_organ_map()
+    results = await fetch_dataset_metadata_bulk()
 
     # Assert
-    assert organ_map == {"RN": {"id": "UBERON:0001465", "name": "Knee"}}
+    assert results["ds-uuid-1"]["donors"] == {
+        "d1": {"sex": ["F"]},
+        "d2": {"sex": ["M"]},
+        "d3": {"sex": ["F"]},
+    }
 
 
 @pytest.mark.asyncio
-async def test_fetch_organ_map_should_omit_a_code_with_no_uberon_term(mocker):
-    """Test a code with no UBERON term anywhere is left unmapped.
-
-    Left out of the map, the transform counts it as an unmapped organ
-    rather than storing a foreign id where the contract promises UBERON.
-
-    Given:
-        A UBKG entry with an FMA organ_uberon and no category.
-    When:
-        fetch_organ_map runs.
-    Then:
-        The code should be absent from the map.
-    """
-    # Arrange
-    payload = [{"rui_code": "LN", "term": "Knee", "organ_uberon": "FMA:24978"}]
-    session = _OrganSession(payload=payload)
-    mocker.patch.object(
-        hubmap_module.aiohttp, "ClientSession", return_value=session
-    )
-
-    # Act
-    organ_map = await fetch_organ_map()
-
-    # Assert
-    assert organ_map == {}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("session_kwargs", "expected"),
-    [
-        ({"error": asyncio.TimeoutError()}, "TimeoutError"),
-        ({"payload": ValueError("bad json")}, "bad json"),
-        ({"payload": {"organs": []}}, "not a list"),
-    ],
-)
-async def test_fetch_organ_map_should_return_empty_and_warn_on_a_degraded_answer(
-    mocker, caplog, session_kwargs, expected
+async def test_fetch_dataset_metadata_bulk_should_raise_when_the_deadline_has_passed(
+    mocker,
 ):
-    """Test every failure shape degrades anatomy instead of failing the sync.
-
-    aiohttp raises a bare TimeoutError on an exceeded total, not a
-    ClientError, and a wrongly shaped body would otherwise fail on
-    iteration -- both escaped the contract the docstring states.
+    """Test the dataset prefetch honors the sync's shared deadline.
 
     Given:
-        A UBKG request that times out, answers undecodable JSON, or
-        answers a JSON object instead of a list.
+        A deadline already behind the event-loop clock.
     When:
-        fetch_organ_map runs.
+        fetch_dataset_metadata_bulk runs.
     Then:
-        It should return an empty map and log a warning describing it.
+        It should raise a timeout without issuing a request.
     """
     # Arrange
-    session = _OrganSession(**session_kwargs)
+    session = _SearchSession(pages=[_page({"uuid": "ds-uuid-1"}, sort_key="uuid")])
     mocker.patch.object(
         hubmap_module.aiohttp, "ClientSession", return_value=session
     )
+    deadline = asyncio.get_running_loop().time() - 1
 
     # Act
-    with caplog.at_level("WARNING"):
-        organ_map = await fetch_organ_map()
+    with pytest.raises(asyncio.TimeoutError):
+        await fetch_dataset_metadata_bulk(deadline=deadline)
 
     # Assert
-    assert organ_map == {}
-    assert any(expected in record.message for record in caplog.records)
+    assert session.post_bodies == []
+
+
+def test_build_donor_lookup_should_merge_singular_and_plural_donors():
+    """Test every donor any dataset names joins, the first naming winning.
+
+    Given:
+        One dataset naming a donor only under donors, another naming a
+        donor only singly, and a third repeating the first donor with
+        different demographics.
+    When:
+        build_donor_lookup runs.
+    Then:
+        All three donors should be present, the repeated one keeping the
+        demographics of the first dataset that named it.
+    """
+    # Arrange
+    dataset_metadata = {
+        "ds1": {"donors": {"d1": {"sex": ["F"]}}},
+        "ds2": {"donor_uuid": "d2", "donor_metadata": {"sex": ["M"]}},
+        "ds3": {"donors": {"d1": {"sex": ["M"]}}},
+    }
+
+    # Act
+    lookup = build_donor_lookup(dataset_metadata)
+
+    # Assert
+    assert lookup == {"d1": {"sex": ["F"]}, "d2": {"sex": ["M"]}}
 
 
 def test_build_hubmap_dcc_record_should_carry_the_static_dcc_fields():

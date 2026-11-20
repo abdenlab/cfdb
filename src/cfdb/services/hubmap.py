@@ -17,8 +17,8 @@ File search (search_after pagination, one document per file):
 Dataset search (search_after pagination, one document per dataset):
   https://search.api.hubmapconsortium.org/v3/portal/search
 
-Organ code -> UBERON (one request per sync):
-  https://ontology.api.hubmapconsortium.org/organs?application_context=HUBMAP
+Organ code -> UBERON: no request. A checked-in snapshot of the UBKG organs
+endpoint, ``HUBMAP_ORGAN_TO_UBERON`` in :mod:`cfdb.services.ontology_mappings`.
 
 Field Mapping (HuBMAP files search API -> CFDB)
 -----------------------------------------------
@@ -53,7 +53,7 @@ dataset_hubmap_id                       -> collections[].name
 portal dataset URL                      -> collections[].persistent_id
 dataset_type                            -> collections[].experiment_type
 analyte_class                           -> collections[].analyte_class
-organs[] (code -> UBERON via UBKG)      -> collections[].anatomy
+organs[] (code -> UBERON, static table) -> collections[].anatomy
 
 Enriched Collection (dataset index join)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -115,7 +115,11 @@ from cfdb.services.ingest_common import (
     derive_compression_format,
     timeout_from_env,
 )
-from cfdb.services.ontology_mappings import get_file_format, get_taxonomy
+from cfdb.services.ontology_mappings import (
+    HUBMAP_ORGAN_TO_UBERON,
+    get_file_format,
+    get_taxonomy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +128,6 @@ _REQUEST_INTERVAL = 0.1
 
 ASSETS_BASE_URL = "https://assets.hubmapconsortium.org"
 PORTAL_DATASET_URL = "https://portal.hubmapconsortium.org/browse/dataset/{uuid}"
-UBKG_ORGANS_URL = (
-    "https://ontology.api.hubmapconsortium.org/organs?application_context=HUBMAP"
-)
 
 #: Environment variable overriding which file extensions are ingested, and
 #: the allowlist applied when it is unset. An allowlist rather than a filter
@@ -142,8 +143,9 @@ _FILE_EXTENSIONS_DEFAULT: tuple[str, ...] = (
     ".h5",
     ".hdf5",
     # ".bcf" is deliberately absent: every .bcf in the index is a CODEX
-    # raw-acquisition sidecar (raw/Cyc1_reg1/1.bcf), not binary VCF, and
-    # ingesting them would label microscope files as variant calls.
+    # raw-acquisition sidecar (raw/Cyc1_reg1/1.bcf), not binary VCF. Nor
+    # does "bcf" map to a format, so an operator who opts them in gets files
+    # with no file_format rather than ones labelled as variant calls.
     ".gz",
     ".mtx",
     ".arrow",
@@ -163,7 +165,7 @@ def file_extensions_from_env() -> tuple[str, ...]:
 
     Reads a comma-separated ``HUBMAP_FILE_EXTENSIONS``, stripping each entry,
     lower-casing it, prefixing a missing leading dot, and dropping blanks —
-    so ``h5ad, .BCF`` and ``.h5ad,.bcf`` configure the same thing, and what
+    so ``h5ad, .MTX`` and ``.h5ad,.mtx`` configure the same thing, and what
     is sent to the search API matches the index's dot-prefixed
     ``file_extension`` values exactly. An unset variable yields the default
     allowlist; a variable set to an empty (or all-blank) value yields an
@@ -281,11 +283,13 @@ _RETRY_BACKOFF_SECONDS = 2.0
 #: will refuse again, so it is raised at once.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-#: Environment variable bounding the HuBMAP files stream, and its default.
-#: The stream runs inside the cutover lock, which gates the whole read
-#: surface, so it gets one deadline -- the reasoning ENCODE's metadata
-#: budget records -- kept well under the sync lock's one-hour stale
-#: threshold so a slow upstream cannot admit a second, clearing sync.
+#: Environment variable bounding the HuBMAP sync's network fetches, and its
+#: default. The file stream runs inside the cutover lock, which gates the
+#: whole read surface, so the sync gets one deadline -- the reasoning
+#: ENCODE's metadata budget records. The budget alone does not keep the
+#: sync lock fresh: that lock's staleness counts from the start of the
+#: whole multi-DCC run, so the sync clamps this budget to what is left of
+#: it (see ``_stale_safe_deadline`` in :mod:`cfdb.services.sync`).
 _SYNC_TIMEOUT_ENV = "HUBMAP_SYNC_TIMEOUT_SECONDS"
 _SYNC_TIMEOUT_DEFAULT_SECONDS = 1800
 
@@ -303,8 +307,11 @@ class _RetryablePageError(RuntimeError):
     """A page failure that a fresh attempt at the same page may not repeat."""
 
 
-def _page_hits(data: object, label: str) -> list[dict]:
-    """Return a search response's hits, refusing a partial or malformed page.
+def _page_hits(data: object, label: str) -> tuple[list[dict], Optional[int]]:
+    """Return a search response's hits and exact total, refusing a bad page.
+
+    The total is the index's ``hits.total.value`` when it is exact
+    (``relation: eq``, which ``track_total_hits`` guarantees), else None.
 
     Elasticsearch answers 200 with whatever the healthy shards returned when
     a shard fails or the query times out, and the walk would then resume
@@ -327,7 +334,13 @@ def _page_hits(data: object, label: str) -> list[dict]:
             f"HuBMAP {label} search had {failed} failed shard(s); the page "
             "is partial"
         )
-    return hits["hits"]
+    total = hits.get("total")
+    exact = (
+        total.get("value")
+        if isinstance(total, dict) and total.get("relation") == "eq"
+        else None
+    )
+    return hits["hits"], exact if isinstance(exact, int) else None
 
 
 async def _search_page(
@@ -337,8 +350,8 @@ async def _search_page(
     label: str,
     *,
     deadline: float | None = None,
-) -> list[dict]:
-    """POST one search page and return its hits, retrying transient failures.
+) -> tuple[list[dict], Optional[int]]:
+    """POST one search page and return its hits and exact total, retrying.
 
     Transport errors, timeouts, retryable statuses, and partial or malformed
     pages are retried up to ``_PAGE_ATTEMPTS`` times with linear backoff;
@@ -363,8 +376,9 @@ async def _search_page(
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError(
-                    f"HuBMAP {label} fetch did not finish within the "
-                    f"{_SYNC_TIMEOUT_ENV} budget"
+                    f"HuBMAP {label} fetch did not finish within the sync's "
+                    f"deadline ({_SYNC_TIMEOUT_ENV}, clamped to the sync "
+                    "lock's stale threshold)"
                 )
             timeout = min(timeout, remaining)
 
@@ -420,11 +434,15 @@ _DATASET_SOURCE_FIELDS = [
     "metadata",
     "donor.mapped_metadata",
     "donor.uuid",
+    "donors.mapped_metadata",
+    "donors.uuid",
     "ingest_metadata.workflow_description",
 ]
 
 
-async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
+async def fetch_dataset_metadata_bulk(
+    *, deadline: float | None = None
+) -> dict[str, dict]:
     """
     Fetch all HuBMAP dataset metadata from the dataset-level search index.
 
@@ -438,9 +456,15 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
     partial map, since a silently partial map would mean silently
     under-enriched documents.
 
+    Args:
+        deadline: Event-loop clock reading by which the whole fetch must
+            finish; each page's timeout is clamped to what remains. None
+            leaves only the per-page timeout.
+
     Returns:
         {dataset_uuid: {pipeline, processing, group_name, visualization,
                         vitessce_hints, metadata, donor_uuid, donor_metadata,
+                        donors: {donor_uuid: mapped_metadata},
                         genome_assembly}}
     """
     config = get_dcc_config("hubmap")
@@ -463,7 +487,9 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
             if search_after is not None:
                 query["search_after"] = search_after
 
-            hits = await _search_page(session, search_url, query, "dataset")
+            hits, _ = await _search_page(
+                session, search_url, query, "dataset", deadline=deadline
+            )
 
             await asyncio.sleep(_REQUEST_INTERVAL)
 
@@ -492,7 +518,11 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
                 if metadata:
                     entry["metadata"] = metadata
 
-                # Donor demographics
+                # Donor demographics. ``donor`` names one donor; a dataset
+                # pooled from several also lists every one under ``donors``,
+                # so both feed the per-donor map ``build_donor_lookup``
+                # merges -- reading ``donor`` alone covers the others only
+                # when each happens to be some other dataset's ``donor``.
                 donor = src.get("donor") or {}
                 donor_metadata = donor.get("mapped_metadata")
                 if donor_metadata:
@@ -500,6 +530,15 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
                 donor_uuid = donor.get("uuid")
                 if donor_uuid:
                     entry["donor_uuid"] = donor_uuid
+                donors = {
+                    d["uuid"]: d["mapped_metadata"]
+                    for d in [donor, *(src.get("donors") or [])]
+                    if isinstance(d, dict)
+                    and d.get("uuid")
+                    and d.get("mapped_metadata")
+                }
+                if donors:
+                    entry["donors"] = donors
 
                 # Genome assembly from workflow description
                 ingest = src.get("ingest_metadata") or {}
@@ -523,6 +562,24 @@ async def fetch_dataset_metadata_bulk() -> dict[str, dict]:
 
     logger.info(f"HuBMAP dataset fetch: {len(results)} total datasets fetched")
     return results
+
+
+def build_donor_lookup(dataset_metadata: dict[str, dict]) -> dict[str, dict]:
+    """Merge every dataset's donors into one demographics map by donor uuid.
+
+    Each dataset entry from :func:`fetch_dataset_metadata_bulk` carries its
+    donors -- the singular ``donor`` and the plural ``donors`` alike -- so a
+    donor of a pooled dataset joins even when no dataset names it singly.
+    The first dataset to name a donor wins; a donor's demographics are the
+    same wherever it appears.
+    """
+    lookup: dict[str, dict] = {}
+    for meta in dataset_metadata.values():
+        for donor_uuid, donor_metadata in (meta.get("donors") or {}).items():
+            lookup.setdefault(donor_uuid, donor_metadata)
+        if meta.get("donor_uuid") and meta.get("donor_metadata"):
+            lookup.setdefault(meta["donor_uuid"], meta["donor_metadata"])
+    return lookup
 
 
 # Fields to request from the files index — the whole per-file surface the
@@ -567,10 +624,12 @@ async def fetch_file_metadata(
 
     Each page is retried on transient failure, and a partial page (failed
     shards, an upstream timeout, a missing hits envelope) is refused rather
-    than walked past; see ``_search_page``. A failure that outlasts the
-    retries still raises mid-stream, and behind the loader's deferred clear
-    that leaves a partial slice -- loudly rather than silently, but only a
-    shadow-collection swap would make it atomic.
+    than walked past; see ``_search_page``. The first page asks for an
+    exact total, and a walk that ends with fewer documents than it raises.
+    A failure that outlasts the retries still raises mid-stream, and behind
+    the loader's deferred clear that leaves a partial slice -- loudly
+    rather than silently, but only a shadow-collection swap would make it
+    atomic.
 
     Args:
         extensions: Dot-prefixed, lower-case extension allowlist.
@@ -590,7 +649,8 @@ async def fetch_file_metadata(
 
     page_size = 1000
     search_after: Optional[list] = None
-    total = 0
+    yielded = 0
+    expected: Optional[int] = None
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -610,10 +670,16 @@ async def fetch_file_metadata(
 
             if search_after is not None:
                 query["search_after"] = search_after
+            else:
+                # Exact on the first page only: the count is what the walk
+                # is checked against when it ends.
+                query["track_total_hits"] = True
 
-            hits = await _search_page(
+            hits, total = await _search_page(
                 session, search_url, query, "files", deadline=deadline
             )
+            if search_after is None:
+                expected = total
 
             await asyncio.sleep(_REQUEST_INTERVAL)
 
@@ -622,89 +688,22 @@ async def fetch_file_metadata(
 
             for hit in hits:
                 yield hit.get("_source", {})
-                total += 1
+                yielded += 1
 
-            if total % 10000 < page_size:
-                logger.info(f"HuBMAP file fetch: {total} files fetched so far")
+            if yielded % 10000 < page_size:
+                logger.info(f"HuBMAP file fetch: {yielded} files fetched so far")
 
             # Prepare next page
             search_after = hits[-1].get("sort")
             if not search_after:
                 break
 
-    logger.info(f"HuBMAP file fetch: {total} total files fetched")
-
-
-def _uberon_term(organ: dict) -> Optional[dict]:
-    """The UBERON term for one UBKG organ entry, or None when it has none.
-
-    ``organ_uberon`` is not always UBERON despite its name: the lateral
-    organs (left/right knee, mammary gland, tonsil) carry FMA ids there,
-    and their side-neutral parent under ``category`` carries the UBERON
-    one. Falling back loses the side -- UBERON's knee is side-neutral --
-    which is the honest trade: an FMA id stored where the anatomy
-    contract promises UBERON would not resolve for any consumer.
-    """
-    for source in (organ, organ.get("category")):
-        if not isinstance(source, dict):
-            continue
-        uberon = source.get("organ_uberon")
-        if isinstance(uberon, str) and uberon.startswith("UBERON:"):
-            return {"id": uberon, "name": source.get("term") or uberon}
-    return None
-
-
-async def fetch_organ_map() -> dict[str, dict]:
-    """
-    Fetch the HuBMAP organ-code → UBERON mapping from the UBKG ontology API.
-
-    One small request per sync. Returns ``{rui_code: {"id": uberon_id,
-    "name": term}}`` for every organ with a UBERON term, taking the
-    side-neutral ``category`` term where ``organ_uberon`` is not UBERON
-    (see ``_uberon_term``); a code with no UBERON term at all is left out,
-    so the transform counts it as unmapped rather than storing a foreign
-    id. Failure degrades rather than aborts -- anatomy is enrichment, not
-    identity, so a UBKG outage costs the anatomy terms of one sync, not the
-    corpus -- and returns an empty map with a warning. That covers a
-    timeout (a bare ``TimeoutError`` in aiohttp, not a ``ClientError``)
-    and an undecodable or wrongly shaped body as well as transport errors.
-    """
-    degraded = "HuBMAP collections will carry no anatomy terms this sync"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                UBKG_ORGANS_URL,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as response:
-                if response.status != 200:
-                    logger.warning(
-                        f"UBKG organs API error: HTTP {response.status}; "
-                        f"{degraded}"
-                    )
-                    return {}
-                organs = await response.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        logger.warning(f"UBKG organs API failed ({e!r}); {degraded}")
-        return {}
-
-    if not isinstance(organs, list):
-        logger.warning(
-            f"UBKG organs API returned {type(organs).__name__}, not a list; "
-            f"{degraded}"
+    if expected is not None and yielded < expected:
+        raise RuntimeError(
+            f"HuBMAP files walk ended short: {yielded} of the {expected} "
+            "files the index reported on its first page"
         )
-        return {}
-
-    organ_map: dict[str, dict] = {}
-    for organ in organs:
-        if not isinstance(organ, dict):
-            continue
-        code = organ.get("rui_code")
-        term = _uberon_term(organ)
-        if code and term:
-            organ_map[code] = term
-
-    logger.info(f"UBKG organs: {len(organ_map)} organ codes mapped to UBERON")
-    return organ_map
+    logger.info(f"HuBMAP file fetch: {yielded} total files fetched")
 
 
 # Scalar demographics HuBMAP returns as single-element lists; unwrapped to
@@ -801,7 +800,7 @@ def transform_file_to_cfdb(
     *,
     dataset_metadata: dict[str, dict],
     donor_lookup: dict[str, dict],
-    organ_map: dict[str, dict],
+    organ_map: dict[str, dict] | None = None,
     stats: Counter | None = None,
 ) -> Optional[dict]:
     """
@@ -816,12 +815,13 @@ def transform_file_to_cfdb(
             than dropping it.
         donor_lookup: Donor demographics keyed by donor uuid, built from
             ``dataset_metadata`` by the caller.
-        organ_map: Organ-code → UBERON mapping from :func:`fetch_organ_map`.
-            An unmapped code skips that anatomy term rather than fabricating
-            an id.
+        organ_map: Organ-code → UBERON term mapping; defaults to the
+            checked-in ``HUBMAP_ORGAN_TO_UBERON``. An unmapped code skips
+            that anatomy term rather than fabricating an id.
         stats: Optional counter the transform reports into — per-extension
-            document tallies, skip reasons, and unmapped organ codes — so
-            the sync can log one distribution instead of a line per file.
+            document tallies, skip reasons, unmapped organ codes, and
+            datasets or donors absent from the join maps — so the sync can
+            log one distribution instead of a line per file.
 
     Returns:
         CFDB-compatible dict for insertion into the files collection, or
@@ -850,7 +850,14 @@ def transform_file_to_cfdb(
     except (KeyError, TypeError, ValueError):
         size_in_bytes = None
 
-    dataset_meta = dataset_metadata.get(dataset_uuid) or {}
+    if organ_map is None:
+        organ_map = HUBMAP_ORGAN_TO_UBERON
+
+    dataset_meta = dataset_metadata.get(dataset_uuid)
+    if dataset_meta is None:
+        if stats is not None:
+            stats["unjoined_dataset"] += 1
+        dataset_meta = {}
 
     doc: dict = {
         "submission": "hubmap",
@@ -913,13 +920,15 @@ def transform_file_to_cfdb(
         if taxonomy:
             subject["taxonomy"] = taxonomy
         donor_metadata = donor_lookup.get(donor_uuid)
+        if not donor_metadata and stats is not None:
+            stats["unjoined_donor"] += 1
         if donor_metadata:
             donor_extra = _donor_extra(donor_metadata)
             if donor_extra:
                 subject["extra"] = {"hubmap": donor_extra}
         subjects.append(subject)
 
-    # --- Anatomy, from the file's organs through the UBKG mapping ---
+    # --- Anatomy, from the file's organs through the organ table ---
     anatomy = []
     seen_codes: set[str] = set()
     for organ in src.get("organs") or []:
@@ -932,9 +941,9 @@ def transform_file_to_cfdb(
             if stats is not None:
                 stats[f"unmapped_organ:{code}"] += 1
             continue
-        # The UBKG term, not the file's own label: labels drift between
-        # files for the same code ("Main Bronchus (Right)" vs "Bronchus
-        # (Right)"), which would give one id two names.
+        # The table's UBERON label, not the file's own label: labels drift
+        # between files for the same code ("Main Bronchus (Right)" vs
+        # "Bronchus (Right)"), which would give one id two names.
         anatomy.append({"id": term["id"], "name": term["name"]})
 
     # --- Collection, one per file: its parent dataset ---

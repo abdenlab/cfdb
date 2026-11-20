@@ -38,7 +38,6 @@ FILE_FORMAT_TO_EDAM = {
     "bed broadpeak": {"id": "format:3614", "name": "BroadPeak"},
     # Variant formats
     "vcf": {"id": "format:3016", "name": "VCF"},
-    "bcf": {"id": "format:3020", "name": "BCF"},
     # Annotation formats
     "gtf": {"id": "format:2306", "name": "GTF"},
     "gff": {"id": "format:1975", "name": "GFF"},
