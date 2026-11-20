@@ -109,11 +109,11 @@ from urllib.parse import quote
 import aiohttp
 
 from cfdb.dcc_registry import get_dcc_config
-from cfdb.services.encode import (
+from cfdb.services.ingest_common import (
     COMPRESSION_SUFFIX_TO_EDAM,
     UNMAPPABLE_COMPRESSION_SUFFIXES,
-    _timeout_from_env,
     derive_compression_format,
+    timeout_from_env,
 )
 from cfdb.services.ontology_mappings import get_file_format, get_taxonomy
 
@@ -296,7 +296,7 @@ def sync_budget_seconds() -> int:
     Read per call, like ENCODE's budget, so a malformed value fails the sync
     that reads it rather than the import of this module.
     """
-    return _timeout_from_env(_SYNC_TIMEOUT_ENV, _SYNC_TIMEOUT_DEFAULT_SECONDS)
+    return timeout_from_env(_SYNC_TIMEOUT_ENV, _SYNC_TIMEOUT_DEFAULT_SECONDS)
 
 
 class _RetryablePageError(RuntimeError):
