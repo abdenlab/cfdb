@@ -12,6 +12,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from cfdb.dump import SCHEMA_VERSION, DumpError, DumpReport, dump_files
+from cfdb.services.hubmap import transform_file_to_cfdb
 
 #: Every table schema.sql creates, by tier.
 PROVENANCE_TABLES = {"dump_info", "dump_stat", "dump_conflict"}
@@ -1279,6 +1280,69 @@ def test_dump_files_should_carry_the_hubmap_dataset_status():
         "SELECT dataset_status FROM collection_extra_hubmap"
     ).fetchone()
     assert status == "Published"
+
+
+def test_dump_files_should_load_a_document_built_by_the_hubmap_transform():
+    """Test the dump accepts the document shape the HuBMAP loader writes.
+
+    The other HuBMAP fixtures model the retired C2M2 shape; this one is
+    built by the loader itself, so a change to that shape fails here
+    rather than only against a live corpus.
+
+    Given:
+        A files-index document transformed with dataset context, donor
+        demographics, and a mapped organ, carrying is_data_product.
+    When:
+        The transformed document is dumped.
+    Then:
+        It should land with an integer size, its HuBMAP file and collection
+        extensions, the collection's anatomy and subject junctions, and no
+        skipped documents.
+    """
+    # Arrange
+    src = {
+        "file_uuid": "f1",
+        "rel_path": "processed/secondary_analysis.h5ad",
+        "file_extension": ".h5ad",
+        "size": 5529765,
+        "md5_checksum": "0b05f823fd4b3cc86204366c6f71eae9",
+        "data_access_level": "public",
+        "is_data_product": "True",
+        "dataset_uuid": "ds1",
+        "dataset_hubmap_id": "HBM339.XXWC.842",
+        "dataset_type": "RNAseq",
+        "dataset_status": "Published",
+        "donors": [{"uuid": "donor-1"}, {"uuid": "donor-1"}],
+        "organs": [{"code": "TH", "label": "Thymus"}],
+    }
+    doc = transform_file_to_cfdb(
+        src,
+        dataset_metadata={"ds1": {"pipeline": "Salmon"}},
+        donor_lookup={"donor-1": {"sex": ["Female"]}},
+        organ_map={"TH": {"id": "UBERON:0002370", "name": "thymus"}},
+    )
+
+    # Act
+    con, report = run_dump([doc])
+
+    # Assert
+    assert con.execute(
+        "SELECT size_in_bytes FROM file WHERE local_id = 'f1'"
+    ).fetchone() == (5529765,)
+    assert con.execute(
+        "SELECT rel_path, is_data_product FROM file_extra_hubmap"
+    ).fetchone() == ("processed/secondary_analysis.h5ad", True)
+    assert con.execute(
+        "SELECT pipeline, dataset_status FROM collection_extra_hubmap"
+    ).fetchone() == ("Salmon", "Published")
+    assert con.execute(
+        "SELECT anatomy FROM collection_anatomy"
+    ).fetchall() == [("UBERON:0002370",)]
+    assert con.execute(
+        "SELECT subject_local_id FROM subject_in_collection"
+    ).fetchall() == [("donor-1",)]
+    assert report.file_count == 1
+    assert report.stats.get("documents_invalid", 0) == 0
 
 
 def test_dump_files_should_order_extra_files_by_source_position():
